@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBytes, PyType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const DEFAULT_MAX_BUFFER_SIZE: usize = 5 * 1024 * 1024;
 
@@ -519,7 +519,7 @@ impl ObjectInputFile {
 // TODO the C++ implementation track an internal lock on all random access files, DO we need this here?
 #[pyclass(weakref, module = "deltalake._internal")]
 pub struct ObjectOutputStream {
-    upload: Box<dyn MultipartUpload>,
+    upload: Mutex<Box<dyn MultipartUpload>>,
     pos: i64,
     #[pyo3(get)]
     closed: bool,
@@ -536,6 +536,7 @@ impl ObjectOutputStream {
         max_buffer_size: usize,
     ) -> Result<Self, ObjectStoreError> {
         let upload = store.put_multipart(&path).await?;
+        let upload = Mutex::new(upload);
         Ok(Self {
             upload,
             pos: 0,
@@ -555,14 +556,19 @@ impl ObjectOutputStream {
     }
 
     fn abort(&mut self) -> PyResult<()> {
-        rt().block_on(self.upload.abort())
+        let mut upload = self.upload.lock().unwrap();
+        rt().block_on(upload.abort())
             .map_err(PythonError::from)?;
         Ok(())
     }
 
     fn upload_buffer(&mut self) -> PyResult<()> {
         let payload = std::mem::take(&mut self.buffer).freeze();
-        match rt().block_on(self.upload.put_part(payload)) {
+        let result = {
+            let mut upload = self.upload.lock().unwrap();
+            rt().block_on(upload.put_part(payload))
+        };
+        match result {
             Ok(_) => Ok(()),
             Err(err) => {
                 self.abort()?;
@@ -580,7 +586,8 @@ impl ObjectOutputStream {
             if !self.buffer.is_empty() {
                 self.upload_buffer()?;
             }
-            match rt().block_on(self.upload.complete()) {
+            let mut upload = self.upload.lock().unwrap();
+            match rt().block_on(upload.complete()) {
                 Ok(_) => Ok(()),
                 Err(err) => Err(PyIOError::new_err(err.to_string())),
             }
