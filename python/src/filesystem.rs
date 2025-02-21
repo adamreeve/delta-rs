@@ -1,15 +1,19 @@
 use crate::error::PythonError;
 use crate::utils::{delete_dir, rt, walk_tree, warn};
 use crate::RawDeltaTable;
-use deltalake::storage::object_store::{MultipartUpload, PutPayloadMut};
+use deltalake::storage::object_store::{
+    MultipartUpload, PutPayload, PutPayloadMut, PutResult, UploadPart,
+};
 use deltalake::storage::{DynObjectStore, ListResult, ObjectStoreError, Path};
 use deltalake::DeltaTableBuilder;
+use futures::FutureExt;
 use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBytes, PyType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 const DEFAULT_MAX_BUFFER_SIZE: usize = 5 * 1024 * 1024;
 
@@ -555,18 +559,27 @@ impl ObjectOutputStream {
         Ok(())
     }
 
+    async fn abort_upload(&mut self) -> Result<(), ObjectStoreError> {
+        let mut upload = self.upload.lock().await;
+        upload.abort().await?;
+        Ok(())
+    }
+
     fn abort(&mut self) -> PyResult<()> {
-        let mut upload = self.upload.lock().map_err(PythonError::from)?;
-        rt().block_on(upload.abort()).map_err(PythonError::from)?;
+        rt().block_on(self.abort_upload())
+            .map_err(PythonError::from)?;
+        Ok(())
+    }
+
+    async fn put_part(&mut self, payload: PutPayload) -> Result<(), ObjectStoreError> {
+        let mut upload = self.upload.lock().await;
+        upload.put_part(payload).await?;
         Ok(())
     }
 
     fn upload_buffer(&mut self) -> PyResult<()> {
         let payload = std::mem::take(&mut self.buffer).freeze();
-        let result = {
-            let mut upload = self.upload.lock().map_err(PythonError::from)?;
-            rt().block_on(upload.put_part(payload))
-        };
+        let result = { rt().block_on(self.put_part(payload)) };
         match result {
             Ok(_) => Ok(()),
             Err(err) => {
@@ -574,6 +587,12 @@ impl ObjectOutputStream {
                 Err(PyIOError::new_err(err.to_string()))
             }
         }
+    }
+
+    async fn complete_upload(&mut self) -> Result<(), ObjectStoreError> {
+        let mut upload = self.upload.lock().await;
+        upload.complete().await?;
+        Ok(())
     }
 }
 
@@ -585,8 +604,7 @@ impl ObjectOutputStream {
             if !self.buffer.is_empty() {
                 self.upload_buffer()?;
             }
-            let mut upload = self.upload.lock().map_err(PythonError::from)?;
-            match rt().block_on(upload.complete()) {
+            match rt().block_on(self.complete_upload()) {
                 Ok(_) => Ok(()),
                 Err(err) => Err(PyIOError::new_err(err.to_string())),
             }
