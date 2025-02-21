@@ -1765,7 +1765,7 @@ fn filestats_to_expression_next<'py>(
             })?
             .data_type()
             .clone();
-        let column_type = PyArrowType(column_type).into_py(py);
+        let column_type = PyArrowType(column_type).into_pyobject(py)?;
         pa.call_method1("scalar", (value,))?
             .call_method1("cast", (column_type,))
     };
