@@ -1,4 +1,4 @@
-from deltalake._internal import TableFeatures, __version__, rust_core_version
+from deltalake._internal import TableFeatures, __version__, rust_core_version, use_kms_client
 from deltalake.query import QueryBuilder
 from deltalake.schema import DataType, Field, Schema
 from deltalake.table import DeltaTable, Metadata, Transaction

@@ -6,6 +6,7 @@ mod query;
 mod schema;
 mod utils;
 mod writer;
+mod encryption;
 
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
@@ -91,6 +92,7 @@ use jemallocator::Jemalloc;
 
 #[cfg(any(not(target_family = "unix"), target_os = "emscripten"))]
 use mimalloc::MiMalloc;
+use crate::encryption::{KmsClient, PyKmsClient};
 
 #[global_allocator]
 #[cfg(all(target_family = "unix", not(target_os = "emscripten")))]
@@ -99,6 +101,21 @@ static ALLOC: Jemalloc = Jemalloc;
 #[global_allocator]
 #[cfg(any(not(target_family = "unix"), target_os = "emscripten"))]
 static ALLOC: MiMalloc = MiMalloc;
+
+#[pyfunction]
+fn use_kms_client<'py>(client: Bound<'py, PyAny>) -> PyResult<String> {
+    let client = PyKmsClient::new(client)?;
+    let key: Vec<u8> = b"0123456789012345".into();
+    let master_identifier = "kf";
+    let wrapped = client.wrap_key(&key, master_identifier)
+        .map_err(|e| PyErr::new::<PyRuntimeError, _>(e.to_string()))?;
+    let unwrapped = client.unwrap_key(&wrapped, master_identifier)
+        .map_err(|e| PyErr::new::<PyRuntimeError, _>(e.to_string()))?;
+    if unwrapped != key {
+        return Err(PyErr::new::<PyRuntimeError, _>(format!("Unwrapped != orig key. Unwrapped = '{:?}', orig = '{:?}'", unwrapped, key)))
+    }
+    Ok("Success".into())
+}
 
 #[derive(FromPyObject)]
 enum PartitionFilterValue {
@@ -2582,6 +2599,7 @@ fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
         get_num_idx_cols_and_stats_columns,
         m
     )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(use_kms_client, m)?)?;
     m.add_class::<RawDeltaTable>()?;
     m.add_class::<PyMergeBuilder>()?;
     m.add_class::<PyQueryBuilder>()?;
