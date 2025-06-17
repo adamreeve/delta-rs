@@ -6,6 +6,7 @@ use std::fmt;
 use std::fmt::Formatter;
 
 use chrono::{DateTime, Utc};
+use datafusion::config::TableParquetOptions;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{path::Path, ObjectStore};
 use serde::de::{Error, SeqAccess, Visitor};
@@ -74,6 +75,8 @@ pub struct DeltaTable {
     pub config: DeltaTableConfig,
     /// log store
     pub(crate) log_store: LogStoreRef,
+    /// Options for reading Parquet files
+    pub(crate) parquet_options: Option<TableParquetOptions>,
 }
 
 impl Serialize for DeltaTable {
@@ -124,6 +127,7 @@ impl<'de> Deserialize<'de> for DeltaTable {
                     state,
                     config,
                     log_store,
+                    parquet_options: None, // TODO
                 };
                 Ok(table)
             }
@@ -143,6 +147,7 @@ impl DeltaTable {
             state: None,
             log_store,
             config,
+            parquet_options: None,
         }
     }
 
@@ -156,7 +161,13 @@ impl DeltaTable {
             state: Some(state),
             log_store,
             config: Default::default(),
+            parquet_options: None,
         }
+    }
+
+    pub fn with_parquet_options(mut self, options: TableParquetOptions) -> Self {
+        self.parquet_options = Some(options);
+        self
     }
 
     /// get a shared reference to the delta object store
