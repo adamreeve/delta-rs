@@ -116,10 +116,8 @@ async fn read_table(
     let table = deltalake::open_table(String::from(uri)).await?;
     let mut parquet_options = TableParquetOptions::default();
     parquet_options.crypto.file_decryption = Some(decryption_properties.into());
-    let (_table, stream) = DeltaOps(table)
-        .load()
-        .with_parquet_options(parquet_options)
-        .await?;
+    let table = table.with_parquet_options(parquet_options);
+    let (_table, stream) = DeltaOps(table).load().await?;
     let data: Vec<RecordBatch> = collect_sendable_stream(stream).await?;
 
     println!("{data:?}");
