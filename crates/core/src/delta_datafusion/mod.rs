@@ -480,6 +480,7 @@ pub(crate) struct DeltaScanBuilder<'a> {
     limit: Option<usize>,
     files: Option<&'a [Add]>,
     config: Option<DeltaScanConfig>,
+    parquet_options: Option<TableParquetOptions>,
 }
 
 impl<'a> DeltaScanBuilder<'a> {
@@ -497,6 +498,7 @@ impl<'a> DeltaScanBuilder<'a> {
             limit: None,
             files: None,
             config: None,
+            parquet_options: None,
         }
     }
 
@@ -522,6 +524,11 @@ impl<'a> DeltaScanBuilder<'a> {
 
     pub fn with_scan_config(mut self, config: DeltaScanConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    pub fn with_parquet_options(mut self, parquet_options: Option<TableParquetOptions>) -> Self {
+        self.parquet_options = parquet_options;
         self
     }
 
@@ -729,10 +736,10 @@ impl<'a> DeltaScanBuilder<'a> {
 
         let stats = stats.unwrap_or(Statistics::new_unknown(&schema));
 
-        let parquet_options = TableParquetOptions {
+        let parquet_options = self.parquet_options.unwrap_or_else(|| TableParquetOptions {
             global: self.session.config().options().execution.parquet.clone(),
             ..Default::default()
-        };
+        });
 
         let mut file_source = ParquetSource::new(parquet_options);
 
@@ -857,6 +864,7 @@ impl TableProvider for DeltaTable {
             .with_projection(projection)
             .with_limit(limit)
             .with_filter(filter_expr)
+            .with_parquet_options(self.parquet_options.clone())
             .build()
             .await?;
 

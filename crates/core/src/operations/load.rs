@@ -1,10 +1,10 @@
-use std::sync::Arc;
-
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::{SessionContext, TaskContext};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures::future::BoxFuture;
+use std::sync::Arc;
 
 use super::CustomExecuteHandler;
 use crate::delta_datafusion::DataFusionMixins;
@@ -22,6 +22,8 @@ pub struct LoadBuilder {
     log_store: LogStoreRef,
     /// A sub-selection of columns to be loaded
     columns: Option<Vec<String>>,
+    /// Options for reading Parquet files
+    parquet_options: Option<TableParquetOptions>,
 }
 
 impl super::Operation<()> for LoadBuilder {
@@ -40,12 +42,18 @@ impl LoadBuilder {
             snapshot,
             log_store,
             columns: None,
+            parquet_options: None,
         }
     }
 
     /// Specify column selection to load
     pub fn with_columns(mut self, columns: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.columns = Some(columns.into_iter().map(|s| s.into()).collect());
+        self
+    }
+
+    pub fn with_parquet_options(mut self, parquet_options: TableParquetOptions) -> Self {
+        self.parquet_options = Some(parquet_options);
         self
     }
 }
@@ -63,7 +71,11 @@ impl std::future::IntoFuture for LoadBuilder {
                 return Err(DeltaTableError::NotInitializedWithFiles("reading".into()));
             }
 
-            let table = DeltaTable::new_with_state(this.log_store, this.snapshot);
+            let mut table = DeltaTable::new_with_state(this.log_store, this.snapshot);
+            if let Some(parquet_options) = this.parquet_options {
+                table = table.with_parquet_options(parquet_options);
+            }
+
             let schema = table.snapshot()?.arrow_schema()?;
             let projection = this
                 .columns
