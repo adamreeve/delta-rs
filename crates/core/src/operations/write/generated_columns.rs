@@ -45,7 +45,7 @@ pub fn add_missing_generated_columns(
             missing_cols.push(col_name.to_string());
             df = df
                 .clone()
-                .with_column(col_name, Expr::Literal(ScalarValue::Null))?;
+                .with_column(col_name, Expr::Literal(ScalarValue::Null, None))?;
         }
     }
     Ok((df, missing_cols))

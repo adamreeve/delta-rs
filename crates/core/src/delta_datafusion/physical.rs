@@ -111,6 +111,13 @@ impl ExecutionPlan for MetricObserverExec {
         self.parent.statistics()
     }
 
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> DataFusionResult<datafusion::common::Statistics> {
+        self.parent.partition_statistics(partition)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,

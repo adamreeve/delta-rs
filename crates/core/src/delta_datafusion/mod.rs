@@ -51,7 +51,7 @@ use datafusion::common::{
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::physical_plan::{
     wrap_partition_type_in_dict, wrap_partition_value_in_dict, FileGroup, FileScanConfigBuilder,
-    ParquetSource,
+    FileSource, ParquetSource,
 };
 use datafusion::datasource::{listing::PartitionedFile, MemTable, TableProvider, TableType};
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState, TaskContext};
@@ -480,6 +480,7 @@ pub(crate) struct DeltaScanBuilder<'a> {
     limit: Option<usize>,
     files: Option<&'a [Add]>,
     config: Option<DeltaScanConfig>,
+    parquet_options: Option<TableParquetOptions>,
 }
 
 impl<'a> DeltaScanBuilder<'a> {
@@ -497,6 +498,7 @@ impl<'a> DeltaScanBuilder<'a> {
             limit: None,
             files: None,
             config: None,
+            parquet_options: None,
         }
     }
 
@@ -522,6 +524,11 @@ impl<'a> DeltaScanBuilder<'a> {
 
     pub fn with_scan_config(mut self, config: DeltaScanConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    pub fn with_parquet_options(mut self, parquet_options: Option<TableParquetOptions>) -> Self {
+        self.parquet_options = parquet_options;
         self
     }
 
@@ -729,44 +736,42 @@ impl<'a> DeltaScanBuilder<'a> {
 
         let stats = stats.unwrap_or(Statistics::new_unknown(&schema));
 
-        let parquet_options = TableParquetOptions {
-            global: self.session.config().options().execution.parquet.clone(),
-            ..Default::default()
-        };
+        let parquet_options = self
+            .parquet_options
+            .unwrap_or_else(|| self.session.table_options().parquet.clone());
 
-        let mut file_source = ParquetSource::new(parquet_options)
-            .with_schema_adapter_factory(Arc::new(DeltaSchemaAdapterFactory {}));
+        let mut file_source = ParquetSource::new(parquet_options);
 
         // Sometimes (i.e Merge) we want to prune files that don't make the
         // filter and read the entire contents for files that do match the
         // filter
         if let Some(predicate) = pushdown_filter {
             if config.enable_parquet_pushdown {
-                file_source = file_source.with_predicate(Arc::clone(&file_schema), predicate);
+                file_source = file_source.with_predicate(predicate);
             }
         };
 
-        let file_scan_config = FileScanConfigBuilder::new(
-            self.log_store.object_store_url(),
-            file_schema,
-            Arc::new(file_source),
-        )
-        .with_file_groups(
-            // If all files were filtered out, we still need to emit at least one partition to
-            // pass datafusion sanity checks.
-            //
-            // See https://github.com/apache/datafusion/issues/11322
-            if file_groups.is_empty() {
-                vec![FileGroup::from(vec![])]
-            } else {
-                file_groups.into_values().map(FileGroup::from).collect()
-            },
-        )
-        .with_statistics(stats)
-        .with_projection(self.projection.cloned())
-        .with_limit(self.limit)
-        .with_table_partition_cols(table_partition_cols)
-        .build();
+        let file_source =
+            file_source.with_schema_adapter_factory(Arc::new(DeltaSchemaAdapterFactory {}))?;
+
+        let file_scan_config =
+            FileScanConfigBuilder::new(self.log_store.object_store_url(), file_schema, file_source)
+                .with_file_groups(
+                    // If all files were filtered out, we still need to emit at least one partition to
+                    // pass datafusion sanity checks.
+                    //
+                    // See https://github.com/apache/datafusion/issues/11322
+                    if file_groups.is_empty() {
+                        vec![FileGroup::from(vec![])]
+                    } else {
+                        file_groups.into_values().map(FileGroup::from).collect()
+                    },
+                )
+                .with_statistics(stats)
+                .with_projection(self.projection.cloned())
+                .with_limit(self.limit)
+                .with_table_partition_cols(table_partition_cols)
+                .build();
 
         let metrics = ExecutionPlanMetricsSet::new();
         MetricBuilder::new(&metrics)
@@ -858,6 +863,7 @@ impl TableProvider for DeltaTable {
             .with_projection(projection)
             .with_limit(limit)
             .with_filter(filter_expr)
+            .with_parquet_options(self.parquet_options.clone())
             .build()
             .await?;
 
@@ -928,7 +934,7 @@ fn expr_is_exact_predicate_for_cols(partition_cols: &[String], expr: &Expr) -> b
                 Ok(TreeNodeRecursion::Stop)
             }
         }
-        Expr::Literal(_)
+        Expr::Literal(_, _)
         | Expr::Not(_)
         | Expr::IsNotNull(_)
         | Expr::IsNull(_)
@@ -1675,7 +1681,7 @@ impl TreeNodeVisitor<'_> for FindFilesExprProperties {
                 }
             }
             Expr::ScalarVariable(_, _)
-            | Expr::Literal(_)
+            | Expr::Literal(_, _)
             | Expr::Alias(_)
             | Expr::BinaryExpr(_)
             | Expr::Like(_)

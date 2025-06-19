@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use datafusion::common::error::DataFusionError;
 use datafusion::sql::parser::{DFParserBuilder, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{ObjectName, Value};
 use datafusion::sql::sqlparser::dialect::{keywords::Keyword, Dialect, GenericDialect};
@@ -10,7 +11,10 @@ use datafusion::sql::sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 // Use `Parser::expected` instead, if possible
 macro_rules! parser_err {
     ($MSG:expr) => {
-        Err(ParserError::ParserError($MSG.to_string()))
+        Err(DataFusionError::SQL(
+            ParserError::ParserError($MSG.to_string()),
+            None,
+        ))
     };
 }
 
@@ -74,16 +78,21 @@ pub struct DeltaParser<'a> {
 
 impl<'a> DeltaParser<'a> {
     /// Create a new parser for the specified tokens using the [`GenericDialect`].
-    pub fn new(sql: &'a str) -> Result<Self, ParserError> {
+    pub fn new(sql: &'a str) -> Result<Self, DataFusionError> {
         let dialect = &GenericDialect {};
         DeltaParser::new_with_dialect(sql, dialect)
     }
 
     /// Create a new parser for the specified tokens with the
     /// specified dialect.
-    pub fn new_with_dialect(sql: &'a str, dialect: &'a dyn Dialect) -> Result<Self, ParserError> {
+    pub fn new_with_dialect(
+        sql: &'a str,
+        dialect: &'a dyn Dialect,
+    ) -> Result<Self, DataFusionError> {
         let mut tokenizer = Tokenizer::new(dialect, sql);
-        let tokens = tokenizer.tokenize()?;
+        let tokens = tokenizer
+            .tokenize()
+            .map_err(|te| DataFusionError::SQL(ParserError::TokenizerError(te.message), None))?;
 
         Ok(Self {
             sql,
@@ -93,7 +102,7 @@ impl<'a> DeltaParser<'a> {
 
     /// Parse a sql string into one or [`Statement`]s using the
     /// [`GenericDialect`].
-    pub fn parse_sql(sql: impl AsRef<str>) -> Result<VecDeque<Statement>, ParserError> {
+    pub fn parse_sql(sql: impl AsRef<str>) -> Result<VecDeque<Statement>, DataFusionError> {
         let dialect: &GenericDialect = &GenericDialect {};
         DeltaParser::parse_sql_with_dialect(sql.as_ref(), dialect)
     }
@@ -103,7 +112,7 @@ impl<'a> DeltaParser<'a> {
     pub fn parse_sql_with_dialect(
         sql: &str,
         dialect: &dyn Dialect,
-    ) -> Result<VecDeque<Statement>, ParserError> {
+    ) -> Result<VecDeque<Statement>, DataFusionError> {
         let mut parser = DeltaParser::new_with_dialect(sql, dialect)?;
         let mut stmts = VecDeque::new();
         let mut expecting_statement_delimiter = false;
@@ -129,12 +138,12 @@ impl<'a> DeltaParser<'a> {
     }
 
     /// Report an unexpected token
-    fn expected<T>(&self, expected: &str, found: TokenWithSpan) -> Result<T, ParserError> {
+    fn expected<T>(&self, expected: &str, found: TokenWithSpan) -> Result<T, DataFusionError> {
         parser_err!(format!("Expected {expected}, found: {found}"))
     }
 
     /// Parse a new expression
-    pub fn parse_statement(&mut self) -> Result<Statement, ParserError> {
+    pub fn parse_statement(&mut self) -> Result<Statement, DataFusionError> {
         match self.parser.peek_token().token {
             Token::Word(w) => {
                 match w.keyword {
@@ -161,9 +170,9 @@ impl<'a> DeltaParser<'a> {
         }
     }
 
-    pub fn parse_vacuum(&mut self) -> Result<Statement, ParserError> {
+    pub fn parse_vacuum(&mut self) -> Result<Statement, DataFusionError> {
         let table_name = self.parser.parse_object_name(false)?;
-        match self.parser.peek_token().token {
+        let result = match self.parser.peek_token().token {
             Token::Word(w) => match w.keyword {
                 Keyword::RETAIN => {
                     self.parser.next_token();
@@ -176,9 +185,8 @@ impl<'a> DeltaParser<'a> {
                         )),
                     }?;
                     if !self.parser.parse_keyword(Keyword::HOURS) {
-                        return Err(ParserError::ParserError(
-                            "Expected keyword 'HOURS'".to_string(),
-                        ));
+                        let pe = ParserError::ParserError("Expected keyword 'HOURS'".to_string());
+                        return Err(DataFusionError::SQL(pe, None));
                     };
                     Ok(Statement::Vacuum(VacuumStatement {
                         table: table_name,
@@ -216,7 +224,8 @@ impl<'a> DeltaParser<'a> {
                     )))
                 }
             }
-        }
+        };
+        result.map_err(|pe| DataFusionError::SQL(pe, None))
     }
 }
 
@@ -226,7 +235,7 @@ mod tests {
     use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart};
     use datafusion::sql::sqlparser::tokenizer::Span;
 
-    fn expect_parse_ok(sql: &str, expected: Statement) -> Result<(), ParserError> {
+    fn expect_parse_ok(sql: &str, expected: Statement) -> Result<(), DataFusionError> {
         let statements = DeltaParser::parse_sql(sql)?;
         assert_eq!(
             statements.len(),
@@ -287,7 +296,7 @@ mod tests {
 
         let res = DeltaParser::parse_sql("VACUUM data_table DRY").unwrap_err();
         match res {
-            ParserError::ParserError(msg) => {
+            DataFusionError::SQL(ParserError::ParserError(msg), _) => {
                 assert_eq!("Expected keyword 'RUN'", msg);
             }
             _ => unreachable!(),

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
+use datafusion::common::ColumnStatistics;
 use datafusion::datasource::schema_adapter::{SchemaAdapter, SchemaAdapterFactory, SchemaMapper};
 
 use crate::operations::cast::cast_record_batch;
@@ -74,5 +75,13 @@ impl SchemaMapper for SchemaMapping {
     fn map_batch(&self, batch: RecordBatch) -> datafusion::common::Result<RecordBatch> {
         let record_batch = cast_record_batch(&batch, self.projected_schema.clone(), false, true)?;
         Ok(record_batch)
+    }
+
+    fn map_column_statistics(
+        &self,
+        file_col_statistics: &[ColumnStatistics],
+    ) -> datafusion::common::Result<Vec<ColumnStatistics>> {
+        // TODO: Check whether any mapping is needed here
+        Ok(file_col_statistics.into())
     }
 }
