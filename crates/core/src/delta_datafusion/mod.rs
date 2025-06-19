@@ -736,10 +736,9 @@ impl<'a> DeltaScanBuilder<'a> {
 
         let stats = stats.unwrap_or(Statistics::new_unknown(&schema));
 
-        let parquet_options = self.parquet_options.unwrap_or_else(|| TableParquetOptions {
-            global: self.session.config().options().execution.parquet.clone(),
-            ..Default::default()
-        });
+        let parquet_options = self
+            .parquet_options
+            .unwrap_or_else(|| self.session.table_options().parquet.clone());
 
         let mut file_source = ParquetSource::new(parquet_options);
 
