@@ -114,10 +114,14 @@ mod schema_adapter;
 impl From<DeltaTableError> for DataFusionError {
     fn from(err: DeltaTableError) -> Self {
         match err {
-            DeltaTableError::Arrow { source } => DataFusionError::ArrowError(source, None),
+            DeltaTableError::Arrow { source } => {
+                DataFusionError::ArrowError(Box::new(source), None)
+            }
             DeltaTableError::Io { source } => DataFusionError::IoError(source),
-            DeltaTableError::ObjectStore { source } => DataFusionError::ObjectStore(source),
-            DeltaTableError::Parquet { source } => DataFusionError::ParquetError(source),
+            DeltaTableError::ObjectStore { source } => {
+                DataFusionError::ObjectStore(Box::new(source))
+            }
+            DeltaTableError::Parquet { source } => DataFusionError::ParquetError(Box::new(source)),
             _ => DataFusionError::External(Box::new(err)),
         }
     }
@@ -126,10 +130,12 @@ impl From<DeltaTableError> for DataFusionError {
 impl From<DataFusionError> for DeltaTableError {
     fn from(err: DataFusionError) -> Self {
         match err {
-            DataFusionError::ArrowError(source, _) => DeltaTableError::Arrow { source },
+            DataFusionError::ArrowError(source, _) => DeltaTableError::Arrow { source: *source },
             DataFusionError::IoError(source) => DeltaTableError::Io { source },
-            DataFusionError::ObjectStore(source) => DeltaTableError::ObjectStore { source },
-            DataFusionError::ParquetError(source) => DeltaTableError::Parquet { source },
+            DataFusionError::ObjectStore(source) => {
+                DeltaTableError::ObjectStore { source: *source }
+            }
+            DataFusionError::ParquetError(source) => DeltaTableError::Parquet { source: *source },
             _ => DeltaTableError::Generic(err.to_string()),
         }
     }
