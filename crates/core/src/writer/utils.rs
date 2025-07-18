@@ -16,6 +16,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::errors::DeltaResult;
+use crate::writer::properties::WriterPropertiesFactory;
 use crate::writer::DeltaWriterError;
 
 /// Generate the name of the file to be written
@@ -26,7 +27,7 @@ pub(crate) fn next_data_path(
     prefix: &Path,
     part_count: usize,
     writer_id: &Uuid,
-    writer_properties: &WriterProperties,
+    writer_properties_factory: &WriterPropertiesFactory,
 ) -> Path {
     fn compression_to_str(compression: &Compression) -> &str {
         match compression {
@@ -46,7 +47,7 @@ pub(crate) fn next_data_path(
     // We can not access the default column properties but the current implementation will return
     // the default compression when the column is not found
     let column_path = ColumnPath::new(Vec::new());
-    let compression = writer_properties.compression(&column_path);
+    let compression = writer_properties_factory.compression(&column_path);
 
     let part = format!("{part_count:0>5}");
 
@@ -166,58 +167,51 @@ mod tests {
         let uuid = Uuid::parse_str("02f09a3f-1624-3b1d-8409-44eff7708208").unwrap();
 
         // Validated against Spark
-        let props = WriterProperties::builder()
-            .set_compression(Compression::UNCOMPRESSED)
-            .build();
+        let mut props = WriterPropertiesFactory::default();
+        props.set_compression(Compression::UNCOMPRESSED);
 
         assert_eq!(
             next_data_path(&prefix, 1, &uuid, &props).as_ref(),
             "x=0/y=0/part-00001-02f09a3f-1624-3b1d-8409-44eff7708208-c000.parquet"
         );
 
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
+        let mut props = WriterPropertiesFactory::default();
+        props.set_compression(Compression::SNAPPY);
         assert_eq!(
             next_data_path(&prefix, 1, &uuid, &props).as_ref(),
             "x=0/y=0/part-00001-02f09a3f-1624-3b1d-8409-44eff7708208-c000.snappy.parquet"
         );
 
-        let props = WriterProperties::builder()
-            .set_compression(Compression::GZIP(GzipLevel::default()))
-            .build();
+        let mut props = WriterPropertiesFactory::default();
+        props.set_compression(Compression::GZIP(GzipLevel::default()));
         assert_eq!(
             next_data_path(&prefix, 1, &uuid, &props).as_ref(),
             "x=0/y=0/part-00001-02f09a3f-1624-3b1d-8409-44eff7708208-c000.gz.parquet"
         );
 
-        let props = WriterProperties::builder()
-            .set_compression(Compression::LZ4)
-            .build();
+        let mut props = WriterPropertiesFactory::default();
+        props.set_compression(Compression::LZ4);
         assert_eq!(
             next_data_path(&prefix, 1, &uuid, &props).as_ref(),
             "x=0/y=0/part-00001-02f09a3f-1624-3b1d-8409-44eff7708208-c000.lz4.parquet"
         );
 
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .build();
+        let mut props = WriterPropertiesFactory::default();
+        props.set_compression(Compression::ZSTD(ZstdLevel::default()));
         assert_eq!(
             next_data_path(&prefix, 1, &uuid, &props).as_ref(),
             "x=0/y=0/part-00001-02f09a3f-1624-3b1d-8409-44eff7708208-c000.zstd.parquet"
         );
 
-        let props = WriterProperties::builder()
-            .set_compression(Compression::LZ4_RAW)
-            .build();
+        let mut props = WriterPropertiesFactory::default();
+        props.set_compression(Compression::LZ4_RAW);
         assert_eq!(
             next_data_path(&prefix, 1, &uuid, &props).as_ref(),
             "x=0/y=0/part-00001-02f09a3f-1624-3b1d-8409-44eff7708208-c000.lz4raw.parquet"
         );
 
-        let props = WriterProperties::builder()
-            .set_compression(Compression::BROTLI(BrotliLevel::default()))
-            .build();
+        let mut props = WriterPropertiesFactory::default();
+        props.set_compression(Compression::BROTLI(BrotliLevel::default()));
         assert_eq!(
             next_data_path(&prefix, 1, &uuid, &props).as_ref(),
             "x=0/y=0/part-00001-02f09a3f-1624-3b1d-8409-44eff7708208-c000.br.parquet"

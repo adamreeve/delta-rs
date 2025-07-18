@@ -64,6 +64,7 @@ use crate::logstore::LogStoreRef;
 use crate::operations::cdc::*;
 use crate::protocol::DeltaOperation;
 use crate::table::state::DeltaTableState;
+use crate::writer::properties::WriterPropertiesFactory;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
 
 /// Custom column name used for marking internal [RecordBatch] rows as updated
@@ -86,8 +87,8 @@ pub struct UpdateBuilder {
     log_store: LogStoreRef,
     /// Datafusion session state relevant for executing the input plan
     state: Option<SessionState>,
-    /// Properties passed to underlying parquet writer for when files are rewritten
-    writer_properties: Option<WriterProperties>,
+    /// Factory for properties passed to underlying parquet writer when files are rewritten
+    writer_properties_factory: WriterPropertiesFactory,
     /// Additional information to add to the commit
     commit_properties: CommitProperties,
     /// safe_cast determines how data types that do not match the underlying table are handled
@@ -131,7 +132,7 @@ impl UpdateBuilder {
             snapshot,
             log_store,
             state: None,
-            writer_properties: None,
+            writer_properties_factory: WriterPropertiesFactory::default(),
             commit_properties: CommitProperties::default(),
             safe_cast: false,
             custom_execute_handler: None,
@@ -168,7 +169,8 @@ impl UpdateBuilder {
 
     /// Writer properties passed to parquet writer for when fiiles are rewritten
     pub fn with_writer_properties(mut self, writer_properties: WriterProperties) -> Self {
-        self.writer_properties = Some(writer_properties);
+        self.writer_properties_factory
+            .set_properties(writer_properties);
         self
     }
 
@@ -238,7 +240,7 @@ async fn execute(
     log_store: LogStoreRef,
     snapshot: DeltaTableState,
     state: SessionState,
-    writer_properties: Option<WriterProperties>,
+    writer_properties_factory: Arc<WriterPropertiesFactory>,
     mut commit_properties: CommitProperties,
     _safe_cast: bool,
     operation_id: Uuid,
@@ -393,7 +395,7 @@ async fn execute(
         log_store.object_store(Some(operation_id)).clone(),
         Some(snapshot.table_config().target_file_size() as usize),
         None,
-        writer_properties.clone(),
+        Arc::clone(&writer_properties_factory),
         writer_stats_config.clone(),
     )
     .await?;
@@ -455,7 +457,7 @@ async fn execute(
                     log_store.object_store(Some(operation_id)),
                     Some(snapshot.table_config().target_file_size() as usize),
                     None,
-                    writer_properties,
+                    writer_properties_factory,
                     writer_stats_config,
                 )
                 .await?;
@@ -509,7 +511,7 @@ impl std::future::IntoFuture for UpdateBuilder {
                 this.log_store.clone(),
                 this.snapshot,
                 state,
-                this.writer_properties,
+                Arc::new(this.writer_properties_factory),
                 this.commit_properties,
                 this.safe_cast,
                 operation_id,

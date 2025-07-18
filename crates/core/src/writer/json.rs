@@ -27,6 +27,7 @@ use crate::errors::DeltaTableError;
 use crate::kernel::{scalars::ScalarExt, Add, PartitionsExt};
 use crate::logstore::ObjectStoreRetryExt;
 use crate::table::builder::DeltaTableBuilder;
+use crate::writer::properties::WriterPropertiesFactory;
 use crate::writer::utils::ShareableBuffer;
 use crate::DeltaTable;
 
@@ -38,7 +39,7 @@ pub struct JsonWriter {
     table: DeltaTable,
     /// Optional schema to use, otherwise try to rely on the schema from the [DeltaTable]
     schema_ref: Option<ArrowSchemaRef>,
-    writer_properties: WriterProperties,
+    writer_properties_factory: Arc<WriterPropertiesFactory>,
     partition_columns: Vec<String>,
     arrow_writers: HashMap<String, DataArrowWriter>,
 }
@@ -47,7 +48,7 @@ pub struct JsonWriter {
 #[derive(Debug)]
 pub(crate) struct DataArrowWriter {
     arrow_schema: Arc<ArrowSchema>,
-    writer_properties: WriterProperties,
+    writer_properties_factory: Arc<WriterPropertiesFactory>,
     buffer: ShareableBuffer,
     arrow_writer: ArrowWriter<ShareableBuffer>,
     partition_values: IndexMap<String, Scalar>,
@@ -137,7 +138,7 @@ impl DataArrowWriter {
                 let arrow_writer = Self::new_underlying_writer(
                     new_buffer,
                     self.arrow_schema.clone(),
-                    self.writer_properties.clone(),
+                    &self.writer_properties_factory,
                 )?;
                 let _ = std::mem::replace(&mut self.arrow_writer, arrow_writer);
                 self.partition_values.clear();
@@ -149,13 +150,13 @@ impl DataArrowWriter {
 
     fn new(
         arrow_schema: Arc<ArrowSchema>,
-        writer_properties: WriterProperties,
+        writer_properties_factory: Arc<WriterPropertiesFactory>,
     ) -> Result<Self, ParquetError> {
         let buffer = ShareableBuffer::default();
         let arrow_writer = Self::new_underlying_writer(
             buffer.clone(),
             arrow_schema.clone(),
-            writer_properties.clone(),
+            &writer_properties_factory,
         )?;
 
         let partition_values = IndexMap::new();
@@ -163,7 +164,7 @@ impl DataArrowWriter {
 
         Ok(Self {
             arrow_schema,
-            writer_properties,
+            writer_properties_factory,
             buffer,
             arrow_writer,
             partition_values,
@@ -174,8 +175,13 @@ impl DataArrowWriter {
     fn new_underlying_writer(
         buffer: ShareableBuffer,
         arrow_schema: Arc<ArrowSchema>,
-        writer_properties: WriterProperties,
+        writer_properties_factory: &Arc<WriterPropertiesFactory>,
     ) -> Result<ArrowWriter<ShareableBuffer>, ParquetError> {
+        // TODO: Fix error handling. Factory should return ParquetError? Or DeltaTableError should be used?
+        // TODO: Get file path? Is it needed here?
+        let writer_properties = writer_properties_factory
+            .create_writer_properties("", &arrow_schema)
+            .map_err(|e| ParquetError::General(e.to_string()))?;
         ArrowWriter::try_new(buffer, arrow_schema, Some(writer_properties))
     }
 }
@@ -193,15 +199,12 @@ impl JsonWriter {
             .load()
             .await?;
         // Initialize writer properties for the underlying arrow writer
-        let writer_properties = WriterProperties::builder()
-            // NOTE: Consider extracting config for writer properties and setting more than just compression
-            .set_compression(Compression::SNAPPY)
-            .build();
+        let writer_properties_factory = Arc::new(WriterPropertiesFactory::default());
 
         Ok(Self {
             table,
             schema_ref: Some(schema_ref),
-            writer_properties,
+            writer_properties_factory,
             partition_columns: partition_columns.unwrap_or_default(),
             arrow_writers: HashMap::new(),
         })
@@ -214,14 +217,11 @@ impl JsonWriter {
         let partition_columns = metadata.partition_columns().clone();
 
         // Initialize writer properties for the underlying arrow writer
-        let writer_properties = WriterProperties::builder()
-            // NOTE: Consider extracting config for writer properties and setting more than just compression
-            .set_compression(Compression::SNAPPY)
-            .build();
+        let writer_properties_factory = Arc::new(WriterPropertiesFactory::default());
 
         Ok(Self {
             table: table.clone(),
-            writer_properties,
+            writer_properties_factory,
             partition_columns,
             schema_ref: None,
             arrow_writers: HashMap::new(),
@@ -318,7 +318,6 @@ impl DeltaWriter<Vec<Value>> for JsonWriter {
         let arrow_schema = self.arrow_schema();
         let divided = self.divide_by_partition_values(values)?;
         let partition_columns = self.partition_columns.clone();
-        let writer_properties = self.writer_properties.clone();
 
         for (key, values) in divided {
             match self.arrow_writers.get_mut(&key) {
@@ -330,7 +329,8 @@ impl DeltaWriter<Vec<Value>> for JsonWriter {
                 }
                 None => {
                     let schema = arrow_schema_without_partitions(&arrow_schema, &partition_columns);
-                    let mut writer = DataArrowWriter::new(schema, writer_properties.clone())?;
+                    let mut writer =
+                        DataArrowWriter::new(schema, Arc::clone(&self.writer_properties_factory))?;
                     let result = writer
                         .write_values(&partition_columns, arrow_schema.clone(), values)
                         .await;
@@ -377,7 +377,7 @@ impl DeltaWriter<Vec<Value>> for JsonWriter {
             let prefix = Path::parse(prefix)?;
             let uuid = Uuid::new_v4();
 
-            let path = next_data_path(&prefix, 0, &uuid, &writer.writer_properties);
+            let path = next_data_path(&prefix, 0, &uuid, &writer.writer_properties_factory);
             let obj_bytes = Bytes::from(writer.buffer.to_vec());
             let file_size = obj_bytes.len() as i64;
             self.table

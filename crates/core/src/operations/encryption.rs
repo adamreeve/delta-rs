@@ -1,0 +1,45 @@
+//! Configuration for Parquet modular encryption
+
+use crate::DeltaResult;
+use arrow_schema::Schema;
+use datafusion::config::EncryptionFactoryOptions;
+use datafusion::execution::parquet_encryption::EncryptionFactory;
+use object_store::path::Path;
+use parquet::file::properties::WriterPropertiesBuilder;
+use std::sync::Arc;
+
+#[derive(Clone, Debug)]
+pub struct TableEncryption {
+    encryption_factory: Arc<dyn EncryptionFactory>,
+    configuration: EncryptionFactoryOptions,
+}
+
+impl TableEncryption {
+    pub fn new(
+        encryption_factory: Arc<dyn EncryptionFactory>,
+        configuration: EncryptionFactoryOptions,
+    ) -> Self {
+        Self {
+            encryption_factory,
+            configuration,
+        }
+    }
+
+    pub fn update_writer_properties(
+        &self,
+        mut builder: WriterPropertiesBuilder,
+        file_path: &str,
+        file_schema: &Arc<Schema>,
+    ) -> DeltaResult<WriterPropertiesBuilder> {
+        let object_path = Path::parse(file_path)?;
+        let encryption_properties = self.encryption_factory.get_file_encryption_properties(
+            &self.configuration,
+            file_schema,
+            &object_path,
+        )?;
+        if let Some(encryption_properties) = encryption_properties {
+            builder = builder.with_file_encryption_properties(encryption_properties);
+        }
+        Ok(builder)
+    }
+}

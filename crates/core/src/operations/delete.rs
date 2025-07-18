@@ -60,6 +60,7 @@ use crate::operations::write::WriterStatsConfig;
 use crate::operations::CustomExecuteHandler;
 use crate::protocol::DeltaOperation;
 use crate::table::state::DeltaTableState;
+use crate::writer::properties::WriterPropertiesFactory;
 use crate::{DeltaTable, DeltaTableError};
 
 const SOURCE_COUNT_ID: &str = "delete_source_count";
@@ -76,8 +77,8 @@ pub struct DeleteBuilder {
     log_store: LogStoreRef,
     /// Datafusion session state relevant for executing the input plan
     state: Option<SessionState>,
-    /// Properties passed to underlying parquet writer for when files are rewritten
-    writer_properties: Option<WriterProperties>,
+    /// Factory for properties passed to underlying parquet writer when files are rewritten
+    writer_properties_factory: WriterPropertiesFactory,
     /// Commit properties and configuration
     commit_properties: CommitProperties,
     custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
@@ -120,7 +121,7 @@ impl DeleteBuilder {
             log_store,
             state: None,
             commit_properties: CommitProperties::default(),
-            writer_properties: None,
+            writer_properties_factory: WriterPropertiesFactory::default(),
             custom_execute_handler: None,
         }
     }
@@ -145,7 +146,8 @@ impl DeleteBuilder {
 
     /// Writer properties passed to parquet writer for when files are rewritten
     pub fn with_writer_properties(mut self, writer_properties: WriterProperties) -> Self {
-        self.writer_properties = Some(writer_properties);
+        self.writer_properties_factory
+            .set_properties(writer_properties);
         self
     }
 
@@ -194,7 +196,7 @@ async fn execute_non_empty_expr(
     expression: &Expr,
     rewrite: &[Add],
     metrics: &mut DeleteMetrics,
-    writer_properties: Option<WriterProperties>,
+    writer_properties_factory: Arc<WriterPropertiesFactory>,
     partition_scan: bool,
     operation_id: Uuid,
 ) -> DeltaResult<Vec<Action>> {
@@ -259,7 +261,7 @@ async fn execute_non_empty_expr(
             log_store.object_store(Some(operation_id)),
             Some(snapshot.table_config().target_file_size() as usize),
             None,
-            writer_properties.clone(),
+            Arc::clone(&writer_properties_factory),
             writer_stats_config.clone(),
         )
         .await?;
@@ -295,7 +297,7 @@ async fn execute_non_empty_expr(
             log_store.object_store(Some(operation_id)),
             Some(snapshot.table_config().target_file_size() as usize),
             None,
-            writer_properties,
+            writer_properties_factory,
             writer_stats_config,
         )
         .await?;
@@ -311,7 +313,7 @@ async fn execute(
     log_store: LogStoreRef,
     snapshot: DeltaTableState,
     state: SessionState,
-    writer_properties: Option<WriterProperties>,
+    writer_properties_factory: Arc<WriterPropertiesFactory>,
     mut commit_properties: CommitProperties,
     operation_id: Uuid,
     handle: Option<&Arc<dyn CustomExecuteHandler>>,
@@ -338,7 +340,7 @@ async fn execute(
             &predicate,
             &candidates.candidates,
             &mut metrics,
-            writer_properties,
+            writer_properties_factory,
             candidates.partition_scan,
             operation_id,
         )
@@ -440,7 +442,7 @@ impl std::future::IntoFuture for DeleteBuilder {
                 this.log_store.clone(),
                 this.snapshot,
                 state,
-                this.writer_properties,
+                Arc::new(this.writer_properties_factory),
                 this.commit_properties,
                 operation_id,
                 this.custom_execute_handler.as_ref(),

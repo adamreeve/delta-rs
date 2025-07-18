@@ -56,6 +56,11 @@ pub mod constraints;
 #[cfg(feature = "datafusion")]
 pub mod delete;
 #[cfg(feature = "datafusion")]
+pub mod encryption;
+#[cfg(not(feature = "datafusion"))]
+#[path = "encryption_disabled.rs"]
+pub mod encryption;
+#[cfg(feature = "datafusion")]
 mod load;
 #[cfg(feature = "datafusion")]
 pub mod load_cdf;
@@ -198,11 +203,7 @@ impl DeltaOps {
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn load(self) -> LoadBuilder {
-        let builder = LoadBuilder::new(self.0.log_store, self.0.state.unwrap());
-        match self.0.parquet_options {
-            Some(parquet_options) => builder.with_parquet_options(parquet_options),
-            None => builder,
-        }
+        LoadBuilder::new(self.0.log_store, self.0.state.unwrap())
     }
 
     /// Load a table with CDF Enabled
@@ -216,7 +217,12 @@ impl DeltaOps {
     #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn write(self, batches: impl IntoIterator<Item = RecordBatch>) -> WriteBuilder {
-        WriteBuilder::new(self.0.log_store, self.0.state).with_input_batches(batches)
+        let mut builder =
+            WriteBuilder::new(self.0.log_store, self.0.state).with_input_batches(batches);
+        if let Some(encryption_config) = self.0.encryption_config {
+            builder = builder.with_encryption(encryption_config);
+        }
+        builder
     }
 
     /// Vacuum stale files from delta table

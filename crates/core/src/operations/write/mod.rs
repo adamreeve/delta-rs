@@ -46,8 +46,10 @@ use std::vec;
 use arrow_array::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::common::{Column, DFSchema, Result, ScalarValue};
+use datafusion::config::EncryptionFactoryOptions;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::{SessionContext, SessionState};
+use datafusion::execution::parquet_encryption::EncryptionFactory;
 use datafusion::logical_expr::{cast, lit, try_cast, Expr, Extension, LogicalPlan};
 use datafusion::prelude::DataFrame;
 use execution::{prepare_predicate_actions, write_execution_plan_v2};
@@ -74,8 +76,10 @@ use crate::kernel::{
     new_metadata, Action, ActionType, MetadataExt as _, ProtocolExt as _, StructType, StructTypeExt,
 };
 use crate::logstore::LogStoreRef;
+use crate::operations::encryption::TableEncryption;
 use crate::protocol::{DeltaOperation, SaveMode};
 use crate::table::state::DeltaTableState;
+use crate::writer::properties::WriterPropertiesFactory;
 use crate::DeltaTable;
 
 #[derive(thiserror::Error, Debug)]
@@ -151,8 +155,8 @@ pub struct WriteBuilder {
     schema_mode: Option<SchemaMode>,
     /// how to handle cast failures, either return NULL (safe=true) or return ERR (safe=false)
     safe_cast: bool,
-    /// Parquet writer properties
-    writer_properties: Option<WriterProperties>,
+    /// Factory to create Parquet writer properties
+    writer_properties_factory: WriterPropertiesFactory,
     /// Additional information to add to the commit
     commit_properties: CommitProperties,
     /// Name of the table, only used when table doesn't exist yet
@@ -203,13 +207,18 @@ impl WriteBuilder {
             write_batch_size: None,
             safe_cast: false,
             schema_mode: None,
-            writer_properties: None,
+            writer_properties_factory: WriterPropertiesFactory::default(),
             commit_properties: CommitProperties::default(),
             name: None,
             description: None,
             configuration: Default::default(),
             custom_execute_handler: None,
         }
+    }
+
+    pub fn with_encryption(mut self, encryption: TableEncryption) -> Self {
+        self.writer_properties_factory.set_encryption(encryption);
+        self
     }
 
     /// Specify the behavior when a table exists at location
@@ -273,7 +282,8 @@ impl WriteBuilder {
 
     /// Specify the writer properties to use when writing a parquet file
     pub fn with_writer_properties(mut self, writer_properties: WriterProperties) -> Self {
-        self.writer_properties = Some(writer_properties);
+        self.writer_properties_factory
+            .set_properties(writer_properties);
         self
     }
 
@@ -617,6 +627,8 @@ impl std::future::IntoFuture for WriteBuilder {
 
             let mut contains_cdc = false;
 
+            let writer_properties_factory = Arc::new(this.writer_properties_factory);
+
             // Collect remove actions if we are overwriting the table
             if let Some(snapshot) = &this.snapshot {
                 if matches!(this.mode, SaveMode::Overwrite) {
@@ -653,7 +665,7 @@ impl std::future::IntoFuture for WriteBuilder {
                                 snapshot,
                                 state.clone(),
                                 partition_columns.clone(),
-                                this.writer_properties.clone(),
+                                Arc::clone(&writer_properties_factory),
                                 deletion_timestamp,
                                 writer_stats_config.clone(),
                                 operation_id,
@@ -697,7 +709,7 @@ impl std::future::IntoFuture for WriteBuilder {
                 this.log_store.object_store(Some(operation_id)).clone(),
                 target_file_size,
                 this.write_batch_size,
-                this.writer_properties,
+                writer_properties_factory,
                 writer_stats_config.clone(),
                 predicate.clone(),
                 contains_cdc,

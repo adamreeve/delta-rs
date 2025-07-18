@@ -17,6 +17,7 @@ pub use record_batch::RecordBatchWriter;
 pub use stats::create_add;
 
 pub mod json;
+pub mod properties;
 pub mod record_batch;
 pub(crate) mod stats;
 pub mod utils;

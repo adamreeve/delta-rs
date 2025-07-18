@@ -13,6 +13,7 @@ use deltalake_core::operations::optimize::{
 };
 use deltalake_core::operations::DeltaOps;
 use deltalake_core::protocol::DeltaOperation;
+use deltalake_core::writer::properties::WriterPropertiesFactory;
 use deltalake_core::writer::{DeltaWriter, RecordBatchWriter};
 use deltalake_core::{DeltaTable, PartitionFilter, Path};
 use futures::TryStreamExt;
@@ -288,7 +289,7 @@ async fn test_conflict_for_remove_actions() -> Result<(), Box<dyn Error>> {
         dt.snapshot()?,
         &filter,
         None,
-        WriterProperties::builder().build(),
+        Arc::new(WriterPropertiesFactory::default()),
     )?;
 
     let uri = context.tmp_dir.path().to_str().to_owned().unwrap();
@@ -350,7 +351,7 @@ async fn test_no_conflict_for_append_actions() -> Result<(), Box<dyn Error>> {
         dt.snapshot()?,
         &filter,
         None,
-        WriterProperties::builder().build(),
+        Arc::new(WriterPropertiesFactory::default()),
     )?;
 
     let uri = context.tmp_dir.path().to_str().to_owned().unwrap();
@@ -409,7 +410,7 @@ async fn test_commit_interval() -> Result<(), Box<dyn Error>> {
         dt.snapshot()?,
         &[],
         None,
-        WriterProperties::builder().build(),
+        Arc::new(WriterPropertiesFactory::default()),
     )?;
 
     let metrics = plan

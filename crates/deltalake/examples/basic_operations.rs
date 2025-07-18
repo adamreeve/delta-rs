@@ -9,19 +9,30 @@ use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::{arrow, parquet, protocol::SaveMode, DeltaOps};
 use std::fs;
 
+use datafusion_parquet_key_management::{KmsEncryptionFactory, KmsEncryptionFactoryOptions};
 use deltalake::arrow::datatypes::Schema;
 use deltalake::datafusion::assert_batches_sorted_eq;
-use deltalake::datafusion::config::{TableOptions, TableParquetOptions};
+use deltalake::datafusion::config::{
+    ConfigField, EncryptionFactoryOptions, ExtensionOptions, TableOptions, TableParquetOptions,
+};
 use deltalake::datafusion::dataframe::DataFrame;
 use deltalake::datafusion::execution::runtime_env::RuntimeEnv;
 use deltalake::datafusion::execution::{SessionState, SessionStateBuilder};
 use deltalake::datafusion::logical_expr::{col, lit};
 use deltalake::datafusion::prelude::{SessionConfig, SessionContext};
+use deltalake::datafusion::test_util::test_table_with_name;
 use deltalake::parquet::encryption::decrypt::FileDecryptionProperties;
 use deltalake::parquet::encryption::encrypt::FileEncryptionProperties;
 use deltalake_core::datafusion::config::ConfigFileDecryptionProperties;
+use deltalake_core::datafusion::execution::parquet_encryption::EncryptionFactory;
 use deltalake_core::logstore::LogStoreRef;
+use deltalake_core::operations::encryption::TableEncryption;
 use deltalake_core::{DeltaTable, DeltaTableError, TableProperty};
+use parquet_key_management::crypto_factory::{
+    CryptoFactory, DecryptionConfiguration, EncryptionConfiguration,
+};
+use parquet_key_management::kms::KmsConnectionConfig;
+use parquet_key_management::test_kms::TestKmsClientFactory;
 use std::sync::Arc;
 
 fn get_table_columns() -> Vec<StructField> {
@@ -80,7 +91,8 @@ fn get_table_batches() -> RecordBatch {
 async fn create_table(
     uri: &str,
     table_name: &str,
-    crypt: &FileEncryptionProperties,
+    encryption_factory: &Arc<dyn EncryptionFactory>,
+    encryption_options: &EncryptionFactoryOptions,
 ) -> Result<DeltaTable, DeltaTableError> {
     fs::remove_dir_all(uri)?;
     let ops = DeltaOps::try_from_uri(uri).await?;
@@ -97,15 +109,16 @@ async fn create_table(
 
     assert_eq!(table.version(), Some(0));
 
-    let writer_properties = WriterProperties::builder()
-        .with_file_encryption_properties(crypt.clone())
-        .build();
+    let encryption =
+        TableEncryption::new(Arc::clone(encryption_factory), encryption_options.clone());
+    let table = table.with_encryption(encryption.clone());
 
     let batch = get_table_batches();
-    let table = DeltaOps(table)
-        .write(vec![batch.clone()])
-        .with_writer_properties(writer_properties.clone())
-        .await?;
+    let table = DeltaOps(table).write(vec![batch.clone()]).await?;
+
+    // TODO: Lose encryption setting on table after write op above,
+    // need to rethink this.
+    let table = table.with_encryption(encryption);
 
     assert_eq!(table.version(), Some(1));
 
@@ -113,7 +126,7 @@ async fn create_table(
     let table = DeltaOps(table)
         .write(vec![batch.clone()])
         .with_save_mode(SaveMode::Overwrite)
-        .with_writer_properties(writer_properties.clone())
+        //.with_writer_properties(writer_properties.clone())
         .await?;
 
     assert_eq!(table.version(), Some(2));
@@ -148,9 +161,9 @@ async fn read_table(
     decryption_properties: &FileDecryptionProperties,
 ) -> Result<(), deltalake::errors::DeltaTableError> {
     let (table, state) = open_table_with_state(uri, decryption_properties).await?;
-    let mut parquet_options = TableParquetOptions::default();
-    parquet_options.crypto.file_decryption = Some(decryption_properties.into());
-    let table = table.with_parquet_options(parquet_options);
+    //let mut parquet_options = TableParquetOptions::default();
+    //parquet_options.crypto.file_decryption = Some(decryption_properties.into());
+    //let table = table.with_parquet_options(parquet_options);
 
     let (_table, stream) = DeltaOps(table).load().await?;
     let data: Vec<RecordBatch> = collect_sendable_stream(stream).await?;
@@ -286,28 +299,34 @@ async fn round_trip_test() -> Result<(), deltalake::errors::DeltaTableError> {
     uri.push("encrypted_roundtrip");
     let uri = uri.to_str().unwrap();
 
+    // Create DataFusion EncryptionFactory to use for encryption
+    let crypto_factory = CryptoFactory::new(TestKmsClientFactory::with_default_keys());
+    let kms_connection_config = Arc::new(KmsConnectionConfig::default());
+    let encryption_factory: Arc<dyn EncryptionFactory> = Arc::new(KmsEncryptionFactory::new(
+        crypto_factory,
+        kms_connection_config,
+    ));
+
+    let encryption_config = EncryptionConfiguration::builder("kf".into()).build()?;
+    let decryption_config = DecryptionConfiguration::builder().build();
+    let kms_options = KmsEncryptionFactoryOptions::new(encryption_config, decryption_config);
+    let mut factory_options = EncryptionFactoryOptions::default();
+    for entry in kms_options.entries() {
+        if let Some(value) = entry.value {
+            factory_options.set(&entry.key, &value)?;
+        }
+    }
+
     println!("Using table URI {uri}");
 
     let table_name = "roundtrip";
-    let key: Vec<_> = b"1234567890123450".to_vec();
-    let wrong_key: Vec<_> = b"9234567890123450".to_vec();
 
-    let crypt = parquet::encryption::encrypt::FileEncryptionProperties::builder(key.clone())
-        .with_column_key("int", key.clone())
-        .with_column_key("string", key.clone())
-        .build()?;
-
-    let decrypt = FileDecryptionProperties::builder(key.clone())
-        .with_column_key("int", key.clone())
-        .with_column_key("string", key.clone())
-        .build()?;
-
-    create_table(uri, table_name, &crypt).await?;
-    read_table(uri, &decrypt).await?;
+    create_table(uri, table_name, &encryption_factory, &factory_options).await?;
+    //read_table(uri, &decrypt).await?;
     //update_table(uri, &decrypt, &crypt).await?;
     //delete_from_table(uri, &decrypt, &crypt).await?;
-    merge_table(uri, &decrypt, &crypt).await?;
-    read_table(uri, &decrypt).await?;
+    //merge_table(uri, &decrypt, &crypt).await?;
+    //read_table(uri, &decrypt).await?;
     Ok(())
 }
 

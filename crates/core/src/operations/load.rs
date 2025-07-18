@@ -71,10 +71,7 @@ impl std::future::IntoFuture for LoadBuilder {
                 return Err(DeltaTableError::NotInitializedWithFiles("reading".into()));
             }
 
-            let mut table = DeltaTable::new_with_state(this.log_store, this.snapshot);
-            if let Some(parquet_options) = this.parquet_options {
-                table = table.with_parquet_options(parquet_options);
-            }
+            let table = DeltaTable::new_with_state(this.log_store, this.snapshot);
 
             let schema = table.snapshot()?.arrow_schema()?;
             let projection = this

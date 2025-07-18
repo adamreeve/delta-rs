@@ -1,18 +1,21 @@
 //! Abstractions and implementations for writing data to delta tables
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SchemaRef as ArrowSchemaRef};
 use bytes::Bytes;
+use datafusion::config::EncryptionFactoryOptions;
+use datafusion::execution::parquet_encryption::EncryptionFactory;
 use delta_kernel::expressions::Scalar;
 use futures::{StreamExt, TryStreamExt};
 use indexmap::IndexMap;
 use object_store::{path::Path, ObjectStore};
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use parquet::encryption::encrypt::FileEncryptionProperties;
+use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use tokio::task::JoinSet;
 use tracing::debug;
 
@@ -21,6 +24,7 @@ use crate::crate_version;
 use crate::errors::{DeltaResult, DeltaTableError};
 use crate::kernel::{Add, PartitionsExt};
 use crate::logstore::ObjectStoreRef;
+use crate::writer::properties::WriterPropertiesFactory;
 use crate::writer::record_batch::{divide_by_partition_values, PartitionResult};
 use crate::writer::stats::create_add;
 use crate::writer::utils::{
@@ -99,8 +103,8 @@ pub struct WriterConfig {
     table_schema: ArrowSchemaRef,
     /// Column names for columns the table is partitioned by
     partition_columns: Vec<String>,
-    /// Properties passed to underlying parquet writer
-    writer_properties: WriterProperties,
+    /// Factory for properties to pass to underlying parquet writer
+    writer_properties_factory: Arc<WriterPropertiesFactory>,
     /// Size above which we will write a buffered parquet file to disk.
     target_file_size: usize,
     /// Row chunks passed to parquet writer. This and the internal parquet writer settings
@@ -117,24 +121,19 @@ impl WriterConfig {
     pub fn new(
         table_schema: ArrowSchemaRef,
         partition_columns: Vec<String>,
-        writer_properties: Option<WriterProperties>,
+        writer_properties_factory: Arc<WriterPropertiesFactory>,
         target_file_size: Option<usize>,
         write_batch_size: Option<usize>,
         num_indexed_cols: i32,
         stats_columns: Option<Vec<String>>,
     ) -> Self {
-        let writer_properties = writer_properties.unwrap_or_else(|| {
-            WriterProperties::builder()
-                .set_compression(Compression::SNAPPY)
-                .build()
-        });
         let target_file_size = target_file_size.unwrap_or(DEFAULT_TARGET_FILE_SIZE);
         let write_batch_size = write_batch_size.unwrap_or(DEFAULT_WRITE_BATCH_SIZE);
 
         Self {
             table_schema,
             partition_columns,
-            writer_properties,
+            writer_properties_factory,
             target_file_size,
             write_batch_size,
             num_indexed_cols,
@@ -170,7 +169,8 @@ impl DeltaWriter {
 
     /// Apply custom writer_properties to the underlying parquet writer
     pub fn with_writer_properties(mut self, writer_properties: WriterProperties) -> Self {
-        self.config.writer_properties = writer_properties;
+        let properties = Arc::make_mut(&mut self.config.writer_properties_factory);
+        properties.set_properties(writer_properties);
         self
     }
 
@@ -207,7 +207,7 @@ impl DeltaWriter {
                 let config = PartitionWriterConfig::try_new(
                     self.config.file_schema(),
                     partition_values.clone(),
-                    Some(self.config.writer_properties.clone()),
+                    Arc::clone(&self.config.writer_properties_factory),
                     Some(self.config.target_file_size),
                     Some(self.config.write_batch_size),
                 )?;
@@ -268,8 +268,8 @@ pub struct PartitionWriterConfig {
     prefix: Path,
     /// Values for all partition columns
     partition_values: IndexMap<String, Scalar>,
-    /// Properties passed to underlying parquet writer
-    writer_properties: WriterProperties,
+    /// Factory for properties to pass to underlying parquet writer
+    writer_properties_factory: Arc<WriterPropertiesFactory>,
     /// Size above which we will write a buffered parquet file to disk.
     target_file_size: usize,
     /// Row chunks passed to parquet writer. This and the internal parquet writer settings
@@ -282,17 +282,12 @@ impl PartitionWriterConfig {
     pub fn try_new(
         file_schema: ArrowSchemaRef,
         partition_values: IndexMap<String, Scalar>,
-        writer_properties: Option<WriterProperties>,
+        writer_properties_factory: Arc<WriterPropertiesFactory>,
         target_file_size: Option<usize>,
         write_batch_size: Option<usize>,
     ) -> DeltaResult<Self> {
         let part_path = partition_values.hive_partition_path();
         let prefix = Path::parse(part_path)?;
-        let writer_properties = writer_properties.unwrap_or_else(|| {
-            WriterProperties::builder()
-                .set_created_by(format!("delta-rs version {}", crate_version()))
-                .build()
-        });
         let target_file_size = target_file_size.unwrap_or(DEFAULT_TARGET_FILE_SIZE);
         let write_batch_size = write_batch_size.unwrap_or(DEFAULT_WRITE_BATCH_SIZE);
 
@@ -300,7 +295,7 @@ impl PartitionWriterConfig {
             file_schema,
             prefix,
             partition_values,
-            writer_properties,
+            writer_properties_factory,
             target_file_size,
             write_batch_size,
         })
@@ -334,10 +329,14 @@ impl PartitionWriter {
         stats_columns: Option<Vec<String>>,
     ) -> DeltaResult<Self> {
         let buffer = AsyncShareableBuffer::default();
+        // TODO: Need to refactor file path handling so path is known before creating AsyncArrowWriter
+        let writer_properties = config
+            .writer_properties_factory
+            .create_writer_properties("", &config.file_schema)?;
         let arrow_writer = AsyncArrowWriter::try_new(
             buffer.clone(),
             config.file_schema.clone(),
-            Some(config.writer_properties.clone()),
+            Some(writer_properties),
         )?;
 
         Ok(Self {
@@ -360,7 +359,7 @@ impl PartitionWriter {
             &self.config.prefix,
             self.part_counter,
             &self.writer_id,
-            &self.config.writer_properties,
+            &self.config.writer_properties_factory,
         )
     }
 
@@ -368,10 +367,15 @@ impl PartitionWriter {
         &mut self,
     ) -> DeltaResult<(AsyncArrowWriter<AsyncShareableBuffer>, AsyncShareableBuffer)> {
         let new_buffer = AsyncShareableBuffer::default();
+        // TODO: Correct path
+        let writer_properties = self
+            .config
+            .writer_properties_factory
+            .create_writer_properties("", &self.config.file_schema)?;
         let arrow_writer = AsyncArrowWriter::try_new(
             new_buffer.clone(),
             self.config.file_schema.clone(),
-            Some(self.config.writer_properties.clone()),
+            Some(writer_properties),
         )?;
         Ok((
             std::mem::replace(&mut self.arrow_writer, arrow_writer),
@@ -501,10 +505,14 @@ mod tests {
         target_file_size: Option<usize>,
         write_batch_size: Option<usize>,
     ) -> DeltaWriter {
+        let mut writer_properties_factory = WriterPropertiesFactory::default();
+        if let Some(writer_properties) = writer_properties {
+            writer_properties_factory.set_properties(writer_properties);
+        }
         let config = WriterConfig::new(
             batch.schema(),
             vec![],
-            writer_properties,
+            Arc::new(writer_properties_factory),
             target_file_size,
             write_batch_size,
             DEFAULT_NUM_INDEX_COLS,
@@ -520,10 +528,14 @@ mod tests {
         target_file_size: Option<usize>,
         write_batch_size: Option<usize>,
     ) -> PartitionWriter {
+        let mut writer_properties_factory = WriterPropertiesFactory::default();
+        if let Some(writer_properties) = writer_properties {
+            writer_properties_factory.set_properties(writer_properties);
+        }
         let config = PartitionWriterConfig::try_new(
             batch.schema(),
             IndexMap::new(),
-            writer_properties,
+            Arc::new(writer_properties_factory),
             target_file_size,
             write_batch_size,
         )
