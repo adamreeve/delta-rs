@@ -47,9 +47,9 @@ object_store = { version = "0.12.1" }
 parquet = { version = "55.2.0" }
 
 # datafusion
-datafusion = "48.0.0"
-datafusion-ffi = "48.0.0"
-datafusion-proto = "48.0.0"
+datafusion = { path = "../datafusion/datafusion/core" }
+datafusion-ffi = { path = "../datafusion/datafusion/ffi" }
+datafusion-proto = { path = "../datafusion/datafusion/proto" }
 
 # serde
 serde = { version = "1.0.194", features = ["derive"] }
