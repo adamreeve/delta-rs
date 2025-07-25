@@ -3063,8 +3063,8 @@ mod tests {
         assert_eq!("a", small.iter().next().unwrap().unwrap());
 
         let expected = vec![
-            ObjectStoreOperation::GetRange(LocationType::Data, 4952..4960),
-            ObjectStoreOperation::GetRange(LocationType::Data, 2399..4952),
+            ObjectStoreOperation::GetRange(LocationType::Data, 4950..4958),
+            ObjectStoreOperation::GetRange(LocationType::Data, 2399..4950),
             #[expect(clippy::single_range_in_vec_init)]
             ObjectStoreOperation::GetRanges(LocationType::Data, vec![4..58]),
         ];
