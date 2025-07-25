@@ -10,7 +10,6 @@ use datafusion::prelude::DataFrame;
 use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
 use futures::StreamExt;
 use object_store::prefix::PrefixStore;
-use parquet::file::properties::WriterProperties;
 use tracing::log::*;
 use uuid::Uuid;
 
@@ -29,10 +28,8 @@ use crate::DeltaTableError;
 use arrow::compute::concat_batches;
 use arrow_schema::Schema;
 use datafusion::catalog::TableProvider;
-use datafusion::config::EncryptionFactoryOptions;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
-use datafusion::execution::parquet_encryption::EncryptionFactory;
 use datafusion::logical_expr::col;
 
 use crate::operations::cdc::CDC_COLUMN_NAME;

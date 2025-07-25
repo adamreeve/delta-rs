@@ -17,8 +17,8 @@ use delta_kernel::engine::arrow_conversion::{TryIntoArrow, TryIntoKernel};
 use delta_kernel::expressions::Scalar;
 use indexmap::IndexMap;
 use object_store::{path::Path, ObjectStore};
+use parquet::file::properties::WriterProperties;
 use parquet::{arrow::ArrowWriter, errors::ParquetError};
-use parquet::{basic::Compression, file::properties::WriterProperties};
 use tracing::log::*;
 use uuid::Uuid;
 

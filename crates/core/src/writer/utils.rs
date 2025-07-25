@@ -10,7 +10,6 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use object_store::path::Path;
 use parking_lot::RwLock;
 use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 use serde_json::Value;
 use uuid::Uuid;

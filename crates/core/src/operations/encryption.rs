@@ -34,7 +34,7 @@ impl TableEncryption {
         let encryption_properties = self.encryption_factory.get_file_encryption_properties(
             &self.configuration,
             file_schema,
-            &file_path,
+            file_path,
         )?;
         if let Some(encryption_properties) = encryption_properties {
             builder = builder.with_file_encryption_properties(encryption_properties);

@@ -20,7 +20,6 @@
 //! let (table, metrics) = OptimizeBuilder::new(table.object_store(), table.state).await?;
 //! ````
 
-use arrow::csv::Writer;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef as ArrowSchemaRef;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
@@ -54,7 +53,7 @@ use crate::protocol::DeltaOperation;
 use crate::table::state::DeltaTableState;
 use crate::writer::properties::WriterPropertiesFactory;
 use crate::writer::utils::arrow_schema_without_partitions;
-use crate::{crate_version, DeltaTable, ObjectMeta, PartitionFilter};
+use crate::{DeltaTable, ObjectMeta, PartitionFilter};
 
 /// Metrics from Optimize
 #[derive(Default, Debug, PartialEq, Clone, Serialize, Deserialize)]
