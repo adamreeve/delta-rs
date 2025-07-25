@@ -166,10 +166,17 @@ impl RecordBatchWriter {
         let written_schema = match self.arrow_writers.get_mut(&partition_key) {
             Some(writer) => writer.write(&record_batch, mode)?,
             None => {
+                let prefix = Path::parse(&partition_key)?;
+                let uuid = Uuid::new_v4();
+                let path = next_data_path(&prefix, 0, &uuid, &self.writer_properties_factory);
+                let writer_properties = self
+                    .writer_properties_factory
+                    .create_writer_properties(&path, &arrow_schema)?;
                 let mut writer = PartitionWriter::new(
                     arrow_schema,
                     partition_values.clone(),
-                    self.writer_properties_factory.clone(),
+                    writer_properties,
+                    path,
                 )?;
                 let schema = writer.write(&record_batch, mode)?;
                 let _ = self.arrow_writers.insert(partition_key, writer);
@@ -237,18 +244,15 @@ impl DeltaWriter<RecordBatch> for RecordBatchWriter {
 
         for (_, writer) in writers {
             let metadata = writer.arrow_writer.close()?;
-            let prefix = Path::parse(writer.partition_values.hive_partition_path())?;
-            let uuid = Uuid::new_v4();
-            let path = next_data_path(&prefix, 0, &uuid, &writer.writer_properties_factory);
             let obj_bytes = Bytes::from(writer.buffer.to_vec());
             let file_size = obj_bytes.len() as i64;
             self.storage
-                .put_with_retries(&path, obj_bytes.into(), 15)
+                .put_with_retries(&writer.path, obj_bytes.into(), 15)
                 .await?;
 
             actions.push(create_add(
                 &writer.partition_values,
-                path.to_string(),
+                writer.path.to_string(),
                 file_size,
                 &metadata,
                 self.num_indexed_cols,
@@ -294,38 +298,38 @@ pub struct PartitionResult {
 
 struct PartitionWriter {
     arrow_schema: ArrowSchemaRef,
-    writer_properties_factory: WriterPropertiesFactory,
+    writer_properties: WriterProperties,
     pub(super) buffer: ShareableBuffer,
     pub(super) arrow_writer: ArrowWriter<ShareableBuffer>,
     pub(super) partition_values: IndexMap<String, Scalar>,
     pub(super) buffered_record_batch_count: usize,
+    pub(super) path: Path,
 }
 
 impl PartitionWriter {
     pub fn new(
         arrow_schema: ArrowSchemaRef,
         partition_values: IndexMap<String, Scalar>,
-        writer_properties_factory: WriterPropertiesFactory,
+        writer_properties: WriterProperties,
+        path: Path,
     ) -> Result<Self, ParquetError> {
         let buffer = ShareableBuffer::default();
-        let writer_properties = writer_properties_factory
-            .create_writer_properties("", &arrow_schema)
-            .map_err(|e| ParquetError::General(e.to_string()))?;
         let arrow_writer = ArrowWriter::try_new(
             buffer.clone(),
             arrow_schema.clone(),
-            Some(writer_properties),
+            Some(writer_properties.clone()),
         )?;
 
         let buffered_record_batch_count = 0;
 
         Ok(Self {
             arrow_schema,
-            writer_properties_factory,
+            writer_properties,
             buffer,
             arrow_writer,
             partition_values,
             buffered_record_batch_count,
+            path,
         })
     }
 
@@ -389,13 +393,10 @@ impl PartitionWriter {
             Err(e) => {
                 let new_buffer = ShareableBuffer::from_bytes(buffer_bytes.as_slice());
                 let _ = std::mem::replace(&mut self.buffer, new_buffer.clone());
-                let writer_properties = self
-                    .writer_properties_factory
-                    .create_writer_properties("", &self.arrow_schema)?;
                 let arrow_writer = ArrowWriter::try_new(
                     new_buffer,
                     self.arrow_schema.clone(),
-                    Some(writer_properties),
+                    Some(self.writer_properties.clone()),
                 )?;
                 let _ = std::mem::replace(&mut self.arrow_writer, arrow_writer);
                 Err(e.into())

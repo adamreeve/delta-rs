@@ -313,6 +313,7 @@ pub struct PartitionWriter {
     buffer: AsyncShareableBuffer,
     arrow_writer: AsyncArrowWriter<AsyncShareableBuffer>,
     part_counter: usize,
+    data_path: Path,
     files_written: Vec<Add>,
     /// Num index cols to collect stats for
     num_indexed_cols: i32,
@@ -329,10 +330,16 @@ impl PartitionWriter {
         stats_columns: Option<Vec<String>>,
     ) -> DeltaResult<Self> {
         let buffer = AsyncShareableBuffer::default();
-        // TODO: Need to refactor file path handling so path is known before creating AsyncArrowWriter
+        let writer_id = uuid::Uuid::new_v4();
+        let data_path = next_data_path(
+            &config.prefix,
+            0,
+            &writer_id,
+            &config.writer_properties_factory,
+        );
         let writer_properties = config
             .writer_properties_factory
-            .create_writer_properties("", &config.file_schema)?;
+            .create_writer_properties(&data_path, &config.file_schema)?;
         let arrow_writer = AsyncArrowWriter::try_new(
             buffer.clone(),
             config.file_schema.clone(),
@@ -341,11 +348,12 @@ impl PartitionWriter {
 
         Ok(Self {
             object_store,
-            writer_id: uuid::Uuid::new_v4(),
+            writer_id,
             config,
             buffer,
             arrow_writer,
             part_counter: 0,
+            data_path,
             files_written: Vec::new(),
             num_indexed_cols,
             stats_columns,
@@ -365,13 +373,17 @@ impl PartitionWriter {
 
     fn reset_writer(
         &mut self,
-    ) -> DeltaResult<(AsyncArrowWriter<AsyncShareableBuffer>, AsyncShareableBuffer)> {
+    ) -> DeltaResult<(
+        AsyncArrowWriter<AsyncShareableBuffer>,
+        AsyncShareableBuffer,
+        Path,
+    )> {
         let new_buffer = AsyncShareableBuffer::default();
-        // TODO: Correct path
+        let new_path = self.next_data_path();
         let writer_properties = self
             .config
             .writer_properties_factory
-            .create_writer_properties("", &self.config.file_schema)?;
+            .create_writer_properties(&new_path, &self.config.file_schema)?;
         let arrow_writer = AsyncArrowWriter::try_new(
             new_buffer.clone(),
             self.config.file_schema.clone(),
@@ -380,6 +392,7 @@ impl PartitionWriter {
         Ok((
             std::mem::replace(&mut self.arrow_writer, arrow_writer),
             std::mem::replace(&mut self.buffer, new_buffer),
+            std::mem::replace(&mut self.data_path, new_path),
         ))
     }
 
@@ -389,7 +402,7 @@ impl PartitionWriter {
 
     async fn flush_arrow_writer(&mut self) -> DeltaResult<()> {
         // replace counter / buffers and close the current writer
-        let (writer, buffer) = self.reset_writer()?;
+        let (writer, buffer, path) = self.reset_writer()?;
         let metadata = writer.close().await?;
         // don't write empty file
         if metadata.num_rows == 0 {
@@ -402,7 +415,6 @@ impl PartitionWriter {
         };
 
         // collect metadata
-        let path = self.next_data_path();
         let file_size = buffer.len() as i64;
 
         // write file to object store

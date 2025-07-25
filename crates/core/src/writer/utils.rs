@@ -64,7 +64,7 @@ pub fn record_batch_from_message(
     arrow_schema: Arc<ArrowSchema>,
     json: &[Value],
 ) -> DeltaResult<RecordBatch> {
-    let mut decoder = ReaderBuilder::new(arrow_schema).build_decoder().unwrap();
+    let mut decoder = ReaderBuilder::new(arrow_schema).build_decoder()?;
     decoder.serialize(json)?;
     decoder
         .flush()?

@@ -1,6 +1,7 @@
 use crate::operations::encryption::TableEncryption;
 use crate::{crate_version, DeltaResult, DeltaTable, DeltaTableError};
 use arrow_schema::Schema;
+use object_store::path::Path;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
@@ -48,7 +49,7 @@ impl WriterPropertiesFactory {
 
     pub(crate) fn create_writer_properties(
         &self,
-        file_path: &str,
+        file_path: &Path,
         file_schema: &Arc<Schema>,
     ) -> DeltaResult<WriterProperties> {
         if let Some(properties) = self.overridden_properties.as_ref() {
