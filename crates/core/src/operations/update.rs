@@ -280,8 +280,6 @@ async fn execute(
         .cloned()
         .collect();
 
-    let state = state_with_parquet_options(state, parquet_options.as_ref());
-
     let update_planner = DeltaPlanner::<UpdateMetricExtensionPlanner> {
         extension_planner: UpdateMetricExtensionPlanner {},
     };
@@ -319,7 +317,7 @@ async fn execute(
     let table_partition_cols = current_metadata.partition_columns().clone();
 
     let scan_start = Instant::now();
-    let candidates = find_files(&snapshot, log_store.clone(), &state, predicate.clone()).await?;
+    let candidates = find_files(&snapshot, log_store.clone(), &state, parquet_options.clone(), predicate.clone()).await?;
     metrics.scan_time_ms = Instant::now().duration_since(scan_start).as_millis() as u64;
 
     if candidates.candidates.is_empty() {

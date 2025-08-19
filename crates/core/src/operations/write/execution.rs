@@ -209,7 +209,7 @@ pub(crate) async fn prepare_predicate_actions(
     operation_id: Uuid,
 ) -> DeltaResult<(Vec<Action>, Option<DataFrame>)> {
     let candidates =
-        find_files(snapshot, log_store.clone(), &state, Some(predicate.clone())).await?;
+        find_files(snapshot, log_store.clone(), &state, None, Some(predicate.clone())).await?;
 
     let (mut actions, cdf_df) = execute_non_empty_expr(
         snapshot,

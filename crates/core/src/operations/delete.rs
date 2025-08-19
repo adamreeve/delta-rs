@@ -339,7 +339,7 @@ async fn execute(
     let mut metrics = DeleteMetrics::default();
 
     let scan_start = Instant::now();
-    let candidates = find_files(&snapshot, log_store.clone(), &state, predicate.clone()).await?;
+    let candidates = find_files(&snapshot, log_store.clone(), &state, None, predicate.clone()).await?;
     metrics.scan_time_ms = Instant::now().duration_since(scan_start).as_millis() as u64;
 
     let predicate = predicate.unwrap_or(lit(true));

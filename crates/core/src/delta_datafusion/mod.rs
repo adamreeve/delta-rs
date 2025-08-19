@@ -1790,6 +1790,7 @@ pub(crate) async fn find_files_scan(
     snapshot: &DeltaTableState,
     log_store: LogStoreRef,
     state: &SessionState,
+    parquet_options: Option<TableParquetOptions>,
     expression: Expr,
 ) -> DeltaResult<Vec<Add>> {
     let candidate_map: HashMap<String, Add> = snapshot
@@ -1818,6 +1819,7 @@ pub(crate) async fn find_files_scan(
         .with_filter(Some(expression.clone()))
         .with_projection(Some(&used_columns))
         .with_scan_config(scan_config)
+        .with_parquet_options(parquet_options)
         .build()
         .await?;
     let scan = Arc::new(scan);
@@ -1903,6 +1905,7 @@ pub async fn find_files(
     snapshot: &DeltaTableState,
     log_store: LogStoreRef,
     state: &SessionState,
+    parquet_options: Option<TableParquetOptions>,
     predicate: Option<Expr>,
 ) -> DeltaResult<FindFiles> {
     let current_metadata = snapshot.metadata();
@@ -1927,7 +1930,7 @@ pub async fn find_files(
                 })
             } else {
                 let candidates =
-                    find_files_scan(snapshot, log_store, state, predicate.to_owned()).await?;
+                    find_files_scan(snapshot, log_store, state, parquet_options, predicate.to_owned()).await?;
 
                 Ok(FindFiles {
                     candidates,
