@@ -185,28 +185,6 @@ impl DeltaOps {
         }
     }
 
-    /// Set options for parquet files
-    pub fn with_file_format_options(mut self, file_format_options: FileFormatRef) -> Self {
-        // Update table-level config so future loads/operations use these options
-        self.0.config.file_format_options = Some(file_format_options);
-        self
-    }
-
-    // Update the in-memory state and snapshot config to match the top level table config
-    pub async fn update_state_config(mut self) -> DeltaResult<Self> {
-        if self.0.state.is_some() {
-            self.0.state = Some(
-                DeltaTableState::try_new(
-                    &self.0.log_store,
-                    self.0.config.clone(),
-                    Some(self.0.state.unwrap().version()),
-                )
-                .await?,
-            );
-        }
-        Ok(self)
-    }
-
     /// Create a [`DeltaOps`] instance from uri string with storage options (deprecated)
     #[deprecated(note = "Use try_from_uri_with_storage_options with url::Url instead")]
     pub async fn try_from_uri_str_with_storage_options(

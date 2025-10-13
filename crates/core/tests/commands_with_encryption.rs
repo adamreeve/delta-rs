@@ -17,7 +17,7 @@ use deltalake_core::parquet::encryption::decrypt::FileDecryptionProperties;
 use deltalake_core::table::file_format_options::{
     FileFormatRef, KmsFileFormatOptions, SimpleFileFormatOptions,
 };
-use deltalake_core::{arrow, parquet, DeltaOps};
+use deltalake_core::{arrow, parquet, DeltaOps, DeltaTableBuilder};
 use deltalake_core::{operations::optimize::OptimizeType, DeltaTable, DeltaTableError};
 use parquet_key_management::datafusion::{KmsEncryptionFactory, KmsEncryptionFactoryOptions};
 use parquet_key_management::{
@@ -95,9 +95,16 @@ async fn ops_with_crypto(
     uri: &str,
     file_format_options: &FileFormatRef,
 ) -> Result<DeltaOps, DeltaTableError> {
-    let ops = ops_from_uri(uri).await?;
-    let ops = ops.with_file_format_options(file_format_options.clone());
-    Ok(ops.update_state_config().await?)
+    let prefix_uri = format!("file://{}", uri);
+    let url = Url::parse(&*prefix_uri).unwrap();
+    let mut table = DeltaTableBuilder::from_uri(url)?
+        .with_file_format_options(file_format_options.clone())
+        .build()?;
+    match table.load().await {
+        Ok(_) => Ok(table.into()),
+        Err(DeltaTableError::NotATable(_)) => Ok(table.into()),
+        Err(err) => Err(err),
+    }
 }
 
 async fn create_table(

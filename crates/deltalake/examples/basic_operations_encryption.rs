@@ -20,7 +20,7 @@ use deltalake_core::table::file_format_options::{
 };
 use deltalake_core::{
     datafusion::common::test_util::format_batches, operations::optimize::OptimizeType, DeltaTable,
-    DeltaTableError,
+    DeltaTableBuilder, DeltaTableError,
 };
 use parquet_key_management::datafusion::{KmsEncryptionFactory, KmsEncryptionFactoryOptions};
 use parquet_key_management::{
@@ -90,9 +90,14 @@ async fn ops_with_crypto(
 ) -> Result<DeltaOps, DeltaTableError> {
     let prefix_uri = format!("file://{}", uri);
     let url = Url::parse(&*prefix_uri).unwrap();
-    let ops = DeltaOps::try_from_uri(url).await?;
-    let ops = ops.with_file_format_options(file_format_options.clone());
-    Ok(ops.update_state_config().await?)
+    let mut table = DeltaTableBuilder::from_uri(url)?
+        .with_file_format_options(file_format_options.clone())
+        .build()?;
+    match table.load().await {
+        Ok(_) => Ok(table.into()),
+        Err(DeltaTableError::NotATable(_)) => Ok(table.into()),
+        Err(err) => Err(err),
+    }
 }
 
 async fn create_table(
