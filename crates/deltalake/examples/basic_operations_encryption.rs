@@ -280,7 +280,7 @@ fn plain_crypto_format() -> Result<FileFormatRef, DeltaTableError> {
 
     let mut tpo: TableParquetOptions = TableParquetOptions::default();
     tpo.crypto.file_encryption = Some((&crypt).into());
-    tpo.crypto.file_decryption = Some((&decrypt).into());
+    tpo.crypto.file_decryption = Some((&decrypt).try_into()?);
     let mut tbl_options = TableOptions::new();
     tbl_options.parquet = tpo;
     tbl_options.current_format = Some(ConfigFileType::PARQUET);
