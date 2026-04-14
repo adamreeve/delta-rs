@@ -29,7 +29,7 @@ arrow-cast = { workspace = true }
 
 # datafusion
 datafusion-ffi = { workspace = true }
-datafusion-execution = { version = "52.1.0" }
+datafusion-execution = { git = "https://github.com/adamreeve/datafusion.git", branch = "fallible-decrypt-config-convert-test" }
 
 # serde
 serde = { workspace = true }

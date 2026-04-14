@@ -39,10 +39,10 @@ object_store = { version = "0.12.1" }
 parquet = { version = "57" }
 
 # datafusion 52.1
-datafusion = { version = "52.1.0", features = ["default", "parquet_encryption"] }
-datafusion-datasource = { version = "52.1.0" }
-datafusion-ffi = { version = "52.1.0" }
-datafusion-proto = { version = "52.1.0" }
+datafusion = { git = "https://github.com/adamreeve/datafusion.git", branch = "fallible-decrypt-config-convert-test", features = ["default", "parquet_encryption"] }
+datafusion-datasource = { git = "https://github.com/adamreeve/datafusion.git", branch = "fallible-decrypt-config-convert-test" }
+datafusion-ffi = { git = "https://github.com/adamreeve/datafusion.git", branch = "fallible-decrypt-config-convert-test" }
+datafusion-proto = { git = "https://github.com/adamreeve/datafusion.git", branch = "fallible-decrypt-config-convert-test" }
 
 # serde
 serde = { version = "1.0.194", features = ["derive"] }
