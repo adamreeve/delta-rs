@@ -23,7 +23,6 @@ delta_kernel = { package = "buoyant_kernel", path = "../delta-kernel-rs/kernel",
     "internal-api",
 ] }
 
-
 # arrow
 arrow = { version = "58" }
 arrow-arith = { version = "58" }
