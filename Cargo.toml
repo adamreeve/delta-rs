@@ -24,7 +24,6 @@ delta_kernel = { package = "buoyant_kernel", git = "https://github.com/G-Researc
     "internal-api",
 ] }
 
-
 # arrow
 arrow = { version = "58" }
 arrow-arith = { version = "58" }
