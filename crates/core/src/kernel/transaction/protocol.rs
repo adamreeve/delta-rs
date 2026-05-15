@@ -263,6 +263,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     let mut reader_features = HashSet::new();
     reader_features.insert(TableFeature::TimestampWithoutTimezone);
     reader_features.insert(TableFeature::DeletionVectors);
+    #[cfg(feature = "float16")]
+    reader_features.insert(TableFeature::Float16);
     // reader_features.insert(TableFeature::ColumnMapping);
     #[cfg(feature = "nanosecond-timestamps")]
     reader_features.insert(TableFeature::TimestampNanos);
@@ -272,6 +274,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     writer_features.insert(TableFeature::TimestampWithoutTimezone);
     #[cfg(feature = "nanosecond-timestamps")]
     writer_features.insert(TableFeature::TimestampNanos);
+    #[cfg(feature = "float16")]
+    writer_features.insert(TableFeature::Float16);
     #[cfg(feature = "datafusion")]
     {
         writer_features.insert(TableFeature::ChangeDataFeed);
