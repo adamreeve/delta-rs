@@ -29,6 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
+use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionContext, SessionState};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::Scalar;
@@ -41,6 +42,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use num_cpus;
 use parquet::basic::{Compression, ZstdLevel};
+use parquet::encryption::decrypt::FileDecryptionProperties;
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
@@ -56,11 +58,14 @@ use crate::delta_datafusion::{
 use crate::errors::{DeltaResult, DeltaTableError, unsupported_column_mapping_write};
 use crate::kernel::transaction::{CommitBuilder, CommitProperties, DEFAULT_RETRIES, PROTOCOL};
 use crate::kernel::{Action, Add, DataType, PartitionsExt, Remove, StructType, Version};
-use crate::kernel::{EagerSnapshot, resolve_snapshot};
+use crate::kernel::{EagerSnapshot, resolve_snapshot_with_config};
 use crate::logstore::{LogStore, LogStoreRef, ObjectStoreRef};
 use crate::parquet_utils::default_writer_properties;
 use crate::protocol::DeltaOperation;
 use crate::table::config::TablePropertiesExt as _;
+use crate::table::file_format_options::{
+    FileFormatRef, IntoWriterPropertiesFactoryRef, WriterPropertiesFactoryRef,
+};
 use crate::table::state::DeltaTableState;
 use crate::writer::utils::arrow_schema_without_partitions;
 use crate::{DeltaTable, ObjectMeta, PartitionFilter, to_kernel_predicate};
@@ -284,7 +289,7 @@ pub struct OptimizeBuilder<'a> {
     /// Desired file size after bin-packing files
     target_size: Option<NonZeroU64>,
     /// Properties passed to underlying parquet writer
-    writer_properties: Option<WriterProperties>,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     /// Commit properties and configuration
     commit_properties: CommitProperties,
     /// Maximum number of concurrent tasks (default is number of cpus)
@@ -310,12 +315,22 @@ impl super::Operation for OptimizeBuilder<'_> {
 impl<'a> OptimizeBuilder<'a> {
     /// Create a new [`OptimizeBuilder`]
     pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
+        let writer_properties_factory = snapshot
+            .as_ref()
+            .and_then(|ss| ss.load_config().file_format_options.clone())
+            .map(|ffo| ffo.writer_properties_factory())
+            .or_else(|| {
+                Some(
+                    default_writer_properties(Compression::ZSTD(ZstdLevel::try_new(4).unwrap()))
+                        .into_factory_ref(),
+                )
+            });
         Self {
             snapshot,
             log_store,
             filters: &[],
             target_size: None,
-            writer_properties: None,
+            writer_properties_factory,
             commit_properties: CommitProperties::default(),
             max_concurrent_tasks: num_cpus::get(),
             optimize_type: OptimizeType::Compact,
@@ -346,7 +361,8 @@ impl<'a> OptimizeBuilder<'a> {
 
     /// Writer properties passed to parquet writer
     pub fn with_writer_properties(mut self, writer_properties: WriterProperties) -> Self {
-        self.writer_properties = Some(writer_properties);
+        let writer_properties_factory = writer_properties.into_factory_ref();
+        self.writer_properties_factory = Some(writer_properties_factory);
         self
     }
 
@@ -414,8 +430,15 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
         let this = self;
 
         Box::pin(async move {
-            let snapshot =
-                resolve_snapshot(&this.log_store, this.snapshot.clone(), true, None).await?;
+            let base_config = this.snapshot.as_ref().map(|s| s.load_config());
+            let snapshot = resolve_snapshot_with_config(
+                &this.log_store,
+                this.snapshot.clone(),
+                true,
+                None,
+                base_config,
+            )
+            .await?;
             if snapshot.table_configuration().column_mapping_mode() != ColumnMappingMode::None {
                 return Err(unsupported_column_mapping_write("OPTIMIZE"));
             }
@@ -424,9 +447,6 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
             let operation_id = this.get_operation_id();
             this.pre_execute(operation_id).await?;
 
-            let writer_properties = this.writer_properties.unwrap_or_else(|| {
-                default_writer_properties(Compression::ZSTD(ZstdLevel::try_new(4).unwrap()))
-            });
             let (session, _) = resolve_session_state(
                 this.session.as_deref(),
                 this.session_fallback_policy,
@@ -443,7 +463,7 @@ impl<'a> std::future::IntoFuture for OptimizeBuilder<'a> {
                 &snapshot,
                 this.filters,
                 this.target_size.to_owned(),
-                writer_properties,
+                this.writer_properties_factory,
                 session,
             )
             .await?;
@@ -595,7 +615,7 @@ pub struct MergeTaskParameters {
     /// Schema of written files
     file_schema: SchemaRef,
     /// Properties passed to parquet writer
-    writer_properties: WriterProperties,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     /// Input parameters for the optimize operation
     input_parameters: OptimizeInput,
     /// Num index cols to collect stats for
@@ -690,7 +710,7 @@ impl MergePlan {
         let writer_config = PartitionWriterConfig::try_new(
             task_parameters.file_schema.clone(),
             partition_values.clone(),
-            Some(task_parameters.writer_properties.clone()),
+            task_parameters.writer_properties_factory.clone(),
             // Since we know the total size of the bin, we can set the target file size to None.
             if ignore_target_size {
                 None
@@ -826,6 +846,9 @@ impl MergePlan {
             log_store.as_ref(),
             Some(operation_id),
         )?;
+
+        // TODO: Handle file decryption properties
+        //let ffo = snapshot.load_config().file_format_options.clone();
 
         let mut stream = match operations {
             OptimizeOperations::Compact(bins) => {
@@ -1008,7 +1031,7 @@ pub async fn create_merge_plan(
     snapshot: &EagerSnapshot,
     filters: &[PartitionFilter],
     target_size: Option<NonZeroU64>,
-    writer_properties: WriterProperties,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     session: SessionState,
 ) -> Result<MergePlan, DeltaTableError> {
     let target_size = target_size.unwrap_or_else(|| snapshot.table_properties().target_file_size());
@@ -1054,7 +1077,7 @@ pub async fn create_merge_plan(
         planner_stats,
         task_parameters: Arc::new(MergeTaskParameters {
             file_schema,
-            writer_properties,
+            writer_properties_factory,
             input_parameters,
             num_indexed_cols: snapshot.table_properties().num_indexed_cols(),
             stats_columns: snapshot
@@ -1381,6 +1404,29 @@ async fn build_zorder_plan(
         metrics,
         PlannerStats::z_order(max_bin_span_files),
     ))
+}
+
+async fn get_file_decryption_properties(
+    file_format_options: &FileFormatRef,
+    file_path: &object_store::path::Path,
+) -> Result<Option<Arc<FileDecryptionProperties>>, DataFusionError> {
+    let parquet_options = file_format_options.table_options().parquet;
+    if let Some(props) = &parquet_options.crypto.file_decryption {
+        return Ok(Some(Arc::new(props.clone().into())));
+    }
+    if let Some(factory_id) = &parquet_options.crypto.factory_id {
+        // Create a temporary DataFusion session to access the encryption factory
+        let ctx = SessionContext::default();
+        let state = ctx.state();
+        file_format_options.update_session(&state)?;
+        let encryption_factory = state.runtime_env().parquet_encryption_factory(factory_id)?;
+        let config = &parquet_options.crypto.factory_options;
+        encryption_factory
+            .get_file_decryption_properties(config, file_path)
+            .await
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
