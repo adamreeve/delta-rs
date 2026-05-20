@@ -1,17 +1,22 @@
-//! This module contains classes and functions to support encryption with a KMS.
-//! These are not part of the core API but are used in the encryption tests and examples.
+//! KMS-based Parquet encryption utilities intended for integration tests and examples.
 //!
-//! The first main class is `TableEncryption`, which encapsulates the encryption configuration
-//! and the encryption factory.
+//! This module is **not part of the stable public API**. It lives in `test_utils` and is
+//! compiled in non-test builds only to allow downstream integration-test crates to depend on it
+//! without pulling in a separate crate. Do not rely on it for production use.
 //!
-//! The second main class is `KmsFileFormatOptions` which configures the file format options for
-//! KMS encryption. It is used to create a `FileFormatOptions` instance that can be
-//! passed to the `DeltaTable::create` method. This class can also be directly used in
-//! `DeltaOps` via the `with_file_format_options` method.
-//! See `crates/deltalake/examples/basic_operations_encryption.rs` for a working example.
+//! # Key types
 //!
-//! The `MockKmsClient` struct provides a mock implementation of `EncryptionFactory` for testing
-//! purposes. It generates unique encryption keys for each file and stores them for later decryption.
+//! - [`TableEncryption`]: bundles an [`EncryptionFactory`] with its
+//!   [`EncryptionFactoryOptions`], providing helpers to produce per-file
+//!   [`WriterPropertiesBuilder`] values.
+//! - [`KmsFileFormatOptions`]: a [`FileFormatOptions`](crate::table::file_format_options::FileFormatOptions)
+//!   implementation that wires KMS-based encryption into [`DeltaTable`](crate::DeltaTable)
+//!   operations. Pass it to [`DeltaTableBuilder::with_file_format_options`](crate::table::builder::DeltaTableBuilder::with_file_format_options)
+//!   or [`DeltaOps::with_file_format_options`](crate::operations::DeltaOps::with_file_format_options).
+//!   See `crates/deltalake/examples/basic_operations_encryption.rs` for a complete example.
+//! - [`MockKmsClient`]: a test-only [`EncryptionFactory`] that generates a unique key per
+//!   file and remembers it for decryption. Useful in unit and integration tests where a
+//!   real KMS is not available.
 
 use crate::table::file_format_options::{
     FileFormatOptions, TableOptions, WriterPropertiesFactory, WriterPropertiesFactoryRef,
@@ -30,7 +35,7 @@ use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -197,14 +202,14 @@ impl FileFormatOptions for KmsFileFormatOptions {
 #[derive(Debug, Default)]
 pub struct MockKmsClient {
     encryption_keys: Mutex<HashMap<Path, Vec<u8>>>,
-    counter: AtomicU8,
+    counter: AtomicU64,
 }
 
 impl MockKmsClient {
     pub fn new() -> Self {
         Self {
             encryption_keys: Mutex::new(HashMap::new()),
-            counter: AtomicU8::new(0),
+            counter: AtomicU64::new(0),
         }
     }
 }
@@ -218,7 +223,9 @@ impl EncryptionFactory for MockKmsClient {
         file_path: &Path,
     ) -> datafusion::error::Result<Option<Arc<FileEncryptionProperties>>> {
         let file_idx = self.counter.fetch_add(1, Ordering::Relaxed);
-        let key = vec![file_idx, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(&file_idx.to_le_bytes());
+        let key = key.to_vec();
         let mut keys = self.encryption_keys.lock().unwrap();
         // Use just the filename as key to handle path prefix differences between write and read
         let filename = Path::from(file_path.filename().unwrap_or(file_path.as_ref()));

@@ -384,15 +384,6 @@ async fn execute(
     let physical_plan = session.create_physical_plan(&plan_updated).await?;
     let tracker = CDCTracker::new(files_scan.scan().clone(), plan_updated);
 
-    let file_format_options = snapshot.load_config().file_format_options.clone();
-    let writer_properties_factory = if writer_properties_factory.is_some() {
-        writer_properties_factory
-    } else {
-        file_format_options
-            .clone()
-            .map(|ffo| ffo.writer_properties_factory())
-    };
-
     let writer_stats_config = WriterStatsConfig::from_config(snapshot.table_configuration());
     let mut actions = write_execution_plan(
         Some(snapshot),

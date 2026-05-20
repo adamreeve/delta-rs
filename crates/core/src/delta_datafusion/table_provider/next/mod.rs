@@ -534,26 +534,8 @@ impl TableProvider for DeltaScan {
 
         let stream = self.scan_metadata_stream(&scan_plan, engine.clone());
 
-        // When no parquet options were explicitly provided, derive them from the snapshot's file
-        // format options.
-        let derived_config;
-        let effective_config: &DeltaScanConfig =
-            if self.config.table_parquet_options.is_none() {
-                if let Some(ffo) = self.snapshot.load_config().file_format_options.as_ref() {
-                    derived_config = DeltaScanConfig {
-                        table_parquet_options: Some(ffo.table_options().parquet),
-                        ..self.config.clone()
-                    };
-                    &derived_config
-                } else {
-                    &self.config
-                }
-            } else {
-                &self.config
-            };
-
         scan::execution_plan(
-            effective_config,
+            &self.config,
             session,
             scan_plan,
             stream,

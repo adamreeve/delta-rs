@@ -19,7 +19,7 @@ use deltalake_core::table::file_format_options::{FileFormatRef, SimpleFileFormat
 use deltalake_core::test_utils::kms_encryption::{
     KmsFileFormatOptions, MockKmsClient, TableEncryption,
 };
-use deltalake_core::{DeltaTable, DeltaTableError, arrow, parquet};
+use deltalake_core::{DeltaResult, DeltaTable, DeltaTableError, arrow, parquet};
 
 use datafusion::config::EncryptionFactoryOptions;
 use paste::paste;
@@ -344,24 +344,22 @@ async fn run_modify_test(
     modifier: ModifyFn,
     expected: Vec<String>,
     decrypt_final_read: bool,
-) {
+) -> DeltaResult<()> {
     let temp_dir = TempDir::new().unwrap();
     let uri = temp_dir.path().to_str().unwrap();
     let table_name = "test";
-    create_table(uri, table_name, &file_format_options)
-        .await
-        .expect("Failed to create encrypted table");
-    modifier(uri, &file_format_options)
-        .await
-        .expect("Failed to modify encrypted table");
-    let data = read_table(uri, &file_format_options, decrypt_final_read)
-        .await
-        .expect("Failed to read encrypted table");
+    create_table(uri, table_name, &file_format_options).await?;
+    modifier(uri, &file_format_options).await?;
+    let data = read_table(uri, &file_format_options, decrypt_final_read).await?;
     let expected_refs: Vec<&str> = expected.iter().map(AsRef::as_ref).collect();
     assert_batches_sorted_eq!(&expected_refs, &data);
+    Ok(())
 }
 
-async fn test_create_and_read(file_format_options: FileFormatRef, decrypt_final_read: bool) {
+async fn test_create_and_read(
+    file_format_options: FileFormatRef,
+    decrypt_final_read: bool,
+) -> DeltaResult<()> {
     // Use the shared modify test template with a no-op modifier
     let expected: Vec<String> = full_table_data().iter().map(|s| s.to_string()).collect();
     run_modify_test(
@@ -370,7 +368,7 @@ async fn test_create_and_read(file_format_options: FileFormatRef, decrypt_final_
         expected,
         decrypt_final_read,
     )
-    .await;
+    .await
 }
 
 // Macro to generate the common encryption test matrix for a given runner function
@@ -380,27 +378,27 @@ macro_rules! encryption_tests {
             #[tokio::test]
             async fn [<$runner _plain_crypto>]() {
                 let file_format_options = plain_crypto_format().unwrap();
-                $runner(file_format_options, true).await;
+                $runner(file_format_options, true).await.expect("plain-crypto test failed");
             }
 
             #[tokio::test]
-            #[should_panic(expected = "Failed to read encrypted table")]
             async fn [<$runner _plain_crypto_no_decryptor>]() {
                 let file_format_options = plain_crypto_format().unwrap();
-                $runner(file_format_options, false).await;
+                let result = $runner(file_format_options, false).await;
+                assert!(result.is_err(), "expected read without decryptor to fail");
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
             async fn [<$runner _kms>]() {
                 let file_format_options = kms_crypto_format().unwrap();
-                $runner(file_format_options, true).await;
+                $runner(file_format_options, true).await.expect("KMS-crypto test failed");
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-            #[should_panic(expected = "Failed to read encrypted table")]
             async fn [<$runner _kms_no_decryptor>]() {
                 let file_format_options = kms_crypto_format().unwrap();
-                $runner(file_format_options, false).await;
+                let result = $runner(file_format_options, false).await;
+                assert!(result.is_err(), "expected read without decryptor to fail");
             }
         }
     };
@@ -409,14 +407,16 @@ macro_rules! encryption_tests {
 encryption_tests!(test_create_and_read);
 
 #[tokio::test]
-#[should_panic(expected = "Failed to read encrypted table")]
 async fn test_create_and_read_bad_crypto() {
     let file_format_options = plain_crypto_format_bad_decryptor().unwrap();
-    test_create_and_read(file_format_options, true).await;
+    let result = test_create_and_read(file_format_options, true).await;
+    assert!(result.is_err(), "expected read with bad decryptor to fail");
 }
 
-async fn test_optimize_compact(file_format_options: FileFormatRef, decrypt_final_read: bool) {
-    // Use the shared modify test template; perform optimization steps inside the modifier
+async fn test_optimize_compact(
+    file_format_options: FileFormatRef,
+    decrypt_final_read: bool,
+) -> DeltaResult<()> {
     let expected: Vec<String> = full_table_data().iter().map(|s| s.to_string()).collect();
     run_modify_test(
         file_format_options,
@@ -424,11 +424,13 @@ async fn test_optimize_compact(file_format_options: FileFormatRef, decrypt_final
         expected,
         decrypt_final_read,
     )
-    .await;
+    .await
 }
 
-async fn test_optimize_z_order(file_format_options: FileFormatRef, decrypt_final_read: bool) {
-    // Use the shared modify test template; perform optimization steps inside the modifier
+async fn test_optimize_z_order(
+    file_format_options: FileFormatRef,
+    decrypt_final_read: bool,
+) -> DeltaResult<()> {
     let expected: Vec<String> = full_table_data().iter().map(|s| s.to_string()).collect();
     run_modify_test(
         file_format_options.clone(),
@@ -436,14 +438,17 @@ async fn test_optimize_z_order(file_format_options: FileFormatRef, decrypt_final
         expected,
         decrypt_final_read,
     )
-    .await;
+    .await
 }
 
 encryption_tests!(test_optimize_compact);
 
 encryption_tests!(test_optimize_z_order);
 
-async fn test_update(file_format_options: FileFormatRef, decrypt_final_read: bool) {
+async fn test_update(
+    file_format_options: FileFormatRef,
+    decrypt_final_read: bool,
+) -> DeltaResult<()> {
     let base = full_table_data();
     let expected: Vec<String> = base
         .iter()
@@ -456,12 +461,15 @@ async fn test_update(file_format_options: FileFormatRef, decrypt_final_read: boo
         expected,
         decrypt_final_read,
     )
-    .await;
+    .await
 }
 
 encryption_tests!(test_update);
 
-async fn test_delete(file_format_options: FileFormatRef, decrypt_final_read: bool) {
+async fn test_delete(
+    file_format_options: FileFormatRef,
+    decrypt_final_read: bool,
+) -> DeltaResult<()> {
     let base = full_table_data();
     let expected: Vec<String> = base
         .iter()
@@ -475,12 +483,15 @@ async fn test_delete(file_format_options: FileFormatRef, decrypt_final_read: boo
         expected,
         decrypt_final_read,
     )
-    .await;
+    .await
 }
 
 encryption_tests!(test_delete);
 
-async fn test_merge(file_format_options: FileFormatRef, decrypt_final_read: bool) {
+async fn test_merge(
+    file_format_options: FileFormatRef,
+    decrypt_final_read: bool,
+) -> DeltaResult<()> {
     let expected_str = vec![
         "+-----+--------+----------------------------+",
         "| int | string | timestamp                  |",
@@ -496,7 +507,7 @@ async fn test_merge(file_format_options: FileFormatRef, decrypt_final_read: bool
         expected,
         decrypt_final_read,
     )
-    .await;
+    .await
 }
 
 encryption_tests!(test_merge);

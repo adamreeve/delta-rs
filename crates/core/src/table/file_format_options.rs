@@ -6,7 +6,7 @@ pub use datafusion::config::{ConfigFileType, TableOptions, TableParquetOptions};
 use datafusion::execution::SessionState;
 use std::fmt::Debug;
 
-use crate::{DeltaResult, crate_version};
+use crate::{DeltaResult, DeltaTableError, crate_version};
 use arrow_schema::Schema as ArrowSchema;
 
 use async_trait::async_trait;
@@ -60,9 +60,13 @@ impl FileFormatOptions for SimpleFileFormatOptions {
     }
 
     fn writer_properties_factory(&self) -> WriterPropertiesFactoryRef {
-        // SAFETY: unwrap is safe because build_writer_properties_factory_tpo only returns None
-        // when given None. Since we pass Some(...), it will always return Some.
-        build_writer_properties_factory_tpo(&Some(self.table_options.parquet.clone())).unwrap()
+        match build_writer_properties_factory_tpo(&Some(self.table_options.parquet.clone())) {
+            Ok(Some(factory)) => factory,
+            Ok(None) => unreachable!("called with Some(parquet_options), result cannot be None"),
+            Err(e) => Arc::new(ErrWriterPropertiesFactory {
+                error: e.to_string(),
+            }),
+        }
     }
 
     // Note: SimpleFileFormatOptions doesn't need to update the session
@@ -95,27 +99,33 @@ pub fn state_with_file_format_options(
 #[cfg(feature = "datafusion")]
 fn build_writer_properties_tpo(
     table_parquet_options: &Option<TableParquetOptions>,
-) -> Option<WriterProperties> {
-    table_parquet_options.as_ref().map(|tpo| {
-        let mut tpo = tpo.clone();
-        tpo.global.skip_arrow_metadata = true;
-        let mut wp_build = WriterPropertiesBuilder::try_from(&tpo)
-            .expect("Failed to convert TableParquetOptions to ParquetWriterOptions");
-        if let Some(enc) = tpo.crypto.file_encryption {
-            // Convert config encryption properties into parquet FileEncryptionProperties
-            // and wrap into Arc as required by the builder.
-            wp_build = wp_build.with_file_encryption_properties(Arc::new(enc.into()));
-        }
-        wp_build.build()
-    })
+) -> DeltaResult<Option<WriterProperties>> {
+    table_parquet_options
+        .as_ref()
+        .map(|tpo| {
+            let mut tpo = tpo.clone();
+            tpo.global.skip_arrow_metadata = true;
+            let mut wp_build = WriterPropertiesBuilder::try_from(&tpo).map_err(|e| {
+                DeltaTableError::Generic(format!(
+                    "Failed to convert TableParquetOptions to WriterProperties: {e}"
+                ))
+            })?;
+            if let Some(enc) = tpo.crypto.file_encryption {
+                // Convert config encryption properties into parquet FileEncryptionProperties
+                // and wrap into Arc as required by the builder.
+                wp_build = wp_build.with_file_encryption_properties(Arc::new(enc.into()));
+            }
+            Ok(wp_build.build())
+        })
+        .transpose()
 }
 
 #[cfg(feature = "datafusion")]
 fn build_writer_properties_factory_tpo(
     table_parquet_options: &Option<TableParquetOptions>,
-) -> Option<WriterPropertiesFactoryRef> {
-    let props = build_writer_properties_tpo(table_parquet_options);
-    props.map(|wp| Arc::new(SimpleWriterPropertiesFactory::new(wp)) as WriterPropertiesFactoryRef)
+) -> DeltaResult<Option<WriterPropertiesFactoryRef>> {
+    let props = build_writer_properties_tpo(table_parquet_options)?;
+    Ok(props.map(|wp| Arc::new(SimpleWriterPropertiesFactory::new(wp)) as WriterPropertiesFactoryRef))
 }
 
 pub trait IntoWriterPropertiesFactoryRef {
@@ -130,6 +140,29 @@ impl IntoWriterPropertiesFactoryRef for WriterProperties {
 
 pub fn build_writer_properties_factory_default() -> WriterPropertiesFactoryRef {
     Arc::new(SimpleWriterPropertiesFactory::default())
+}
+
+/// A [`WriterPropertiesFactory`] that always returns an error from [`Self::create_writer_properties`].
+/// Used to defer a construction-time error (e.g. invalid `TableParquetOptions`) to write time,
+/// where it can be surfaced as a `DeltaResult` instead of a panic.
+#[derive(Debug)]
+struct ErrWriterPropertiesFactory {
+    error: String,
+}
+
+#[async_trait]
+impl WriterPropertiesFactory for ErrWriterPropertiesFactory {
+    fn compression(&self, _column_path: &ColumnPath) -> Compression {
+        Compression::UNCOMPRESSED
+    }
+
+    async fn create_writer_properties(
+        &self,
+        _file_path: &Path,
+        _file_schema: &Arc<ArrowSchema>,
+    ) -> DeltaResult<WriterProperties> {
+        Err(DeltaTableError::Generic(self.error.clone()))
+    }
 }
 
 #[async_trait]

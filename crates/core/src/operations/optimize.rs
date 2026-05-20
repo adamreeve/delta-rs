@@ -29,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
-use datafusion::error::DataFusionError;
+
 use datafusion::execution::context::{SessionContext, SessionState};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::expressions::Scalar;
@@ -42,7 +42,6 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use num_cpus;
 use parquet::basic::{Compression, ZstdLevel};
-use parquet::encryption::decrypt::FileDecryptionProperties;
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
@@ -63,9 +62,7 @@ use crate::logstore::{LogStore, LogStoreRef, ObjectStoreRef};
 use crate::parquet_utils::default_writer_properties;
 use crate::protocol::DeltaOperation;
 use crate::table::config::TablePropertiesExt as _;
-use crate::table::file_format_options::{
-    FileFormatRef, IntoWriterPropertiesFactoryRef, WriterPropertiesFactoryRef,
-};
+use crate::table::file_format_options::{IntoWriterPropertiesFactoryRef, WriterPropertiesFactoryRef};
 use crate::table::state::DeltaTableState;
 use crate::writer::utils::arrow_schema_without_partitions;
 use crate::{DeltaTable, ObjectMeta, PartitionFilter, to_kernel_predicate};
@@ -642,13 +639,21 @@ impl SelectedFileScanFactory {
         session: &dyn Session,
         read_operation_id: Option<Uuid>,
     ) -> Result<Self, DeltaTableError> {
+        // Mirror the caller's DataFusion session flags so rewrite scans keep
+        // the same parquet/view type behavior as the rest of optimize.
+        let mut scan_config = DeltaScanConfig::new_from_session(session)
+            .with_schema(snapshot.input_schema());
+        // Propagate encryption / file-format options so the scan can decrypt
+        // Parquet footers when the table was written with encryption enabled.
+        scan_config.table_parquet_options = snapshot
+            .load_config()
+            .file_format_options
+            .as_ref()
+            .map(|ffo| ffo.table_options().parquet);
         Ok(Self {
             snapshot: snapshot.clone(),
             log_store,
-            // Mirror the caller's DataFusion session flags so rewrite scans keep
-            // the same parquet/view type behavior as the rest of optimize.
-            scan_config: DeltaScanConfig::new_from_session(session)
-                .with_schema(snapshot.input_schema()),
+            scan_config,
             read_operation_id,
         })
     }
