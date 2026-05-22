@@ -906,6 +906,7 @@ mod local {
             TestCase::new("int16", |value| lit(value as i16)),
             TestCase::new("int8", |value| lit(value as i8)),
             TestCase::new("float64", |value| lit(value as f64)),
+            TestCase::new("float32", |value| lit(value as f32)),
             TestCase::new("timestamp", |value| {
                 lit(TimestampMicrosecond(Some(value * 1_000_000), None))
             }),
