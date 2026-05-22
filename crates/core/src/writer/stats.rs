@@ -245,10 +245,7 @@ enum StatsScalar {
     TimestampNtz(chrono::NaiveDateTime),
     // We are serializing to f64 later and the ordering should be the same
     // Scale is stored to handle scale=0 serialization correctly
-    Decimal {
-        value: f64,
-        scale: i32,
-    },
+    Decimal { value: f64, scale: i32 },
     String(String),
     Bytes(Vec<u8>),
     Uuid(uuid::Uuid),
