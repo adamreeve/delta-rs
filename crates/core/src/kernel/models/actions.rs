@@ -792,8 +792,6 @@ impl TableFeatures {
                     // Optional ReaderWriter features
                     #[cfg(feature = "nanosecond-timestamps")]
                     TableFeature::TimestampNanos => (Some(feature.clone()), Some(feature)),
-
-                    // Cargo-gated features
                     #[cfg(feature = "float16")]
                     TableFeature::Float16 => (Some(feature.clone()), Some(feature)),
 
