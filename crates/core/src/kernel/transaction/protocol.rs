@@ -4,6 +4,8 @@ use std::sync::LazyLock;
 use delta_kernel::table_features::TableFeature;
 
 use super::{TableReference, TransactionError};
+#[cfg(feature = "float16")]
+use crate::kernel::contains_float16;
 #[cfg(feature = "nanosecond-timestamps")]
 use crate::kernel::contains_timestamp_nanos;
 use crate::kernel::{
@@ -148,6 +150,21 @@ impl ProtocolChecker {
             snapshot,
             contains_nanos,
             TableFeature::TimestampWithoutTimezone,
+        )
+    }
+
+    #[cfg(feature = "float16")]
+    /// Check can write float16
+    pub fn check_can_write_float16(
+        &self,
+        snapshot: &EagerSnapshot,
+        schema: &Schema,
+    ) -> Result<(), TransactionError> {
+        trace!("checking to see if {snapshot:?} can write float16");
+        self.check_can_write_feature(
+            snapshot,
+            contains_float16(schema.fields()),
+            TableFeature::Float16,
         )
     }
 

@@ -431,6 +431,8 @@ impl WriteBuilder {
                     PROTOCOL.check_can_write_timestamp_ntz(snapshot, &schema)?;
                     #[cfg(feature = "nanosecond-timestamps")]
                     PROTOCOL.check_can_write_timestamp_nanos(snapshot, &schema)?;
+                    #[cfg(feature = "float16")]
+                    PROTOCOL.check_can_write_float16(snapshot, &schema)?;
                 }
                 match self.mode {
                     SaveMode::ErrorIfExists => {
