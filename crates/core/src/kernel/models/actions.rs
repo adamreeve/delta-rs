@@ -664,6 +664,8 @@ pub enum TableFeatures {
     #[serde(rename = "timestampNanos")]
     /// Timestamps that are nanosecond resolution
     TimestampNanos,
+    #[cfg(feature = "float16")]
+    Float16,
     /// version 2 of checkpointing
     V2Checkpoint,
     /// Append Only Tables
@@ -697,6 +699,8 @@ impl FromStr for TableFeatures {
             "timestampNtz" => Ok(TableFeatures::TimestampWithoutTimezone),
             #[cfg(feature = "nanosecond-timestamps")]
             "timestampNanos" => Ok(TableFeatures::TimestampNanos),
+            #[cfg(feature = "float16")]
+            "float16" => Ok(TableFeatures::Float16),
             "v2Checkpoint" => Ok(TableFeatures::V2Checkpoint),
             "appendOnly" => Ok(TableFeatures::AppendOnly),
             "invariants" => Ok(TableFeatures::Invariants),
@@ -721,6 +725,8 @@ impl AsRef<str> for TableFeatures {
             TableFeatures::TimestampWithoutTimezone => "timestampNtz",
             #[cfg(feature = "nanosecond-timestamps")]
             TableFeatures::TimestampNanos => "timestampNanos",
+            #[cfg(feature = "float16")]
+            TableFeatures::Float16 => "float16",
             TableFeatures::V2Checkpoint => "v2Checkpoint",
             TableFeatures::AppendOnly => "appendOnly",
             TableFeatures::Invariants => "invariants",
