@@ -864,7 +864,6 @@ mod tests {
         let float_array = Float16Array::from(vec![Some(f16::from_f32(3.25)), None]);
         let scalar = Scalar::from_array(&float_array, 0).unwrap();
         assert_eq!(scalar, Scalar::Float16(f16::from_f32(3.25)));
-        assert_eq!(scalar, Scalar::Float16(f16::from_f32(3.25)));
     }
 
     #[test]
