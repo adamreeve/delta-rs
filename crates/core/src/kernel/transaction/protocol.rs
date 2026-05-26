@@ -261,6 +261,8 @@ pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     reader_features.insert(TableFeature::TimestampWithoutTimezone);
     reader_features.insert(TableFeature::DeletionVectors);
     // reader_features.insert(TableFeature::ColumnMapping);
+    #[cfg(feature = "nanosecond-timestamps")]
+    reader_features.insert(TableFeature::TimestampNanos);
 
     let mut writer_features = HashSet::new();
     writer_features.insert(TableFeature::AppendOnly);
