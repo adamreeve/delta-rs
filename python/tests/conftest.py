@@ -242,6 +242,9 @@ def sample_data_pyarrow() -> "pa.Table":
         extras["timestamp_ns"] = pa.array(
             [pa.scalar(i, type=pa.timestamp("ns", "UTC")) for i in range(nrows)]
         )
+        extras["timestamp_ns_ntz"] = pa.array(
+            [pa.scalar(i, type=pa.timestamp("ns", None)) for i in range(nrows)]
+        )
 
     return pa.table(
         {

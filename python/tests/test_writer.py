@@ -1028,6 +1028,7 @@ def test_writer_stats(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table
     expected_mins["date32"] = "2022-01-01"
     if _NANOSECOND_TIMESTAMPS:
         expected_mins["timestamp_ns"] = "1970-01-01T00:00:00Z"
+        expected_mins["timestamp_ns_ntz"] = "1970-01-01T00:00:00"
 
     assert stats["minValues"] == expected_mins
 
@@ -1048,6 +1049,7 @@ def test_writer_stats(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table
     expected_maxs["date32"] = "2022-01-05"
     if _NANOSECOND_TIMESTAMPS:
         expected_maxs["timestamp_ns"] = "1970-01-01T00:00:00.000000004Z"
+        expected_maxs["timestamp_ns_ntz"] = "1970-01-01T00:00:00.000000004"
 
     assert stats["maxValues"] == expected_maxs
 
@@ -2209,6 +2211,10 @@ def test_write_timestamp_nanos_nested(tmp_path: pathlib.Path, array):
             "x": array(
                 pa,
                 pa.scalar(datetime(2010, 1, 1), type=pa.timestamp("ns", "UTC")),
+            ),
+            "x_ntz": array(
+                pa,
+                pa.scalar(datetime(2010, 1, 1), type=pa.timestamp("ns", None)),
             )
         }
     )

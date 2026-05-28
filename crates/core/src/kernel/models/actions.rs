@@ -168,9 +168,13 @@ pub fn contains_timestampntz<'a>(fields: impl Iterator<Item = &'a StructField>) 
 }
 
 #[cfg(feature = "nanosecond-timestamps")]
-/// checks if table contains timestamp_nanos in any field including nested fields.
+/// checks if table contains timestamp_nanos or timestamp_nanos_ntz in any
+/// field including nested fields. Both primitive types require the same
+/// `timestampNanos` table feature.
 pub fn contains_timestamp_nanos<'a>(fields: impl Iterator<Item = &'a StructField>) -> bool {
-    contains_datatype(fields, &DataType::TIMESTAMP_NANOS)
+    let fields: Vec<_> = fields.collect();
+    contains_datatype(fields.iter().copied(), &DataType::TIMESTAMP_NANOS)
+        || contains_datatype(fields.into_iter(), &DataType::TIMESTAMP_NANOS_NTZ)
 }
 
 /// Extension trait for delta-kernel Protocol action.
