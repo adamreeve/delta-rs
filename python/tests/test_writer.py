@@ -2217,7 +2217,7 @@ def test_write_timestamp_nanos_nested(tmp_path: pathlib.Path, array):
             "x_ntz": array(
                 pa,
                 pa.scalar(datetime(2010, 1, 1), type=pa.timestamp("ns", None)),
-            )
+            ),
         }
     )
     write_deltalake(

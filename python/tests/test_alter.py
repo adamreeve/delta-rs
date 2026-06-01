@@ -427,7 +427,10 @@ def test_add_timestamp_nanos_column(tmp_path: pathlib.Path, sample_table: Table)
 )
 def test_add_timestamp_nanos_ntz_column(tmp_path: pathlib.Path, sample_table: Table):
     check_timestamp_column(
-        tmp_path, sample_table, "timestamp_nanos_ntz", {"timestampNanos", "timestampNtz"}
+        tmp_path,
+        sample_table,
+        "timestamp_nanos_ntz",
+        {"timestampNanos", "timestampNtz"},
     )
 
 

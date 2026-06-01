@@ -4,9 +4,8 @@ import pytest
 from arro3.core import DataType, Field, Schema
 
 from deltalake import DeltaTable, write_deltalake
-from deltalake.writer._conversion import _convert_arro3_schema_to_delta
 from deltalake._internal import _NANOSECOND_TIMESTAMPS
-
+from deltalake.writer._conversion import _convert_arro3_schema_to_delta
 
 if _NANOSECOND_TIMESTAMPS:
     _ns_converted_unit = "ns"
@@ -62,7 +61,9 @@ else:
             Schema(
                 fields=[Field("foo", DataType.timestamp("ns", tz="Europe/Amsterdam"))]
             ),
-            Schema(fields=[Field("foo", DataType.timestamp(_ns_converted_unit, tz="UTC"))]),
+            Schema(
+                fields=[Field("foo", DataType.timestamp(_ns_converted_unit, tz="UTC"))]
+            ),
         ),
         (
             Schema(fields=[Field("foo", DataType.timestamp("ns"))]),
@@ -75,7 +76,11 @@ else:
         ),
         (
             Schema(fields=[Field("foo", DataType.timestamp("ns"), nullable=True)]),
-            Schema(fields=[Field("foo", DataType.timestamp(_ns_converted_unit), nullable=True)]),
+            Schema(
+                fields=[
+                    Field("foo", DataType.timestamp(_ns_converted_unit), nullable=True)
+                ]
+            ),
         ),
         # List of unsigned ints
         (
@@ -560,7 +565,9 @@ def test_null_conversion_without_existing_schema():
 
     assert converted.field("id").type == DataType.int64()
     assert DataType.is_null(converted.field("null_field").type)
-    assert converted.field("timestamp_field").type == DataType.timestamp(_ns_converted_unit)
+    assert converted.field("timestamp_field").type == DataType.timestamp(
+        _ns_converted_unit
+    )
 
 
 @pytest.mark.pandas

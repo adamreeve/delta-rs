@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from arro3.core import DataType
 from arro3.core import Schema as Arro3Schema
+
 from deltalake._internal import _NANOSECOND_TIMESTAMPS
 
 
