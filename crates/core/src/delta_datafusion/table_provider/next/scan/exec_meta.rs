@@ -3,7 +3,6 @@
 //! This module implements [`DeltaScanMetaExec`], which answers queries using only file
 //! metadata and statistics, avoiding the cost of reading actual Parquet data files.
 
-use std::any::Any;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -196,10 +195,6 @@ impl ExecutionPlan for DeltaScanMetaExec {
         "DeltaScanMetaExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -293,12 +288,12 @@ impl ExecutionPlan for DeltaScanMetaExec {
         None
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        Ok(Statistics {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.exact_num_rows(partition)?),
             total_byte_size: Precision::Absent,
             column_statistics: Statistics::unknown_column(self.schema().as_ref()),
-        })
+        }))
     }
 
     fn gather_filters_for_pushdown(
@@ -696,7 +691,7 @@ mod tests {
             .scan(&session.state(), Some(&empty_projection), &[], None)
             .await?;
         assert!(
-            scan.as_any().downcast_ref::<DeltaScanMetaExec>().is_some(),
+            scan.downcast_ref::<DeltaScanMetaExec>().is_some(),
             "expected metadata-only scan\n{diagnostics}"
         );
         assert_eq!(
@@ -817,7 +812,7 @@ mod tests {
             )
             .await?;
 
-        let downcast = scan.as_any().downcast_ref::<DeltaScanMetaExec>();
+        let downcast = scan.downcast_ref::<DeltaScanMetaExec>();
         assert!(downcast.is_some());
 
         session.register_table("delta_table", provider).unwrap();
@@ -870,7 +865,7 @@ mod tests {
             )
             .await?;
 
-        let downcast = scan.as_any().downcast_ref::<DeltaScanMetaExec>();
+        let downcast = scan.downcast_ref::<DeltaScanMetaExec>();
         assert!(downcast.is_some());
 
         let expected = vec![
@@ -971,7 +966,7 @@ mod tests {
             )
             .await?;
 
-        let downcast = scan.as_any().downcast_ref::<DeltaScanMetaExec>();
+        let downcast = scan.downcast_ref::<DeltaScanMetaExec>();
         assert!(downcast.is_some());
 
         let data = collect_partitioned(scan, session.task_ctx())
@@ -998,7 +993,7 @@ mod tests {
         let scan = provider
             .scan(&session.state(), Some(&vec![data_idx]), &[], None)
             .await?;
-        let downcast = scan.as_any().downcast_ref::<DeltaScanMetaExec>();
+        let downcast = scan.downcast_ref::<DeltaScanMetaExec>();
         assert!(downcast.is_some());
         assert_eq!(
             scan.schema()
@@ -1122,7 +1117,6 @@ mod tests {
             .scan(&session.state(), Some(&empty_projection), &[], None)
             .await?;
         let template = scan
-            .as_any()
             .downcast_ref::<DeltaScanMetaExec>()
             .expect("expected metadata-only scan");
 
@@ -1155,7 +1149,6 @@ mod tests {
         );
 
         let repartitioned = repartitioned
-            .as_any()
             .downcast_ref::<DeltaScanMetaExec>()
             .expect("expected repartitioned DeltaScanMetaExec");
         assert_eq!(repartitioned.input.len(), 2);

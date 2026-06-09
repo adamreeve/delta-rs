@@ -113,7 +113,13 @@ fn build_writer_properties_tpo(
             if let Some(enc) = tpo.crypto.file_encryption {
                 // Convert config encryption properties into parquet FileEncryptionProperties
                 // and wrap into Arc as required by the builder.
-                wp_build = wp_build.with_file_encryption_properties(Arc::new(enc.into()));
+                let enc: parquet::encryption::encrypt::FileEncryptionProperties =
+                    enc.try_into().map_err(|e| {
+                        DeltaTableError::Generic(format!(
+                            "Failed to convert file encryption properties: {e}"
+                        ))
+                    })?;
+                wp_build = wp_build.with_file_encryption_properties(Arc::new(enc));
             }
             Ok(wp_build.build())
         })
