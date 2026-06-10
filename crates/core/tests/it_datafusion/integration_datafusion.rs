@@ -907,6 +907,10 @@ mod local {
             TestCase::new("int8", |value| lit(value as i8)),
             TestCase::new("float64", |value| lit(value as f64)),
             TestCase::new("float32", |value| lit(value as f32)),
+            #[cfg(feature = "float16")]
+            TestCase::new("float16", |value| {
+                lit(Float16(Some(f16::from_f32(value as f32))))
+            }),
             TestCase::new("timestamp", |value| {
                 lit(TimestampMicrosecond(Some(value * 1_000_000), None))
             }),
@@ -1003,6 +1007,10 @@ mod local {
             TestCase::new_wrapped("int8", |value| lit(value as i8)),
             TestCase::new_wrapped("float64", |value| lit(value as f64)),
             TestCase::new_wrapped("float32", |value| lit(value as f32)),
+            #[cfg(feature = "float16")]
+            TestCase::new_wrapped("float16", |value| {
+                lit(Float16(Some(f16::from_f32(value as f32))))
+            }),
             TestCase::new_wrapped("timestamp", |value| {
                 lit(TimestampMicrosecond(Some(value * 1_000_000), None))
             }),
