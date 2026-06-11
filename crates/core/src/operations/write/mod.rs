@@ -3799,6 +3799,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_float16() {
         use arrow_array::Float16Array;
+        use delta_kernel::table_features::TableFeature;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -3823,6 +3824,20 @@ mod tests {
             .await
             .unwrap();
 
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            protocol
+                .reader_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+
         let batches = get_data(&table).await;
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
         let schema = batches[0].schema();
@@ -3835,6 +3850,7 @@ mod tests {
     async fn test_write_float16_array() {
         use arrow::datatypes::Float16Type;
         use arrow_array::ListArray;
+        use delta_kernel::table_features::TableFeature;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -3862,6 +3878,20 @@ mod tests {
             .write(vec![batch])
             .await
             .unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            protocol
+                .reader_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
 
         let batches = get_data(&table).await;
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
