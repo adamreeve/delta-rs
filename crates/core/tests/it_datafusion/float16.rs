@@ -2,7 +2,7 @@
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float16Type, Int32Type};
-use arrow_array::{Float16Array, Int32Array, ListArray, RecordBatch};
+use arrow_array::{FixedSizeListArray, Float16Array, Int32Array, ListArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 use deltalake_core::delta_datafusion::create_session;
@@ -205,6 +205,70 @@ async fn update_with_float16() -> DeltaResult<()> {
 
     let batches = get_data(table).await;
     assert_eq!(sorted_values(&batches), vec![1.0, 8.0, 8.0]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_fixed_size_list_float16_as_list() -> DeltaResult<()> {
+    // F16 is commonly used in fixed-size arrays in ML workloads,
+    // so test this scenario.
+    // Delta doesn't support fixed size lists, so a column written as an Arrow `FixedSizeList`
+    // of float16 should be read back as a variable size `List`.
+    let list_size = 2;
+    let arrow_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new_fixed_size_list(
+            "xs",
+            Field::new_list_field(DataType::Float16, true),
+            list_size,
+            true,
+        ),
+    ]));
+
+    let make_batch = |ids: Vec<i32>, list_values: &[Vec<f32>]| -> DeltaResult<RecordBatch> {
+        let fixed_size_list = Arc::new(
+            FixedSizeListArray::from_iter_primitive::<Float16Type, _, _>(
+                list_values.iter().map(|inner| {
+                    Some(
+                        inner
+                            .iter()
+                            .map(|v| Some(f16::from_f32(*v)))
+                            .collect::<Vec<_>>(),
+                    )
+                }),
+                list_size,
+            ),
+        );
+        Ok(RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![id_array(ids), fixed_size_list],
+        )?)
+    };
+
+    let initial_values: Vec<Vec<f32>> = vec![vec![1.0, 2.5], vec![4.0, 8.0], vec![16.0, 32.0]];
+    let table: DeltaTable = DeltaTable::new_in_memory()
+        .write(vec![make_batch(vec![0, 1, 2], &initial_values)?])
+        .await?;
+
+    // Append more rows, which must also be cast from a fixed size list to a variable size list.
+    let appended_values: Vec<Vec<f32>> = vec![vec![64.0, 128.0], vec![256.0, 512.0]];
+    let table = table
+        .write(vec![make_batch(vec![3, 4], &appended_values)?])
+        .await?;
+    assert_eq!(table.version(), Some(1));
+
+    let batches = get_data(table).await;
+
+    let schema = batches[0].schema();
+    let list_field = schema.field_with_name("xs")?;
+    let DataType::List(inner) = list_field.data_type() else {
+        panic!("expected `xs` to be read back as a variable size list column");
+    };
+    assert_eq!(inner.data_type(), &DataType::Float16);
+
+    let expected: Vec<Vec<f32>> = initial_values.into_iter().chain(appended_values).collect();
+    assert_eq!(sorted_list_values(&batches), expected);
 
     Ok(())
 }
