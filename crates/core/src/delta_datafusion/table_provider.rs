@@ -157,6 +157,7 @@ impl DeltaScanConfigBuilder {
             schema_force_view_types: true,
             file_sort_order: Vec::new(),
             infer_file_sort_order: false,
+            stats_columns: Vec::new(),
         })
     }
 }
@@ -224,6 +225,11 @@ pub struct DeltaScanConfig {
     /// at scan time. Ignored when [`Self::file_sort_order`] is declared.
     #[serde(default)]
     pub infer_file_sort_order: bool,
+    /// Columns for which per-file min/max and null-count statistics are
+    /// materialized during scan planning, in addition to those needed by the
+    /// query itself. See [`TableProviderBuilder::with_stats_columns`].
+    #[serde(default)]
+    pub stats_columns: Vec<String>,
 }
 
 impl Default for DeltaScanConfig {
@@ -243,6 +249,7 @@ impl DeltaScanConfig {
             schema: None,
             file_sort_order: Vec::new(),
             infer_file_sort_order: false,
+            stats_columns: Vec::new(),
         }
     }
 
@@ -258,6 +265,7 @@ impl DeltaScanConfig {
             schema: None,
             file_sort_order: Vec::new(),
             infer_file_sort_order: false,
+            stats_columns: Vec::new(),
         }
     }
 
@@ -307,6 +315,14 @@ impl DeltaScanConfig {
         self.infer_file_sort_order = infer;
         self
     }
+
+    /// Materialize per-file min/max statistics for the given columns.
+    ///
+    /// See [`TableProviderBuilder::with_stats_columns`].
+    pub fn with_stats_columns(mut self, columns: impl IntoIterator<Item = impl ToString>) -> Self {
+        self.stats_columns = columns.into_iter().map(|c| c.to_string()).collect();
+        self
+    }
 }
 
 /// Builder for a datafusion [TableProvider] for a Delta table
@@ -326,6 +342,7 @@ pub struct TableProviderBuilder {
     file_selection: Option<next::FileSelection>,
     file_sort_order: Option<Vec<FileSortColumn>>,
     infer_file_sort_order: Option<bool>,
+    stats_columns: Option<Vec<String>>,
 }
 
 impl fmt::Debug for TableProviderBuilder {
@@ -341,6 +358,7 @@ impl fmt::Debug for TableProviderBuilder {
             .field("file_selection", &self.file_selection)
             .field("file_sort_order", &self.file_sort_order)
             .field("infer_file_sort_order", &self.infer_file_sort_order)
+            .field("stats_columns", &self.stats_columns)
             .finish()
     }
 }
@@ -364,6 +382,7 @@ impl TableProviderBuilder {
             file_selection: None,
             file_sort_order: None,
             infer_file_sort_order: None,
+            stats_columns: None,
         }
     }
 
@@ -484,6 +503,26 @@ impl TableProviderBuilder {
         self
     }
 
+    /// Materialize per-file min/max and null-count statistics for the given
+    /// columns during scan planning, in addition to those needed by the query.
+    ///
+    /// This enables statistics-based optimizations for columns the query does
+    /// not filter on. In particular, `ORDER BY` on a column whose per-file
+    /// value ranges can be grouped into non-overlapping batches is executed by
+    /// sorting each batch separately and streaming the sorted batches in turn
+    /// (`ProgressiveEvalExec`) instead of buffering the whole dataset in a
+    /// global sort — even when rows within each file are unsorted. Unlike
+    /// [`Self::with_file_sort_order`], nothing is declared about the data:
+    /// statistics only make the optimization possible; scans stay correct (and
+    /// fall back to a global sort) when the ranges overlap.
+    ///
+    /// Only regular data columns are supported. Partition columns are pruned
+    /// by partition value rather than file statistics.
+    pub fn with_stats_columns(mut self, columns: impl IntoIterator<Item = impl ToString>) -> Self {
+        self.stats_columns = Some(columns.into_iter().map(|c| c.to_string()).collect());
+        self
+    }
+
     /// Consume the builder and resolve it into an executable [`next::DeltaScan`].
     pub async fn build(self) -> Result<next::DeltaScan> {
         let TableProviderBuilder {
@@ -497,6 +536,7 @@ impl TableProviderBuilder {
             file_selection,
             file_sort_order,
             infer_file_sort_order,
+            stats_columns,
         } = self;
 
         let mut config = session
@@ -512,6 +552,9 @@ impl TableProviderBuilder {
         }
         if let Some(infer) = infer_file_sort_order {
             config = config.with_inferred_file_sort_order(infer);
+        }
+        if let Some(stats_columns) = stats_columns {
+            config = config.with_stats_columns(stats_columns);
         }
 
         let snapshot = match snapshot {

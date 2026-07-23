@@ -91,6 +91,7 @@ mod exec;
 mod exec_meta;
 mod expr_adapter;
 mod plan;
+mod range_batching;
 mod replay;
 
 type ScanMetadataStream = Pin<Box<dyn Stream<Item = Result<ScanMetadata, DeltaTableError>> + Send>>;

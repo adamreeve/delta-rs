@@ -259,3 +259,63 @@ The operator is generic; the goal is to eventually delete our copy:
 - Writer-side changes (same as `plan.md`).
 - Row-group-level range batching (finer than per-file) — possible follow-up.
 - Multi-column and string sort keys (see Step 2 restrictions).
+
+## Implementation status (2026-07)
+
+All three steps plus tests and benchmarks are implemented:
+
+- **Step 1** — `crates/core/src/delta_datafusion/table_provider/next/progressive_eval.rs`
+  vendors PR #10490 (head `71efd8ff56246f88c77139f5e0d2a62831d602c6`) with its
+  unit tests. Deviations (documented in the file header):
+  - Ported to the current `ExecutionPlan` trait (4-arg `PlanProperties`,
+    `partition_statistics`, `OrderingRequirements`, ...).
+  - Prefetch count is a constructor parameter (default 2), not a DataFusion
+    config option.
+  - The PR's "prefetch ALL streams when fetch is None" behavior is removed —
+    with per-batch `SortExec`s below, eager execution of every input partition
+    would defeat the memory bound and time-to-first-row entirely.
+  - The output stream truncates the record batch that crosses the fetch
+    boundary. The PR returned whole "covering" batches (possibly more than
+    `fetch` rows), which is only safe with a limit operator above;
+    `PushdownSort` removes the TopK `SortExec` and trusts `with_fetch` to
+    enforce the limit, so covering-batch semantics returned excess rows.
+- **Step 2** — `crates/core/src/delta_datafusion/table_provider/next/scan/range_batching.rs`
+  implements the sweep-merge batching with all the planned bail-outs. Extra
+  details discovered during implementation:
+  - By `PushdownSort` time, `EnforceDistribution` may have (a) split files
+    into byte-range parts across partitions — parts are reassembled per file
+    (in byte order, within one batch) so per-file deletion-vector masks and
+    row order stay correct — or (b) inserted a round-robin `RepartitionExec`
+    between `DeltaScanExec` and the `DataSourceExec`; the batching looks
+    through those (they only redistribute batches, and the rebuilt scan gets
+    its parallelism from one partition per batch).
+  - **Idempotence guard**: `PushdownSort`'s `transform_down` descends into the
+    replacement subtree and calls `try_pushdown_sort` again on the per-batch
+    `SortExec`'s input. Without detecting "already batched exactly like this"
+    (compare proposed vs. existing grouping), the fallback re-wraps the plan
+    forever — an infinite optimizer loop. This mirrors upstream's
+    `any_reordered == false → Unsupported` termination.
+  - The rebuilt config sets `preserve_order = true` and empties
+    `output_ordering`; group-level statistics are recomputed.
+- **Stats availability** — the kernel scan only materializes min/max stats for
+  predicate/sort-order columns, and declaring `file_sort_order` would falsely
+  assert within-file order. A new provider option
+  `TableProviderBuilder::with_stats_columns` (`DeltaScanConfig::stats_columns`)
+  materializes per-file min/max + null counts for named columns without
+  declaring anything; the optimization stays purely statistics-driven.
+- **Step 3** — fallback arm in `DeltaScanExec::try_pushdown_sort`
+  (`try_progressive_eval_pushdown` in `scan/exec.rs`), bailing when the
+  retained-row-index contract is active. Partition-column sort keys still
+  return `Unsupported` (follow-up as planned).
+- **Tests** — PR unit tests + sweep unit tests; integration tests in
+  `crates/core/tests/it_datafusion/sort_order.rs`: plan snapshots
+  (`ProgressiveEvalExec` + `input_ranges=` for unsorted disjoint files; global
+  sort retained for overlapping files / nulls / missing stats), LIMIT
+  early-termination laziness via the operator's `num_read_inputs` metric
+  (2 of 4 batches executed), and a correctness matrix (disjoint / touching /
+  partial / contained / full overlap / two batches, with and without LIMIT)
+  against the global-sort baseline.
+- **Benchmarks** — `sort-gen --shuffle-within-files [--overlap-days N]`
+  generates the targeted layout (disjoint ranges, unsorted rows, no
+  `sorting_columns` metadata); `sort-bench --modes progressive` uses
+  `with_stats_columns` and reports `progressive_eval=` plan shape.

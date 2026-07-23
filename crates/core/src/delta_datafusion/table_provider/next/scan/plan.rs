@@ -295,20 +295,26 @@ impl KernelScanPlan {
             .scan_builder()
             .with_predicate(scan_predicate.clone());
 
-        if !config.file_sort_order.is_empty() {
-            // Materialize file statistics for the declared sort order columns so
-            // scan file groups can be formed (and orderings validated) from
-            // per-file min/max values.
-            scan_builder = scan_builder.with_extra_stats_columns(
-                config
-                    .file_sort_order
-                    .iter()
-                    .map(|sort_column| ColumnName::new([sort_column.column.as_str()])),
-            );
-        } else if config.infer_file_sort_order {
+        if config.file_sort_order.is_empty() && config.infer_file_sort_order {
             // The sort order columns are not known until file footers are read
             // at planning time, so materialize the full stats schema.
             scan_builder = scan_builder.with_kernel_all_struct_stats();
+        } else {
+            // Materialize file statistics for the declared sort order columns
+            // (so scan file groups can be formed, and orderings validated, from
+            // per-file min/max values) and for explicitly requested stats
+            // columns (so ordered reads can batch files by value range).
+            let extra_stats_columns = config
+                .file_sort_order
+                .iter()
+                .map(|sort_column| sort_column.column.as_str())
+                .chain(config.stats_columns.iter().map(String::as_str))
+                .unique()
+                .map(|name| ColumnName::new([name]))
+                .collect_vec();
+            if !extra_stats_columns.is_empty() {
+                scan_builder = scan_builder.with_extra_stats_columns(extra_stats_columns);
+            }
         }
 
         let scan = if contract.kernel_projection.is_some() {

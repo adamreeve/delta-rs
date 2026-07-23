@@ -175,23 +175,26 @@ where
                     Err(err) => return Poll::Ready(Some(Err(err))),
                 };
                 let snapshot = this.kernel_scan.snapshot();
-                // Also extract stats for file sort order columns so scan file
-                // groups can be formed from per-file min/max values. With an
-                // inferred sort order the columns are not known yet, so all
-                // stats are extracted.
+                // Also extract stats for file sort order columns (so scan file
+                // groups can be formed from per-file min/max values) and for
+                // explicitly requested stats columns (so ordered reads can
+                // batch files by value range). With an inferred sort order the
+                // columns are not known yet, so all stats are extracted.
+                let extra_stats_columns = this
+                    .scan_config
+                    .file_sort_order
+                    .iter()
+                    .map(|sort_column| sort_column.column.as_str())
+                    .chain(this.scan_config.stats_columns.iter().map(String::as_str))
+                    .unique()
+                    .map(|name| ColumnName::new([name]))
+                    .collect_vec();
                 let stats_projection = if this.scan_config.infer_file_sort_order {
                     StatsProjection::Full
-                } else if this.scan_config.file_sort_order.is_empty() {
+                } else if extra_stats_columns.is_empty() {
                     stats_projection
                 } else {
-                    match stats_projection.with_extra_columns(
-                        snapshot,
-                        None,
-                        this.scan_config
-                            .file_sort_order
-                            .iter()
-                            .map(|sort_column| ColumnName::new([sort_column.column.as_str()])),
-                    ) {
+                    match stats_projection.with_extra_columns(snapshot, None, extra_stats_columns) {
                         Ok(projection) => projection,
                         Err(err) => return Poll::Ready(Some(Err(err))),
                     }

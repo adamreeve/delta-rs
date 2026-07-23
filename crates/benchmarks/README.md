@@ -101,13 +101,20 @@ Writes one commit per day, each containing a single batch sorted by
 - `--days <n>`: number of days to write (default 100)
 - `--rows-per-day <n>`: rows per day (default 1,000,000)
 - `--extra-columns <n>`: extra float32 data columns (default 20)
+- `--shuffle-within-files`: shuffle rows within each day's file (day ranges
+  stay disjoint, no `sorting_columns` metadata is written) — the data layout
+  targeted by the ProgressiveEval optimization (see `progressive_eval.md`)
+- `--overlap-days <n>`: widen each file's range to overlap the following `n`
+  days; `n >= days` makes every file overlap every other file, the worst case
+  where range batching must fall back to a global sort
 
 Note the defaults produce roughly 12 GB of parquet. The generator writes
 through a single-partition DataFusion session: with the default multi-partition
 session, the delta-rs write plan repartitions batches across concurrent writer
 tasks and row order within the produced files is not preserved. Every file is
-re-read after writing to verify it is internally sorted and that no file
-ranges overlap, so generation fails loudly if that ever regresses.
+re-read after writing to verify it is internally sorted (or actually shuffled,
+with `--shuffle-within-files`) and that file ranges do not overlap (unless
+`--overlap-days` is set), so generation fails loudly if that ever regresses.
 
 ### Benchmarking sorted reads
 
@@ -117,14 +124,20 @@ cargo run --release -p delta-benchmarks -- sort-bench --table-path ./data/sorted
 
 For each mode the query `SELECT ... FROM t ORDER BY timestamp` is planned and
 streamed to completion, reporting plan shape (`sort_exec`, `spm` =
-SortPreservingMergeExec), planning time, time to first batch, total time, and
-whether the streamed rows were actually in order (`sorted`).
+SortPreservingMergeExec, `progressive_eval` = ProgressiveEvalExec), planning
+time, time to first batch, total time, and whether the streamed rows were
+actually in order (`sorted`).
 
-- `--modes <baseline,declared,inferred>`: provider configurations to compare
-  (default all three). `baseline` declares no ordering and needs a full
-  `SortExec`; `declared` uses `with_file_sort_order`; `inferred` uses
+- `--modes <baseline,declared,inferred,progressive>`: provider configurations
+  to compare (default all four). `baseline` declares no ordering and needs a
+  full `SortExec`; `declared` uses `with_file_sort_order`; `inferred` uses
   `with_inferred_file_sort_order` (reads file footers during planning, visible
-  as extra `plan_ms`).
+  as extra `plan_ms`); `progressive` uses `with_stats_columns` so
+  non-overlapping range batches are sorted separately and streamed in turn
+  (`ProgressiveEvalExec`) — the only mode that avoids a global sort on tables
+  generated with `--shuffle-within-files`. Do not use `declared`/`inferred` on
+  shuffled tables: `declared` would assert an ordering the files do not have
+  (reported as `sorted=false`).
 - `--select-columns <n>`: number of extra float32 columns in the SELECT
   (default: all)
 - `--limit <n>`: add a LIMIT to exercise TopK / early termination

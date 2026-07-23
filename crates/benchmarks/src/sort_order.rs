@@ -10,6 +10,13 @@
 //! record batch sorted by `timestamp`, with `sorting_columns` metadata set on
 //! every file. Day ranges never overlap, so file min/max statistics allow
 //! DataFusion to form non-overlapping file groups.
+//!
+//! With `shuffle_within_files` the rows within each day's file are unsorted
+//! (and no `sorting_columns` metadata is written): only the `progressive`
+//! bench mode (`with_stats_columns`, see `progressive_eval.md`) can then avoid
+//! a full global sort, by sorting each non-overlapping range batch separately
+//! and streaming the sorted batches in turn. `overlap_days` widens each file's
+//! range to benchmark the fallback when ranges overlap.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,6 +53,19 @@ pub struct SortDataParams {
     pub rows_per_day: usize,
     /// Number of extra float32 data columns.
     pub extra_columns: usize,
+    /// Shuffle rows within each day's file (day ranges stay non-overlapping).
+    ///
+    /// Produces the data layout targeted by the ProgressiveEval optimization
+    /// (see `progressive_eval.md`): per-file value ranges are disjoint, but
+    /// rows within a file are unsorted, so no within-file sort order can be
+    /// declared or inferred and `sorting_columns` metadata is not written.
+    pub shuffle_within_files: bool,
+    /// Number of days each file's range overlaps into the next day.
+    ///
+    /// Zero keeps day ranges disjoint. A value >= days makes every file
+    /// overlap every other file — the worst case, where range batching must
+    /// fall back to a global sort.
+    pub overlap_days: usize,
 }
 
 impl Default for SortDataParams {
@@ -54,7 +74,17 @@ impl Default for SortDataParams {
             days: 100,
             rows_per_day: 1_000_000,
             extra_columns: 20,
+            shuffle_within_files: false,
+            overlap_days: 0,
         }
+    }
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
     }
 }
 
@@ -70,27 +100,45 @@ fn sort_table_schema(extra_columns: usize) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// Writer properties declaring every file sorted ascending by the first
-/// (timestamp) column, matching how the data is actually written.
-fn sorting_writer_properties() -> WriterProperties {
-    WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .set_sorting_columns(Some(vec![SortingColumn {
-            column_idx: 0,
-            descending: false,
-            nulls_first: false,
-        }]))
-        .build()
+/// Writer properties for the generated files. When the data is written sorted,
+/// declare it via `sorting_columns` metadata; shuffled files carry no such
+/// claim.
+fn writer_properties(params: &SortDataParams) -> WriterProperties {
+    let builder = WriterProperties::builder().set_compression(Compression::SNAPPY);
+    if params.shuffle_within_files {
+        builder.build()
+    } else {
+        builder
+            .set_sorting_columns(Some(vec![SortingColumn {
+                column_idx: 0,
+                descending: false,
+                nulls_first: false,
+            }]))
+            .build()
+    }
 }
 
-/// Build one day's batch: timestamps spread evenly across the day (ascending),
-/// plus `extra_columns` float32 columns of deterministic pseudo-random values.
+/// Build one day's batch: timestamps spread evenly across the day (ascending,
+/// or deterministically shuffled with `shuffle_within_files`), plus
+/// `extra_columns` float32 columns of deterministic pseudo-random values.
 fn day_batch(schema: SchemaRef, day: usize, params: &SortDataParams) -> DeltaResult<RecordBatch> {
     let rows = params.rows_per_day;
     let day_start_us = (BASE_EPOCH_SECONDS + day as i64 * 86_400) * 1_000_000;
-    let step_us = MICROS_PER_DAY / rows as i64;
+    let span_us = MICROS_PER_DAY * (1 + params.overlap_days as i64);
+    let step_us = span_us / rows as i64;
+    // Stride through the range with a step coprime to the row count so every
+    // slot is visited exactly once, in non-monotonic order when shuffling.
+    let stride = if params.shuffle_within_files {
+        (rows as i64 / 2 + 1..)
+            .find(|s| gcd(*s, rows as i64) == 1)
+            .expect("a coprime stride exists")
+    } else {
+        1
+    };
     let timestamps: Vec<i64> = (0..rows as i64)
-        .map(|i| day_start_us + i * step_us)
+        .map(|i| {
+            day_start_us + ((i128::from(i) * i128::from(stride)) % rows as i128) as i64 * step_us
+        })
         .collect();
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(params.extra_columns + 1);
@@ -155,7 +203,7 @@ pub async fn generate_sorted_table(table_url: &Url, params: &SortDataParams) -> 
             .write(vec![batch])
             .with_save_mode(mode)
             .with_session_state(write_session.clone())
-            .with_writer_properties(sorting_writer_properties())
+            .with_writer_properties(writer_properties(params))
             .await?;
         println!(
             "day={day} rows={} gen_ms={} write_ms={}",
@@ -174,18 +222,24 @@ pub async fn generate_sorted_table(table_url: &Url, params: &SortDataParams) -> 
     );
 
     let verify_start = Instant::now();
-    verify_sorted_files(&table, table_url)?;
+    verify_generated_files(&table, table_url, params)?;
     println!(
-        "verified files_sorted=true verify_s={:.1}",
+        "verified files_ok=true verify_s={:.1}",
         verify_start.elapsed().as_secs_f64()
     );
     Ok(())
 }
 
-/// Re-read the timestamp column of every live file and check that each file is
-/// internally sorted ascending and that file ranges do not overlap. Only
+/// Re-read the timestamp column of every live file and check the generated
+/// layout: files must be internally sorted ascending unless
+/// `shuffle_within_files` is set (then they must actually be unsorted), and
+/// file ranges must not overlap unless `overlap_days` is nonzero. Only
 /// supported for local (file://) tables; skipped otherwise.
-fn verify_sorted_files(table: &DeltaTable, table_url: &Url) -> DeltaResult<()> {
+fn verify_generated_files(
+    table: &DeltaTable,
+    table_url: &Url,
+    params: &SortDataParams,
+) -> DeltaResult<()> {
     let Ok(root) = table_url.to_file_path() else {
         println!("verification skipped: not a local file table");
         return Ok(());
@@ -197,8 +251,10 @@ fn verify_sorted_files(table: &DeltaTable, table_url: &Url) -> DeltaResult<()> {
         let path = root.join(&name);
         let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?;
         let mask = ProjectionMask::leaves(reader.parquet_schema(), [0]);
-        let mut first: Option<i64> = None;
+        let mut min: Option<i64> = None;
+        let mut max: Option<i64> = None;
         let mut last: Option<i64> = None;
+        let mut sorted = true;
         for batch in reader.with_projection(mask).build()? {
             let batch = batch?;
             let timestamps = batch
@@ -210,29 +266,40 @@ fn verify_sorted_files(table: &DeltaTable, table_url: &Url) -> DeltaResult<()> {
             for &ts in timestamps.iter() {
                 if let Some(last) = last {
                     if ts < last {
-                        return Err(DeltaTableError::generic(format!(
-                            "file {name} is not sorted: ts={ts} after previous_ts={last}"
-                        )));
+                        if !params.shuffle_within_files {
+                            return Err(DeltaTableError::generic(format!(
+                                "file {name} is not sorted: ts={ts} after previous_ts={last}"
+                            )));
+                        }
+                        sorted = false;
                     }
                 }
-                first.get_or_insert(ts);
+                min = Some(min.map_or(ts, |m| m.min(ts)));
+                max = Some(max.map_or(ts, |m| m.max(ts)));
                 last = Some(ts);
             }
         }
-        let (Some(first), Some(last)) = (first, last) else {
+        if params.shuffle_within_files && sorted {
+            return Err(DeltaTableError::generic(format!(
+                "file {name} is unexpectedly sorted; the shuffle had no effect"
+            )));
+        }
+        let (Some(min), Some(max)) = (min, max) else {
             return Err(DeltaTableError::generic(format!("file {name} is empty")));
         };
-        ranges.push((first, last, name));
+        ranges.push((min, max, name));
     }
 
-    ranges.sort_unstable();
-    for pair in ranges.windows(2) {
-        let (_, max_a, name_a) = &pair[0];
-        let (min_b, _, name_b) = &pair[1];
-        if min_b < max_a {
-            return Err(DeltaTableError::generic(format!(
-                "files {name_a} and {name_b} have overlapping timestamp ranges"
-            )));
+    if params.overlap_days == 0 {
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            let (_, max_a, name_a) = &pair[0];
+            let (min_b, _, name_b) = &pair[1];
+            if min_b < max_a {
+                return Err(DeltaTableError::generic(format!(
+                    "files {name_a} and {name_b} have overlapping timestamp ranges"
+                )));
+            }
         }
     }
     Ok(())
@@ -248,6 +315,12 @@ pub enum SortBenchMode {
     /// Sort order inferred from parquet `sorting_columns` metadata via
     /// `with_inferred_file_sort_order` (reads every file footer at plan time).
     Inferred,
+    /// Per-file min/max statistics materialized via `with_stats_columns`, so
+    /// files with non-overlapping ranges are grouped into batches that are
+    /// sorted separately and streamed in turn (`ProgressiveEvalExec`). Unlike
+    /// the other modes this works when rows *within* files are unsorted
+    /// (tables generated with `shuffle_within_files`).
+    Progressive,
 }
 
 impl SortBenchMode {
@@ -256,6 +329,7 @@ impl SortBenchMode {
             SortBenchMode::Baseline => "baseline",
             SortBenchMode::Declared => "declared",
             SortBenchMode::Inferred => "inferred",
+            SortBenchMode::Progressive => "progressive",
         }
     }
 }
@@ -282,6 +356,7 @@ pub struct SortBenchReport {
     pub plan: String,
     pub has_sort_exec: bool,
     pub has_sort_preserving_merge: bool,
+    pub has_progressive_eval: bool,
     /// Time to build the table provider.
     pub provider: Duration,
     /// Time to plan the query (includes footer reads in `inferred` mode).
@@ -379,6 +454,7 @@ pub async fn run_sort_bench_once(
             builder.with_file_sort_order([FileSortColumn::asc(TIMESTAMP_COLUMN)])
         }
         SortBenchMode::Inferred => builder.with_inferred_file_sort_order(true),
+        SortBenchMode::Progressive => builder.with_stats_columns([TIMESTAMP_COLUMN]),
     };
     let provider = builder.await?;
     let provider_elapsed = provider_start.elapsed();
@@ -431,6 +507,7 @@ pub async fn run_sort_bench_once(
     Ok(SortBenchReport {
         has_sort_exec: rendered.contains("SortExec"),
         has_sort_preserving_merge: rendered.contains("SortPreservingMergeExec"),
+        has_progressive_eval: rendered.contains("ProgressiveEvalExec"),
         plan: rendered,
         provider: provider_elapsed,
         planning: planning_elapsed,

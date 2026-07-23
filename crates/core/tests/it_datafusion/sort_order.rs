@@ -509,6 +509,376 @@ async fn delta_table_sort_order_validation() -> TestResult<()> {
     Ok(())
 }
 
+// --- ProgressiveEval: ordered reads over non-overlapping but
+// --- internally-unsorted files (see progressive_eval.md) ---
+
+fn unsorted_schema(nullable_timestamp: bool) -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            nullable_timestamp,
+        ),
+        Field::new("value", DataType::Int64, false),
+    ]))
+}
+
+/// One file's batch: `len` unique timestamps starting at `start` seconds, in a
+/// deterministic shuffled (non-sorted) order; `value` mirrors the timestamp
+/// second so full rows can be compared across plans.
+fn unsorted_batch(start: i64, len: i64, nulls: usize) -> TestResult<RecordBatch> {
+    // Deterministic shuffle: stride through the range with a step coprime to
+    // its length so every element is visited once, in non-monotonic order.
+    let step = (0..).map(|i| len / 2 + 1 + i).find(|s| gcd(*s, len) == 1);
+    let step = step.expect("a coprime step exists");
+    let seconds: Vec<i64> = (0..len).map(|i| start + (i * step) % len).collect();
+    let timestamps: Vec<Option<i64>> = seconds
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i >= nulls).then_some(s * 1_000_000))
+        .collect();
+    let values: Vec<i64> = seconds.clone();
+    Ok(RecordBatch::try_new(
+        unsorted_schema(nulls > 0),
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(timestamps)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )?)
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// Create a non-partitioned Delta table with one file per `(start, len)`
+/// range. Rows within each file are deliberately NOT sorted by timestamp, so
+/// the within-file sort order cannot be declared or inferred; only per-file
+/// min/max statistics relate the files to each other.
+async fn unsorted_delta_table(
+    files: &[(i64, i64)],
+    nulls_in_file: Option<usize>,
+) -> TestResult<DeltaTable> {
+    let nullable = nulls_in_file.is_some();
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "timestamp".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
+                nullable,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+
+    for (index, (start, len)) in files.iter().enumerate() {
+        let nulls = (nulls_in_file == Some(index)) as usize;
+        table = table
+            .write(vec![unsorted_batch(*start, *len, nulls)?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), files.len());
+    Ok(table)
+}
+
+/// Render the plan and collect the results of `query` against `table`,
+/// optionally materializing per-file stats for the timestamp column.
+async fn plan_unsorted_query(
+    table: &DeltaTable,
+    with_stats_columns: bool,
+    query: &str,
+) -> TestResult<(String, Vec<RecordBatch>)> {
+    let ctx = create_session().into_inner();
+    let mut builder = table.table_provider();
+    if with_stats_columns {
+        builder = builder.with_stats_columns(["timestamp"]);
+    }
+    ctx.register_table("test_table", builder.await?)?;
+
+    let df = ctx.sql(query).await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok((rendered, batches))
+}
+
+fn collected_timestamps(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_primitive::<TimestampMicrosecondType>()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect()
+}
+
+/// Files with non-overlapping timestamp ranges but unsorted rows within each
+/// file: the scan is rebuilt with one file group per range batch, each batch
+/// is sorted separately, and `ProgressiveEvalExec` streams the sorted batches
+/// in turn — no global sort over the whole dataset.
+#[tokio::test]
+async fn delta_table_unsorted_disjoint_files_uses_progressive_eval() -> TestResult<()> {
+    let table = unsorted_delta_table(&[(0, 100), (100, 100), (200, 100), (300, 100)], None).await?;
+
+    let (rendered, batches) = plan_unsorted_query(
+        &table,
+        true,
+        "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"",
+    )
+    .await?;
+
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("input_ranges="),
+        "expected input_ranges in plan:\n{rendered}"
+    );
+    // The per-batch SortExec must sit below the ProgressiveEvalExec; there
+    // must be no SortExec above it (which would be a global sort).
+    let progressive_pos = rendered.find("ProgressiveEvalExec").unwrap();
+    let sort_pos = rendered.find("SortExec").expect("per-batch SortExec");
+    assert!(
+        progressive_pos < sort_pos,
+        "expected the SortExec below ProgressiveEvalExec:\n{rendered}"
+    );
+
+    let timestamps = collected_timestamps(&batches);
+    assert_eq!(timestamps.len(), 400);
+    assert!(
+        timestamps.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by timestamp"
+    );
+    Ok(())
+}
+
+/// Without materialized stats for the sort column the batching cannot prove
+/// non-overlap, so the global sort is kept — and still returns sorted data.
+#[tokio::test]
+async fn delta_table_unsorted_files_without_stats_columns_keeps_global_sort() -> TestResult<()> {
+    let table = unsorted_delta_table(&[(0, 100), (100, 100), (200, 100), (300, 100)], None).await?;
+
+    let (rendered, batches) = plan_unsorted_query(
+        &table,
+        false,
+        "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"",
+    )
+    .await?;
+
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "expected no ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+    let timestamps = collected_timestamps(&batches);
+    assert_eq!(timestamps.len(), 400);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
+/// When every file overlaps every other file the sweep collapses to a single
+/// batch, which is no better than a global sort, so the plan falls back.
+#[tokio::test]
+async fn delta_table_unsorted_overlapping_files_keeps_global_sort() -> TestResult<()> {
+    let table = unsorted_delta_table(&[(0, 100), (50, 100), (25, 100), (75, 100)], None).await?;
+
+    let (rendered, batches) = plan_unsorted_query(
+        &table,
+        true,
+        "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"",
+    )
+    .await?;
+
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "expected no ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+    let timestamps = collected_timestamps(&batches);
+    assert_eq!(timestamps.len(), 400);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
+/// NULLs in the sort column break the concatenation argument (NULLS
+/// FIRST/LAST placement is per sorted batch, not global), so any file with a
+/// nonzero null count disables the optimization.
+#[tokio::test]
+async fn delta_table_nulls_in_sort_column_keep_global_sort() -> TestResult<()> {
+    let table =
+        unsorted_delta_table(&[(0, 100), (100, 100), (200, 100), (300, 100)], Some(2)).await?;
+
+    let (rendered, batches) = plan_unsorted_query(
+        &table,
+        true,
+        "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"",
+    )
+    .await?;
+
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "expected no ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+    let row_count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(row_count, 400);
+    Ok(())
+}
+
+/// `ORDER BY ... LIMIT n`: the `PushdownSort` rule forwards the eliminated
+/// `SortExec`'s fetch to the `ProgressiveEvalExec`, which stops after the
+/// first batch covers the limit — later batches are never executed (only the
+/// polled stream plus one prefetched stream are started).
+#[tokio::test]
+async fn delta_table_progressive_eval_limit_early_termination() -> TestResult<()> {
+    use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanVisitor, accept};
+
+    let table = unsorted_delta_table(&[(0, 100), (100, 100), (200, 100), (300, 100)], None).await?;
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_stats_columns(["timestamp"])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" LIMIT 50")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        rendered.contains("ProgressiveEvalExec: fetch=50"),
+        "expected ProgressiveEvalExec with forwarded fetch in plan:\n{rendered}"
+    );
+
+    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx()).await?;
+    let timestamps = collected_timestamps(&batches);
+    assert_eq!(timestamps.len(), 50);
+    assert_eq!(
+        timestamps,
+        (0..50).map(|s| s * 1_000_000).collect::<Vec<_>>()
+    );
+
+    // Laziness: with 4 range batches and the limit covered by the first one,
+    // only the first stream (plus one prefetched stream) may have been
+    // executed. Later batches' files are never opened.
+    #[derive(Default)]
+    struct ProgressiveEvalMetrics {
+        num_inputs: Option<usize>,
+        num_read_inputs: Option<usize>,
+    }
+    impl ExecutionPlanVisitor for ProgressiveEvalMetrics {
+        type Error = datafusion::error::DataFusionError;
+        fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
+            if plan.name() == "ProgressiveEvalExec" {
+                let metrics = plan.metrics().expect("metrics recorded after execution");
+                self.num_inputs = metrics.sum_by_name("num_inputs").map(|m| m.as_usize());
+                self.num_read_inputs = metrics.sum_by_name("num_read_inputs").map(|m| m.as_usize());
+                return Ok(false);
+            }
+            Ok(true)
+        }
+    }
+    let mut visitor = ProgressiveEvalMetrics::default();
+    accept(plan.as_ref(), &mut visitor)?;
+    assert_eq!(visitor.num_inputs, Some(4), "expected 4 range batches");
+    assert_eq!(
+        visitor.num_read_inputs,
+        Some(2),
+        "expected only the first batch plus one prefetched batch to execute"
+    );
+    Ok(())
+}
+
+/// Correctness across overlap patterns, with and without LIMIT: the
+/// range-batched plan must return exactly what the global-sort plan returns.
+#[tokio::test]
+async fn delta_table_range_batching_matches_global_sort() -> TestResult<()> {
+    // (name, per-file (start, len)); files are 40 rows each.
+    let patterns: &[(&str, &[(i64, i64)])] = &[
+        ("disjoint", &[(0, 40), (40, 40), (120, 40), (80, 40)]),
+        ("touching", &[(0, 41), (40, 41), (80, 41), (120, 41)]),
+        ("partial_overlap", &[(0, 40), (30, 40), (90, 40), (60, 40)]),
+        ("full_overlap", &[(0, 40), (0, 40), (0, 40), (0, 40)]),
+        ("contained", &[(0, 160), (10, 20), (50, 20), (100, 20)]),
+        ("two_batches", &[(0, 40), (20, 40), (100, 40), (120, 40)]),
+    ];
+
+    for (name, files) in patterns {
+        let table = unsorted_delta_table(files, None).await?;
+        for query in [
+            "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"",
+            "SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" LIMIT 25",
+        ] {
+            let (_, optimized) = plan_unsorted_query(&table, true, query).await?;
+            let (baseline_plan, baseline) = plan_unsorted_query(&table, false, query).await?;
+            assert!(
+                !baseline_plan.contains("ProgressiveEvalExec"),
+                "baseline must not use ProgressiveEvalExec ({name}):\n{baseline_plan}"
+            );
+
+            let optimized_ts = collected_timestamps(&optimized);
+            let baseline_ts = collected_timestamps(&baseline);
+            assert_eq!(
+                optimized_ts, baseline_ts,
+                "timestamps diverge for pattern '{name}' with query '{query}'"
+            );
+            assert!(
+                optimized_ts.windows(2).all(|pair| pair[0] <= pair[1]),
+                "unsorted result for pattern '{name}'"
+            );
+
+            // Rows may tie on timestamp across overlapping files; compare the
+            // full (timestamp, value) multiset instead of row order.
+            let pairs = |batches: &[RecordBatch]| {
+                let mut pairs: Vec<(i64, i64)> = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        let ts = batch.column(0).as_primitive::<TimestampMicrosecondType>();
+                        let values = batch.column(1).as_primitive::<Int64Type>();
+                        ts.values()
+                            .iter()
+                            .zip(values.values().iter())
+                            .map(|(t, v)| (*t, *v))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                pairs.sort_unstable();
+                pairs
+            };
+            if !query.contains("LIMIT") {
+                assert_eq!(
+                    pairs(&optimized),
+                    pairs(&baseline),
+                    "row multiset diverges for pattern '{name}'"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// With no declared sort order, the table's ordering is inferred from the
 /// parquet `sorting_columns` metadata written to each file.
 #[tokio::test]

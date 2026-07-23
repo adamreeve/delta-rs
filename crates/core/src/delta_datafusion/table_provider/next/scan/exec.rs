@@ -37,8 +37,12 @@ use delta_kernel::table_features::TableFeature;
 use delta_kernel::{EvaluationHandler, ExpressionRef};
 use futures::stream::{Stream, StreamExt};
 
+use datafusion::physical_plan::sorts::sort::SortExec;
+
+use super::super::progressive_eval::ProgressiveEvalExec;
 use super::expr_adapter::DeltaPhysicalExprAdapterFactory;
 use super::plan::KernelScanPlan;
+use super::range_batching::try_batch_scan_by_ranges;
 use crate::delta_datafusion::file_id::file_id_field;
 use crate::kernel::ARROW_HANDLER;
 use crate::kernel::arrow::engine_ext::ExpressionEvaluatorExt;
@@ -333,6 +337,56 @@ impl DeltaScanExec {
         Ok(stats)
     }
 
+    /// Fallback for [`ExecutionPlan::try_pushdown_sort`] when the inner scan
+    /// cannot guarantee the requested ordering because rows within the data
+    /// files are not (known to be) sorted.
+    ///
+    /// When per-file min/max statistics prove that the files can be grouped
+    /// into mutually non-overlapping range batches on the sort key, rebuild
+    /// the scan with one file group per batch (in range order), sort each
+    /// batch independently with a partition-preserving `SortExec`, and
+    /// concatenate the sorted batches with a [`ProgressiveEvalExec`]. The
+    /// composite plan guarantees the requested ordering (`Exact`) while:
+    ///
+    /// - bounding peak sort memory by the largest batch rather than the whole
+    ///   dataset,
+    /// - emitting the first rows after the first batch is read and sorted, and
+    /// - terminating early under a `LIMIT` without opening later batches'
+    ///   files (the `PushdownSort` rule forwards the eliminated `SortExec`'s
+    ///   fetch via `with_fetch`).
+    ///
+    /// `order` is the requested ordering over this exec's logical output
+    /// schema; `mapped` is the same ordering mapped onto the inner scan's
+    /// schema. Returns `Ok(None)` when the optimization does not apply.
+    fn try_progressive_eval_pushdown(
+        &self,
+        order: &[PhysicalSortExpr],
+        mapped: &[PhysicalSortExpr],
+    ) -> Result<Option<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>>> {
+        // Retained row indexes require a single input partition; the batched
+        // layout needs one partition per range batch.
+        if self.scan_plan.contract.retained_row_index_field().is_some() {
+            return Ok(None);
+        }
+        let Some(batched) = try_batch_scan_by_ranges(&self.input, mapped)? else {
+            return Ok(None);
+        };
+        let Some(ordering) = LexOrdering::new(order.iter().cloned()) else {
+            return Ok(None);
+        };
+        // The sort runs above this exec on the logical schema, one sorted
+        // stream per range batch.
+        let sort = SortExec::new(ordering, self.with_new_input(batched.input))
+            .with_preserve_partitioning(true);
+        Ok(Some(SortOrderPushdownResult::Exact {
+            inner: Arc::new(ProgressiveEvalExec::new(
+                Arc::new(sort),
+                Some(batched.ranges),
+                None,
+            )),
+        }))
+    }
+
     /// The default physical expr adapter rewrites missing nullable columns to null literals.
     /// That rewrite supports schema evolution. Delta materialized columns live above the
     /// Parquet child, including partition values, file id, and row index. Dynamic filters
@@ -433,10 +487,22 @@ impl ExecutionPlan for DeltaScanExec {
             SortOrderPushdownResult::Exact { inner } => SortOrderPushdownResult::Exact {
                 inner: self.with_new_input(inner),
             },
-            SortOrderPushdownResult::Inexact { inner } => SortOrderPushdownResult::Inexact {
-                inner: self.with_new_input(inner),
+            // The inner scan cannot guarantee the ordering (files are not
+            // internally sorted). If per-file statistics prove the files can
+            // be grouped into non-overlapping range batches, sort each batch
+            // separately and stream the sorted batches in turn instead of
+            // sorting the whole dataset.
+            delegated => match self.try_progressive_eval_pushdown(order, &mapped)? {
+                Some(result) => result,
+                None => match delegated {
+                    SortOrderPushdownResult::Inexact { inner } => {
+                        SortOrderPushdownResult::Inexact {
+                            inner: self.with_new_input(inner),
+                        }
+                    }
+                    _ => SortOrderPushdownResult::Unsupported,
+                },
             },
-            SortOrderPushdownResult::Unsupported => SortOrderPushdownResult::Unsupported,
         })
     }
 

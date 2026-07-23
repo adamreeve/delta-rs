@@ -58,6 +58,7 @@ use crate::logstore::LogStoreRef;
 use crate::protocol::SaveMode;
 use crate::table::normalize_table_url;
 
+mod progressive_eval;
 mod scan;
 
 /// Default column name for the file id column we add to files read from disk.
@@ -627,6 +628,18 @@ impl DeltaScan {
                 return Err(DataFusionError::Plan(format!(
                     "file sort order column '{}' does not exist in the table schema",
                     sort_column.column
+                )));
+            }
+        }
+        for stats_column in &config.stats_columns {
+            if partition_columns.contains(stats_column) {
+                return Err(DataFusionError::Plan(format!(
+                    "stats column '{stats_column}' is a partition column; partition columns carry no file statistics"
+                )));
+            }
+            if scan_schema.field_with_name(stats_column).is_err() {
+                return Err(DataFusionError::Plan(format!(
+                    "stats column '{stats_column}' does not exist in the table schema"
                 )));
             }
         }

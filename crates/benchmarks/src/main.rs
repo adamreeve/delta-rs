@@ -87,6 +87,18 @@ enum Command {
         /// Number of extra float32 data columns
         #[arg(long, default_value_t = 20)]
         extra_columns: usize,
+
+        /// Shuffle rows within each day's file. Day ranges stay
+        /// non-overlapping, but no within-file sort order exists, so only the
+        /// `progressive` bench mode can avoid a global sort
+        #[arg(long)]
+        shuffle_within_files: bool,
+
+        /// Number of days each file's range overlaps into the following days;
+        /// values >= days make every file overlap every other file (the
+        /// worst case for range batching)
+        #[arg(long, default_value_t = 0)]
+        overlap_days: usize,
     },
 
     /// Benchmark sorted streaming reads (ORDER BY timestamp) over a table
@@ -216,6 +228,8 @@ async fn main() -> anyhow::Result<()> {
             days,
             rows_per_day,
             extra_columns,
+            shuffle_within_files,
+            overlap_days,
         } => {
             std::fs::create_dir_all(&table_path)?;
             let table_url = ensure_table_uri(table_path.to_string_lossy().as_ref())?;
@@ -223,9 +237,11 @@ async fn main() -> anyhow::Result<()> {
                 days,
                 rows_per_day,
                 extra_columns,
+                shuffle_within_files,
+                overlap_days,
             };
             println!(
-                "generating table at {table_url} days={days} rows_per_day={rows_per_day} extra_columns={extra_columns}"
+                "generating table at {table_url} days={days} rows_per_day={rows_per_day} extra_columns={extra_columns} shuffle_within_files={shuffle_within_files} overlap_days={overlap_days}"
             );
             generate_sorted_table(&table_url, &params).await?;
         }
@@ -245,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
                     SortBenchMode::Baseline,
                     SortBenchMode::Declared,
                     SortBenchMode::Inferred,
+                    SortBenchMode::Progressive,
                 ]
             });
             let memory_limit_bytes = match memory_limit_gb {
@@ -265,10 +282,11 @@ async fn main() -> anyhow::Result<()> {
                         println!("--- {} plan ---\n{}", mode.name(), report.plan.trim_end());
                     }
                     println!(
-                        "mode={} iter={iter} sort_exec={} spm={} provider_ms={} plan_ms={} first_batch_ms={} total_ms={} rows={} batches={} sorted={} peak_rss_mb={}",
+                        "mode={} iter={iter} sort_exec={} spm={} progressive_eval={} provider_ms={} plan_ms={} first_batch_ms={} total_ms={} rows={} batches={} sorted={} peak_rss_mb={}",
                         mode.name(),
                         report.has_sort_exec,
                         report.has_sort_preserving_merge,
+                        report.has_progressive_eval,
                         report.provider.as_millis(),
                         report.planning.as_millis(),
                         report
