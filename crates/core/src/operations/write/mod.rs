@@ -63,6 +63,9 @@ use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL, Tabl
 use crate::kernel::{Action, EagerSnapshot, StructType};
 use crate::logstore::LogStoreRef;
 use crate::protocol::{DeltaOperation, SaveMode};
+use crate::table::file_format_options::{
+    IntoWriterPropertiesFactoryRef, WriterPropertiesFactoryRef,
+};
 
 pub mod configs;
 pub(crate) mod execution;
@@ -150,7 +153,7 @@ pub struct WriteBuilder {
     /// how to handle cast failures, either return NULL (safe=true) or return ERR (safe=false)
     safe_cast: bool,
     /// Parquet writer properties
-    writer_properties: Option<WriterProperties>,
+    writer_properties_factory: Option<WriterPropertiesFactoryRef>,
     /// Additional information to add to the commit
     commit_properties: CommitProperties,
     /// Name of the table, only used when table doesn't exist yet
@@ -189,6 +192,10 @@ impl super::Operation for WriteBuilder {
 impl WriteBuilder {
     /// Create a new [`WriteBuilder`]
     pub fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
+        let ffo = snapshot
+            .as_ref()
+            .and_then(|s| s.load_config().file_format_options.clone());
+        let writer_properties_factory = ffo.map(|ffo| ffo.writer_properties_factory());
         Self {
             snapshot,
             log_store,
@@ -202,7 +209,7 @@ impl WriteBuilder {
             write_batch_size: None,
             safe_cast: false,
             schema_mode: None,
-            writer_properties: None,
+            writer_properties_factory,
             commit_properties: CommitProperties::default(),
             name: None,
             description: None,
@@ -296,7 +303,8 @@ impl WriteBuilder {
 
     /// Specify the writer properties to use when writing a parquet file
     pub fn with_writer_properties(mut self, writer_properties: WriterProperties) -> Self {
-        self.writer_properties = Some(writer_properties);
+        let writer_properties_factory = writer_properties.into_factory_ref();
+        self.writer_properties_factory = Some(writer_properties_factory);
         self
     }
 
@@ -424,6 +432,8 @@ impl WriteBuilder {
                     #[cfg(feature = "nanosecond-timestamps")]
                     PROTOCOL.check_can_write_timestamp_nanos(snapshot, &schema)?;
                     PROTOCOL.check_can_write_variant(snapshot, &schema)?;
+                    #[cfg(feature = "float16")]
+                    PROTOCOL.check_can_write_float16(snapshot, &schema)?;
                 }
                 match self.mode {
                     SaveMode::ErrorIfExists => {
@@ -509,7 +519,7 @@ impl std::future::IntoFuture for WriteBuilder {
                     predicate: this.predicate,
                     target_file_size: this.target_file_size,
                     write_batch_size: this.write_batch_size,
-                    writer_properties: this.writer_properties.clone(),
+                    writer_properties_factory: this.writer_properties_factory.clone(),
                     configuration: &this.configuration,
                 })?;
 
@@ -549,7 +559,7 @@ impl std::future::IntoFuture for WriteBuilder {
                     partition_columns,
                     target_file_size,
                     write_batch_size,
-                    writer_properties,
+                    writer_properties_factory,
                     writer_stats_config,
                 } = exec_options;
                 let predicate_sql = exact_validation.as_ref().map(fmt_expr_to_sql).transpose()?;
@@ -566,7 +576,7 @@ impl std::future::IntoFuture for WriteBuilder {
                     this.log_store.object_store(Some(operation_id)).clone(),
                     target_file_size,
                     write_batch_size,
-                    writer_properties,
+                    writer_properties_factory,
                     writer_stats_config,
                     exact_validation,
                     contains_cdc,
@@ -662,6 +672,8 @@ mod tests {
     use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::schema::MetadataValue;
     use futures::TryStreamExt;
+    #[cfg(feature = "float16")]
+    use half::f16;
     use itertools::Itertools;
     use serde_json::{Value, json};
 
@@ -3723,33 +3735,49 @@ mod tests {
     #[cfg(not(feature = "nanosecond-timestamps"))]
     #[tokio::test]
     async fn test_write_timestamp_ns_normalizes_to_us() {
-        test_write_timestamp_ns_maybe_normalization(TimeUnit::Microsecond).await;
+        test_write_timestamp_ns_maybe_normalization(TimeUnit::Microsecond, Some("UTC".into()))
+            .await;
+    }
+
+    #[cfg(not(feature = "nanosecond-timestamps"))]
+    #[tokio::test]
+    async fn test_write_timestamp_ns_ntz_normalizes_to_us() {
+        test_write_timestamp_ns_maybe_normalization(TimeUnit::Microsecond, None).await;
     }
 
     #[cfg(feature = "nanosecond-timestamps")]
     #[tokio::test]
     async fn test_write_timestamp_ns_stays_ns() {
-        test_write_timestamp_ns_maybe_normalization(TimeUnit::Nanosecond).await;
+        test_write_timestamp_ns_maybe_normalization(TimeUnit::Nanosecond, Some("UTC".into())).await;
     }
 
-    async fn test_write_timestamp_ns_maybe_normalization(unit: TimeUnit) {
+    #[cfg(feature = "nanosecond-timestamps")]
+    #[tokio::test]
+    async fn test_write_timestamp_ns_ntz_stays_ns() {
+        test_write_timestamp_ns_maybe_normalization(TimeUnit::Nanosecond, None).await;
+    }
+
+    async fn test_write_timestamp_ns_maybe_normalization(unit: TimeUnit, tz: Option<Arc<str>>) {
         use arrow_array::TimestampNanosecondArray;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new(
                 "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()),
                 true,
             ),
         ]));
         let nanos = 1_760_961_600_123_456_789_i64;
+
+        let ts_array = TimestampNanosecondArray::from(vec![nanos]);
+        let ts_array = match tz.as_ref() {
+            Some(tz) => ts_array.with_timezone(tz.clone()),
+            None => ts_array,
+        };
         let batch = RecordBatch::try_new(
             schema,
-            vec![
-                Arc::new(Int32Array::from(vec![1])),
-                Arc::new(TimestampNanosecondArray::from(vec![nanos]).with_timezone("UTC")),
-            ],
+            vec![Arc::new(Int32Array::from(vec![1])), Arc::new(ts_array)],
         )
         .unwrap();
 
@@ -3764,7 +3792,114 @@ mod tests {
         let result_field = schema.field_with_name("ts").unwrap();
         assert_eq!(
             result_field.data_type(),
-            &DataType::Timestamp(unit, Some("UTC".into())),
+            &DataType::Timestamp(unit, tz.clone()),
+        );
+    }
+
+    #[cfg(feature = "float16")]
+    #[tokio::test]
+    async fn test_write_float16() {
+        use arrow_array::Float16Array;
+        use delta_kernel::table_features::TableFeature;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("x", DataType::Float16, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Float16Array::from(vec![
+                    f16::from_f32(1.0),
+                    f16::from_f32(2.5),
+                    f16::INFINITY,
+                    f16::NAN,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let table = DeltaTable::new_in_memory()
+            .write(vec![batch])
+            .await
+            .unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            protocol
+                .reader_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+
+        let batches = get_data(&table).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        let schema = batches[0].schema();
+        let result_field = schema.field_with_name("x").unwrap();
+        assert_eq!(result_field.data_type(), &DataType::Float16,);
+    }
+
+    #[cfg(feature = "float16")]
+    #[tokio::test]
+    async fn test_write_float16_array() {
+        use arrow::datatypes::Float16Type;
+        use arrow_array::ListArray;
+        use delta_kernel::table_features::TableFeature;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("xs", DataType::new_list(DataType::Float16, true), true),
+        ]));
+
+        let data = vec![
+            Some(vec![
+                Some(f16::from_f32(0.0)),
+                Some(f16::from_f32(2.5)),
+                Some(f16::from_f32(0.25)),
+            ]),
+            None,
+            Some(vec![]),
+            Some(vec![Some(f16::from_f32(0.125))]),
+        ];
+        let list_array = Arc::new(ListArray::from_iter_primitive::<Float16Type, _, _>(data));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])), list_array],
+        )
+        .unwrap();
+
+        let table = DeltaTable::new_in_memory()
+            .write(vec![batch])
+            .await
+            .unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert!(
+            protocol
+                .reader_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+        assert!(
+            protocol
+                .writer_features()
+                .unwrap_or_default()
+                .contains(&TableFeature::Float16)
+        );
+
+        let batches = get_data(&table).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        let schema = batches[0].schema();
+        let result_field = schema.field_with_name("xs").unwrap();
+        assert!(
+            matches!(result_field.data_type(), DataType::List(inner) if inner.data_type() == &DataType::Float16)
         );
     }
 

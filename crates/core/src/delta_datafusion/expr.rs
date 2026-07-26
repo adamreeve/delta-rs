@@ -655,6 +655,8 @@ impl fmt::Display for ScalarValueFormat<'_> {
                 }
             )?,
             ScalarValue::Boolean(e) => format_option!(f, e)?,
+            #[cfg(feature = "float16")]
+            ScalarValue::Float16(e) => format_option!(f, e)?,
             ScalarValue::Float32(e) => format_option!(f, e)?,
             ScalarValue::Float64(e) => format_option!(f, e)?,
             ScalarValue::Int8(e) => format_option!(f, e)?,
@@ -851,6 +853,12 @@ mod test {
             StructField::new(
                 "_timestamp_nanos".to_string(),
                 DataType::Primitive(PrimitiveType::TimestampNanos),
+                true,
+            ),
+            #[cfg(feature = "nanosecond-timestamps")]
+            StructField::new(
+                "_timestamp_nanos_ntz".to_string(),
+                DataType::Primitive(PrimitiveType::TimestampNanosNtz),
                 true,
             ),
             StructField::new(
@@ -1283,6 +1291,25 @@ mod test {
                             args: vec![
                                 lit(ScalarValue::Utf8(Some("2010-01-01T00:00:00.000000123".into()))),
                                 lit(ScalarValue::Utf8(Some("Timestamp(Nanosecond, Some(\"UTC\"))".into())))
+                            ]
+                        }
+                    )
+                )),
+            },
+            #[cfg(feature = "nanosecond-timestamps")]
+            ParseTest {
+                expr: col("_timestamp_nanos_ntz").gt(lit(ScalarValue::TimestampNanosecond(
+                    Some(1262304000000000123),
+                    None
+                ))),
+                expected: "_timestamp_nanos_ntz > arrow_cast('2010-01-01T00:00:00.000000123', 'Timestamp(Nanosecond, None)')".to_string(),
+                override_expected_expr: Some(col("_timestamp_nanos_ntz").gt(
+                    datafusion::logical_expr::Expr::ScalarFunction(
+                        ScalarFunction {
+                            func: arrow_cast(),
+                            args: vec![
+                                lit(ScalarValue::Utf8(Some("2010-01-01T00:00:00.000000123".into()))),
+                                lit(ScalarValue::Utf8(Some("Timestamp(Nanosecond, None)".into())))
                             ]
                         }
                     )

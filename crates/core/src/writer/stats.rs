@@ -8,6 +8,8 @@ use std::{
 
 use delta_kernel::expressions::Scalar;
 use delta_kernel::table_properties::DataSkippingNumIndexedCols;
+#[cfg(feature = "float16")]
+use half::f16;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use parquet::basic::LogicalType;
@@ -25,7 +27,7 @@ use crate::kernel::{Add, scalars::ScalarExt};
 use crate::protocol::{ColumnValueStat, Stats};
 
 /// Creates an [`Add`] log action struct.
-pub(crate) fn create_add(
+pub fn create_add(
     partition_values: &IndexMap<String, Scalar>,
     path: String,
     size: i64,
@@ -262,10 +264,13 @@ enum StatsScalar {
     Boolean(bool),
     Int32(i32),
     Int64(i64),
+    #[cfg(feature = "float16")]
+    Float16(f16),
     Float32(f32),
     Float64(f64),
     Date(chrono::NaiveDate),
     Timestamp(chrono::NaiveDateTime),
+    TimestampNtz(chrono::NaiveDateTime),
     // We are serializing to f64 later and the ordering should be the same
     // Scale is stored to handle scale=0 serialization correctly
     Decimal { value: f64, scale: i32 },
@@ -308,10 +313,13 @@ impl StatsScalar {
             }
             (Statistics::Int32(v), _) => Ok(Self::Int32(get_stat!(v))),
             // Int64 can be timestamp, decimal, or integer
-            (Statistics::Int64(v), Some(LogicalType::Timestamp { unit, .. })) => {
-                // For now, we assume timestamps are adjusted to UTC. Non-UTC timestamps
-                // are behind a feature gate in Delta:
-                // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#timestamp-without-timezone-timestampntz
+            (
+                Statistics::Int64(v),
+                Some(LogicalType::Timestamp {
+                    is_adjusted_to_u_t_c,
+                    unit,
+                }),
+            ) => {
                 let v = get_stat!(v);
                 let timestamp = match unit {
                     TimeUnit::MILLIS => chrono::DateTime::from_timestamp_millis(v),
@@ -326,7 +334,11 @@ impl StatsScalar {
                     debug_value: v.to_string(),
                     logical_type: logical_type.cloned(),
                 })?;
-                Ok(Self::Timestamp(timestamp.naive_utc()))
+                if *is_adjusted_to_u_t_c {
+                    Ok(Self::Timestamp(timestamp.naive_utc()))
+                } else {
+                    Ok(Self::TimestampNtz(timestamp.naive_utc()))
+                }
             }
             (Statistics::Int64(v), Some(LogicalType::Decimal { scale, .. })) => {
                 let val = get_stat!(v) as f64 / 10.0_f64.powi(*scale);
@@ -360,6 +372,25 @@ impl StatsScalar {
                         debug_value: format!("{bytes:?}"),
                         logical_type: logical_type.cloned(),
                     }),
+                }
+            }
+            #[cfg(feature = "float16")]
+            (Statistics::FixedLenByteArray(v), Some(LogicalType::Float16)) => {
+                let bytes = if use_min {
+                    v.min_bytes_opt()
+                } else {
+                    v.max_bytes_opt()
+                }
+                .unwrap_or_default();
+
+                let bytes: Result<[u8; 2], _> = bytes.try_into();
+                if let Ok(bytes) = bytes {
+                    Ok(Self::Float16(f16::from_le_bytes(bytes)))
+                } else {
+                    Err(DeltaWriterError::StatsParsingFailed {
+                        debug_value: format!("{bytes:?}"),
+                        logical_type: Some(LogicalType::Float16),
+                    })
                 }
             }
             (Statistics::FixedLenByteArray(v), Some(LogicalType::Decimal { scale, precision })) => {
@@ -445,11 +476,16 @@ impl From<StatsScalar> for serde_json::Value {
             StatsScalar::Boolean(v) => serde_json::Value::Bool(v),
             StatsScalar::Int32(v) => serde_json::Value::from(v),
             StatsScalar::Int64(v) => serde_json::Value::from(v),
+            #[cfg(feature = "float16")]
+            StatsScalar::Float16(v) => serde_json::Value::from(v.to_f32()),
             StatsScalar::Float32(v) => serde_json::Value::from(v),
             StatsScalar::Float64(v) => serde_json::Value::from(v),
             StatsScalar::Date(v) => serde_json::Value::from(v.format("%Y-%m-%d").to_string()),
             StatsScalar::Timestamp(v) => {
                 serde_json::Value::from(v.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string())
+            }
+            StatsScalar::TimestampNtz(v) => {
+                serde_json::Value::from(v.format("%Y-%m-%d %H:%M:%S%.f").to_string())
             }
             StatsScalar::Decimal { value, scale } => {
                 // For scale=0, serialize as integer since serde_json would otherwise

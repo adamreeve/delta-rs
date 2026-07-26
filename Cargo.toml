@@ -18,7 +18,8 @@ repository = "https://github.com/delta-io/delta.rs"
 [workspace.dependencies]
 #delta_kernel = { package = "buoyant_kernel", path = "../delta-kernel-rs/kernel", features = [
 #delta_kernel = { package = "buoyant_kernel", git = "https://github.com/buoyant-data/delta-kernel-rs", branch = "buoyant/main", features = [
-delta_kernel = { package = "buoyant_kernel", version = "0.22.0, <0.22.100", features = [
+#delta_kernel = { package = "buoyant_kernel", version = "0.22.0, <0.22.100", features = [
+delta_kernel = { package = "buoyant_kernel", git = "https://github.com/G-Research-Forks/delta-kernel-rs", tag = "0.22.0-gr.2", features = [
     "arrow-58",
     "internal-api",
 ] }
@@ -40,7 +41,7 @@ object_store = { version = "0.13.2" }
 parquet = { version = "58" }
 
 # datafusion 53
-datafusion = { version = "53.1.0" }
+datafusion = { version = "53.1.0", features = ["default", "parquet_encryption"] }
 datafusion-datasource = { version = "53.1.0" }
 datafusion-physical-expr-adapter = { version = "53.1.0" }
 datafusion-ffi = { version = "53.1.0" }
@@ -63,7 +64,7 @@ tempfile = { version = "3" }
 uuid = { version = "1" }
 
 # runtime / async
-async-trait = { version = "0.1" }
+async-trait = { version = "0.1.89" }
 futures = { version = "0.3" }
 tokio = { version = "1" }
 typed-builder = { version = "0.23.0" }

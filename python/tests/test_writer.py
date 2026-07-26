@@ -14,6 +14,7 @@ from arro3.core import Schema as ArrowSchema
 
 from deltalake import CommitProperties, DeltaTable, Transaction, write_deltalake
 from deltalake._internal import (
+    _FLOAT16,
     _NANOSECOND_TIMESTAMPS,
     CommitFailedError,
     Field,
@@ -630,7 +631,8 @@ def test_roundtrip_metadata(tmp_path: pathlib.Path, sample_table: Table):
         # "binary",
         "date32",
         "timestamp",
-    ],
+    ]
+    + (["float16"] if _FLOAT16 else []),
 )
 def test_roundtrip_partitioned(
     tmp_path: pathlib.Path, sample_data_pyarrow: "pa.Table", column: str
@@ -1018,6 +1020,7 @@ def test_writer_stats(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table
         "float64": -0.0,
         "bool": False,
         "timestamp": "2022-01-01T00:00:00Z",
+        "timestamp_ntz": "2022-01-01 00:00:00",
         "struct": {
             "x": 0,
             "y": "0",
@@ -1028,6 +1031,10 @@ def test_writer_stats(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table
     expected_mins["date32"] = "2022-01-01"
     if _NANOSECOND_TIMESTAMPS:
         expected_mins["timestamp_ns"] = "1970-01-01T00:00:00Z"
+        expected_mins["timestamp_ns_ntz"] = "1970-01-01 00:00:00"
+
+    if _FLOAT16:
+        expected_mins["float16"] = -0.0
 
     assert stats["minValues"] == expected_mins
 
@@ -1041,6 +1048,7 @@ def test_writer_stats(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table
         "float64": 4.0,
         "bool": True,
         "timestamp": "2022-01-01T04:00:00Z",
+        "timestamp_ntz": "2022-01-01 04:00:00",
         "struct": {"x": 4, "y": "4"},
     }
     # PyArrow added support for decimal and date32 in 8.0.0
@@ -1048,6 +1056,10 @@ def test_writer_stats(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table
     expected_maxs["date32"] = "2022-01-05"
     if _NANOSECOND_TIMESTAMPS:
         expected_maxs["timestamp_ns"] = "1970-01-01T00:00:00.000000004Z"
+        expected_maxs["timestamp_ns_ntz"] = "1970-01-01 00:00:00.000000004"
+
+    if _FLOAT16:
+        expected_maxs["float16"] = 4.0
 
     assert stats["maxValues"] == expected_maxs
 
@@ -2209,7 +2221,11 @@ def test_write_timestamp_nanos_nested(tmp_path: pathlib.Path, array):
             "x": array(
                 pa,
                 pa.scalar(datetime(2010, 1, 1), type=pa.timestamp("ns", "UTC")),
-            )
+            ),
+            "x_ntz": array(
+                pa,
+                pa.scalar(datetime(2010, 1, 1), type=pa.timestamp("ns", None)),
+            ),
         }
     )
     write_deltalake(
@@ -3067,7 +3083,7 @@ def test_write_date64_normalizes_to_date32(tmp_path: pathlib.Path):
 
 
 @pytest.mark.pyarrow
-def test_write_timestamp_ns_normalizes_to_us(tmp_path: pathlib.Path):
+def test_write_timestamp_ns_normalize(tmp_path: pathlib.Path):
     import pyarrow as pa
 
     ts1 = datetime(2025, 10, 20, 12, 0, 0, 123456, tzinfo=timezone.utc)
@@ -3110,7 +3126,7 @@ def test_write_timestamp_ns_normalizes_to_us(tmp_path: pathlib.Path):
 
 
 @pytest.mark.pyarrow
-def test_write_timestamp_ntz_ns_normalizes_to_us(tmp_path: pathlib.Path):
+def test_write_timestamp_ntz_ns_normalize(tmp_path: pathlib.Path):
     import pyarrow as pa
 
     ts1 = datetime(2025, 10, 20, 12, 0, 0, 123456)
@@ -3134,7 +3150,8 @@ def test_write_timestamp_ntz_ns_normalizes_to_us(tmp_path: pathlib.Path):
     dt = DeltaTable(tmp_path)
     result = dt.to_pyarrow_table()
     assert result.num_rows == 1
-    assert result.schema.field("ts_ntz").type == pa.timestamp("us")
+    expected_resolution = "ns" if _NANOSECOND_TIMESTAMPS else "us"
+    assert result.schema.field("ts_ntz").type == pa.timestamp(expected_resolution)
 
 
 def test_writing_with_generator(tmp_path):

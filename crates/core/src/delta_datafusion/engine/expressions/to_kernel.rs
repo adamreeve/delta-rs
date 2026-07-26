@@ -237,6 +237,11 @@ pub(crate) fn datafusion_scalar_to_scalar(scalar: &ScalarValue) -> Result<Scalar
             Some(value) => Ok(Scalar::Long(*value)),
             None => Ok(Scalar::Null(DataType::LONG)),
         },
+        #[cfg(feature = "float16")]
+        ScalarValue::Float16(maybe_value) => match maybe_value {
+            Some(value) => Ok(Scalar::Float16(*value)),
+            None => Ok(Scalar::Null(DataType::FLOAT16)),
+        },
         ScalarValue::Float32(maybe_value) => match maybe_value {
             Some(value) => Ok(Scalar::Float(*value)),
             None => Ok(Scalar::Null(DataType::FLOAT)),
@@ -253,6 +258,11 @@ pub(crate) fn datafusion_scalar_to_scalar(scalar: &ScalarValue) -> Result<Scalar
         ScalarValue::TimestampNanosecond(maybe_value, Some(_)) => match maybe_value {
             Some(value) => Ok(Scalar::TimestampNanos(*value)),
             None => Ok(Scalar::Null(DataType::TIMESTAMP_NANOS)),
+        },
+        #[cfg(feature = "nanosecond-timestamps")]
+        ScalarValue::TimestampNanosecond(maybe_value, None) => match maybe_value {
+            Some(value) => Ok(Scalar::TimestampNanosNtz(*value)),
+            None => Ok(Scalar::Null(DataType::TIMESTAMP_NANOS_NTZ)),
         },
         ScalarValue::TimestampMicrosecond(maybe_value, None) => match maybe_value {
             Some(value) => Ok(Scalar::TimestampNtz(*value)),
