@@ -331,3 +331,300 @@ async fn delta_table_multi_column_sort_order_avoids_sort() -> TestResult<()> {
     );
     Ok(())
 }
+
+// --- Descending sort order ---
+
+fn desc_write_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new("value", DataType::Int64, false),
+    ]))
+}
+
+/// Batch covering `[start, start + len)` seconds with rows in *descending*
+/// timestamp order.
+fn desc_write_batch(start: i64, len: i64) -> TestResult<RecordBatch> {
+    let timestamps: Vec<i64> = (start..start + len).rev().map(|s| s * 1_000_000).collect();
+    let values: Vec<i64> = (start..start + len).rev().collect();
+    Ok(RecordBatch::try_new(
+        desc_write_schema(),
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(timestamps)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )?)
+}
+
+/// Create a Delta table whose files are all sorted by timestamp *descending*,
+/// with non-overlapping timestamp ranges across files.
+async fn desc_sorted_delta_table() -> TestResult<DeltaTable> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "timestamp".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
+                false,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+
+    for start in [300, 200, 100, 0] {
+        table = table
+            .write(vec![desc_write_batch(start, 100)?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 4);
+    Ok(table)
+}
+
+fn collect_timestamps(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_primitive::<TimestampMicrosecondType>()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect()
+}
+
+/// A descending sort order declared on the provider satisfies a matching
+/// `ORDER BY ... DESC` without a `SortExec`.
+#[tokio::test]
+async fn delta_table_descending_sort_order_avoids_sort() -> TestResult<()> {
+    let table = desc_sorted_delta_table().await?;
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::desc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" DESC")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    let timestamps = collect_timestamps(&batches);
+    assert_eq!(timestamps.len(), 400);
+    assert!(
+        timestamps.windows(2).all(|pair| pair[0] >= pair[1]),
+        "results are not sorted by timestamp descending"
+    );
+    Ok(())
+}
+
+/// An ascending query over a table declared as descending cannot use the
+/// declared order (files cannot be read backwards) and falls back to a full
+/// sort with correct results.
+#[tokio::test]
+async fn delta_table_descending_sort_order_degrades_for_ascending_query() -> TestResult<()> {
+    let table = desc_sorted_delta_table().await?;
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::desc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+    let timestamps = collect_timestamps(&batches);
+    assert_eq!(timestamps.len(), 400);
+    assert!(
+        timestamps.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by timestamp ascending"
+    );
+    Ok(())
+}
+
+// --- Column-mapped table ---
+
+/// Physical parquet column names for the hand-written column-mapped table.
+const CM_TS_PHYSICAL: &str = "col-4b74c04d-ts";
+const CM_VALUE_PHYSICAL: &str = "col-8aa03c9e-value";
+
+/// Write one data file of the column-mapped table, covering timestamps
+/// `[start, start + len)`, sorted ascending. Returns the file size in bytes.
+fn write_column_mapped_file(path: &std::path::Path, start: i64, len: i64) -> TestResult<u64> {
+    use deltalake_core::parquet::arrow::ArrowWriter;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(CM_TS_PHYSICAL, DataType::Int64, true),
+        Field::new(CM_VALUE_PHYSICAL, DataType::Int64, true),
+    ]));
+    let timestamps: Vec<i64> = (start..start + len).collect();
+    let values: Vec<i64> = timestamps.iter().map(|ts| ts * 10).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(timestamps)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )?;
+    let mut writer = ArrowWriter::try_new(std::fs::File::create(path)?, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(std::fs::metadata(path)?.len())
+}
+
+/// Build a Delta table with `delta.columnMapping.mode = name` whose files are
+/// sorted by the logical `ts` column with non-overlapping ranges.
+///
+/// delta-rs does not support writing to column-mapped tables, so the parquet
+/// files (using physical column names) and the delta log are written by hand,
+/// mirroring the layout of the `table_with_column_mapping` fixture. File
+/// statistics are keyed by physical column names, as Delta requires.
+fn create_column_mapped_table(root: &std::path::Path) -> TestResult<()> {
+    let schema_string = serde_json::json!({
+        "type": "struct",
+        "fields": [
+            {
+                "name": "ts",
+                "type": "long",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 1,
+                    "delta.columnMapping.physicalName": CM_TS_PHYSICAL,
+                },
+            },
+            {
+                "name": "value",
+                "type": "long",
+                "nullable": true,
+                "metadata": {
+                    "delta.columnMapping.id": 2,
+                    "delta.columnMapping.physicalName": CM_VALUE_PHYSICAL,
+                },
+            },
+        ],
+    })
+    .to_string();
+
+    let mut actions = vec![
+        serde_json::json!({"protocol": {"minReaderVersion": 2, "minWriterVersion": 5}}),
+        serde_json::json!({"metaData": {
+            "id": "11111111-2222-3333-4444-555555555555",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema_string,
+            "partitionColumns": [],
+            "configuration": {
+                "delta.columnMapping.mode": "name",
+                "delta.columnMapping.maxColumnId": "2",
+            },
+            "createdTime": 1700000000000i64,
+        }}),
+    ];
+
+    for (index, start) in [0i64, 100, 200].into_iter().enumerate() {
+        let len = 100i64;
+        let name = format!("part-{index:05}.parquet");
+        let size = write_column_mapped_file(&root.join(&name), start, len)?;
+        let stats = format!(
+            r#"{{"numRecords":{len},"minValues":{{"{CM_TS_PHYSICAL}":{min}}},"maxValues":{{"{CM_TS_PHYSICAL}":{max}}},"nullCount":{{"{CM_TS_PHYSICAL}":0}}}}"#,
+            min = start,
+            max = start + len - 1,
+        );
+        actions.push(serde_json::json!({"add": {
+            "path": name,
+            "partitionValues": {},
+            "size": size,
+            "modificationTime": 1700000000000i64,
+            "dataChange": true,
+            "stats": stats,
+        }}));
+    }
+
+    let log_dir = root.join("_delta_log");
+    std::fs::create_dir_all(&log_dir)?;
+    let commit: String = actions
+        .iter()
+        .map(|action| format!("{action}\n"))
+        .collect();
+    std::fs::write(log_dir.join("00000000000000000000.json"), commit)?;
+    Ok(())
+}
+
+/// A sort order declared with logical column names works on a column-mapped
+/// table: the ordering is translated to physical parquet column names for the
+/// scan, and back to logical names on the scan output.
+#[tokio::test]
+async fn delta_table_column_mapped_sort_order_avoids_sort() -> TestResult<()> {
+    let temp_dir = tempfile::tempdir()?;
+    create_column_mapped_table(temp_dir.path())?;
+    let table_url = url::Url::from_directory_path(temp_dir.path().canonicalize()?).unwrap();
+    let table = deltalake_core::open_table(table_url).await?;
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("ts")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT ts, value FROM test_table ORDER BY ts")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+
+    let mut rows: Vec<(i64, i64)> = Vec::new();
+    for batch in &batches {
+        let timestamps = batch.column(0).as_primitive::<Int64Type>().values();
+        let values = batch.column(1).as_primitive::<Int64Type>().values();
+        rows.extend(timestamps.iter().copied().zip(values.iter().copied()));
+    }
+    assert_eq!(rows.len(), 300);
+    assert!(
+        rows.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+        "results are not sorted by ts"
+    );
+    // Both columns must have been mapped correctly from physical names.
+    assert!(rows.iter().all(|(ts, value)| *value == ts * 10));
+    Ok(())
+}
