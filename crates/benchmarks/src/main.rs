@@ -114,8 +114,9 @@ enum Command {
         iterations: usize,
 
         /// Memory budget in GB; installs a spill pool so full sorts spill to
-        /// disk instead of exhausting memory. 0 disables the limit.
-        #[arg(long, default_value_t = 8)]
+        /// disk instead of exhausting memory. 0 (the default) disables the
+        /// limit.
+        #[arg(long, default_value_t = 0)]
         memory_limit_gb: usize,
 
         /// Override datafusion.execution.target_partitions (default: number

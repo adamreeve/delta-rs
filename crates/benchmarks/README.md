@@ -136,7 +136,7 @@ batch, total time, and whether the streamed rows were actually in order
 - `--limit <n>`: add a LIMIT to exercise TopK / early termination
 - `--iterations <n>`: runs per mode (default 3)
 - `--memory-limit-gb <n>`: memory budget backed by a spill pool, so the
-  baseline full sort spills instead of exhausting memory (default 8; 0
-  disables the limit)
+  baseline full sort spills instead of exhausting memory (default 0 = no
+  limit)
 - `--target-partitions <n>`: override `datafusion.execution.target_partitions`
 - `--show-plan`: print the physical plan for the first iteration of each mode
