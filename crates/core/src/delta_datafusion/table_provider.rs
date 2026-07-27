@@ -164,7 +164,6 @@ impl DeltaScanConfigBuilder {
             table_parquet_options,
             schema_force_view_types: true,
             file_sort_order: Vec::new(),
-            file_sort_order_grouping: true,
         })
     }
 }
@@ -231,18 +230,6 @@ pub struct DeltaScanConfig {
     /// adheres to, if any. Empty means no ordering is declared.
     #[serde(default)]
     pub file_sort_order: Vec<FileSortColumn>,
-    /// Whether to arrange scan file groups by file statistics so the declared
-    /// `file_sort_order` is validated at planning time (default true). When
-    /// false, files keep the default grouping and satisfying an `ORDER BY` is
-    /// left to DataFusion's sort-pushdown optimizer rule, which reorders files
-    /// by statistics during physical optimization. Has no effect when
-    /// `file_sort_order` is empty.
-    #[serde(default = "default_file_sort_order_grouping")]
-    pub file_sort_order_grouping: bool,
-}
-
-fn default_file_sort_order_grouping() -> bool {
-    true
 }
 
 impl Default for DeltaScanConfig {
@@ -262,7 +249,6 @@ impl DeltaScanConfig {
             schema: None,
             table_parquet_options: None,
             file_sort_order: Vec::new(),
-            file_sort_order_grouping: true,
         }
     }
 
@@ -276,7 +262,6 @@ impl DeltaScanConfig {
             schema: None,
             table_parquet_options: None,
             file_sort_order: Vec::new(),
-            file_sort_order_grouping: true,
         }
     }
 
@@ -317,14 +302,6 @@ impl DeltaScanConfig {
         self.file_sort_order = columns.into_iter().collect();
         self
     }
-
-    /// Whether to arrange scan file groups by statistics for the declared file sort order.
-    ///
-    /// See [`TableProviderBuilder::with_file_sort_order_grouping`].
-    pub fn with_file_sort_order_grouping(mut self, enabled: bool) -> Self {
-        self.file_sort_order_grouping = enabled;
-        self
-    }
 }
 
 /// Builder for a datafusion [TableProvider] for a Delta table
@@ -342,7 +319,6 @@ pub struct TableProviderBuilder {
     /// Predicates used only for file skipping in kernel log replay
     file_skipping_predicates: Option<Vec<Expr>>,
     file_sort_order: Option<Vec<FileSortColumn>>,
-    file_sort_order_grouping: bool,
 }
 
 impl fmt::Debug for TableProviderBuilder {
@@ -356,7 +332,6 @@ impl fmt::Debug for TableProviderBuilder {
             .field("table_version", &self.table_version)
             .field("file_skipping_predicates", &self.file_skipping_predicates)
             .field("file_sort_order", &self.file_sort_order)
-            .field("file_sort_order_grouping", &self.file_sort_order_grouping)
             .finish()
     }
 }
@@ -378,7 +353,6 @@ impl TableProviderBuilder {
             table_version: None,
             file_skipping_predicates: None,
             file_sort_order: None,
-            file_sort_order_grouping: true,
         }
     }
 
@@ -466,28 +440,6 @@ impl TableProviderBuilder {
         self
     }
 
-    /// Whether to arrange scan file groups by statistics for the declared file sort order.
-    ///
-    /// Enabled by default: file groups are formed so that files within a group
-    /// are non-overlapping and ordered on the declared sort order, letting
-    /// DataFusion satisfy a matching `ORDER BY` at planning time with a
-    /// `SortPreservingMergeExec` over parallel ordered partitions.
-    ///
-    /// When disabled, files keep the default grouping and the declared
-    /// ordering does not validate at planning time; satisfying an `ORDER BY`
-    /// is instead left to DataFusion's sort-pushdown optimizer rule, which
-    /// reorders files by statistics during physical optimization and, when the
-    /// reordered files do not overlap, eliminates the sort. This typically
-    /// yields fewer parallel scan partitions and exists mainly to compare the
-    /// two strategies.
-    ///
-    /// Has no effect unless a sort order is declared via
-    /// [`Self::with_file_sort_order`].
-    pub fn with_file_sort_order_grouping(mut self, enabled: bool) -> Self {
-        self.file_sort_order_grouping = enabled;
-        self
-    }
-
     pub async fn build(self) -> Result<next::DeltaScan> {
         let TableProviderBuilder {
             log_store,
@@ -498,7 +450,6 @@ impl TableProviderBuilder {
             table_version,
             file_skipping_predicates,
             file_sort_order,
-            file_sort_order_grouping,
         } = self;
 
         let mut config = session
@@ -512,7 +463,6 @@ impl TableProviderBuilder {
         if let Some(file_sort_order) = file_sort_order {
             config = config.with_file_sort_order(file_sort_order);
         }
-        config = config.with_file_sort_order_grouping(file_sort_order_grouping);
 
         let snapshot = match snapshot {
             Some(wrapper) => wrapper,

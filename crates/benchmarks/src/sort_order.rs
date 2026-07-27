@@ -237,10 +237,6 @@ pub enum SortBenchMode {
     Baseline,
     /// Sort order declared up front via `with_file_sort_order`.
     Declared,
-    /// Sort order declared but statistics-based file grouping disabled, so the
-    /// ORDER BY is satisfied by DataFusion's sort-pushdown optimizer rule
-    /// (file reorder at optimization time plus a BufferExec under the merge).
-    Pushdown,
     /// No ORDER BY on the query at all: data is read in arbitrary order with
     /// no sorting needed. Lower bound for the cost of producing sorted output.
     Unordered,
@@ -263,7 +259,6 @@ impl SortBenchMode {
         match self {
             SortBenchMode::Baseline => "baseline",
             SortBenchMode::Declared => "declared",
-            SortBenchMode::Pushdown => "pushdown",
             SortBenchMode::Unordered => "unordered",
             SortBenchMode::SequentialRead => "sequential_read",
             SortBenchMode::SequentialReadAsync => "sequential_read_async",
@@ -293,9 +288,6 @@ pub struct SortBenchReport {
     pub plan: String,
     pub has_sort_exec: bool,
     pub has_sort_preserving_merge: bool,
-    /// Whether the plan contains a `BufferExec` (inserted by the sort-pushdown
-    /// optimizer rule when it eliminates a `SortExec`).
-    pub has_buffer_exec: bool,
     /// Time to build the table provider.
     pub provider: Duration,
     /// Time to plan the query.
@@ -523,7 +515,6 @@ async fn run_sequential_read(
         ),
         has_sort_exec: false,
         has_sort_preserving_merge: false,
-        has_buffer_exec: false,
         provider: provider_elapsed,
         planning: Duration::ZERO,
         first_batch: state.first_batch,
@@ -544,9 +535,11 @@ pub async fn run_sort_bench_once(
     params: &SortBenchParams,
 ) -> DeltaResult<SortBenchReport> {
     match params.mode {
-        SortBenchMode::SequentialRead => return run_sequential_read(table_url, params, false).await,
+        SortBenchMode::SequentialRead => {
+            return run_sequential_read(table_url, params, false).await;
+        }
         SortBenchMode::SequentialReadAsync => {
-            return run_sequential_read(table_url, params, true).await
+            return run_sequential_read(table_url, params, true).await;
         }
         _ => {}
     }
@@ -579,9 +572,6 @@ pub async fn run_sort_bench_once(
         SortBenchMode::Declared => {
             builder.with_file_sort_order([FileSortColumn::asc(TIMESTAMP_COLUMN)])
         }
-        SortBenchMode::Pushdown => builder
-            .with_file_sort_order([FileSortColumn::asc(TIMESTAMP_COLUMN)])
-            .with_file_sort_order_grouping(false),
         SortBenchMode::SequentialRead | SortBenchMode::SequentialReadAsync => {
             unreachable!("sequential read modes are handled by run_sequential_read")
         }
@@ -640,7 +630,6 @@ pub async fn run_sort_bench_once(
     Ok(SortBenchReport {
         has_sort_exec: rendered.contains("SortExec"),
         has_sort_preserving_merge: rendered.contains("SortPreservingMergeExec"),
-        has_buffer_exec: rendered.contains("BufferExec"),
         plan: rendered,
         provider: provider_elapsed,
         planning: planning_elapsed,

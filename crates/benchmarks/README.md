@@ -111,30 +111,25 @@ cargo run --release -p delta-benchmarks -- sort-bench --table-path ./data/sorted
 
 For each mode the query `SELECT ... FROM t ORDER BY timestamp` is planned and
 streamed to completion, reporting plan shape (`sort_exec`, `spm` =
-SortPreservingMergeExec, `buffer` = BufferExec), planning time, time to first
-batch, total time, and whether the streamed rows were actually in order
-(`sorted`).
+SortPreservingMergeExec), planning time, time to first batch, total time, and
+whether the streamed rows were actually in order (`sorted`).
 
-- `--modes <baseline,declared,pushdown,unordered,sequential-read,sequential-read-async>`:
+- `--modes <baseline,declared,unordered,sequential-read,sequential-read-async>`:
   configurations to compare (default all). `baseline` declares no ordering and
   needs a full `SortExec`; `declared` uses `with_file_sort_order`, satisfying
   the ORDER BY at planning time with a merge over parallel pre-grouped ordered
-  partitions; `pushdown` also declares the sort order but disables
-  statistics-based file grouping, leaving the ORDER BY to DataFusion's
-  sort-pushdown optimizer rule (file reorder at optimization time plus a
-  `BufferExec` under the merge); `unordered` drops the ORDER BY entirely,
-  reading in arbitrary order with no sorting needed, as a lower bound for
-  comparison; `sequential-read` bypasses the delta-rs scan and DataFusion
-  entirely and reads the parquet files directly with the parquet crate,
-  single-threaded and one file at a time in ascending timestamp order
-  (representing production workloads that read parquet files in a known
-  order — the output is still globally sorted because the files are sorted
-  and non-overlapping); `sequential-read-async` is the same read through the
-  parquet crate's async reader over tokio files — the IO pattern used by
-  object-storage readers and DataFusion's parquet source — isolating the cost
-  of the async read path from the rest of the stack. The sequential read
-  modes honor `--select-columns` and `--limit` but ignore `--memory-limit-gb`
-  and `--target-partitions`.
+  partitions; `unordered` drops the ORDER BY entirely, reading in arbitrary
+  order with no sorting needed, as a lower bound for comparison;
+  `sequential-read` bypasses the delta-rs scan and DataFusion entirely and
+  reads the parquet files directly with the parquet crate, single-threaded and
+  one file at a time in ascending timestamp order (representing production
+  workloads that read parquet files in a known order — the output is still
+  globally sorted because the files are sorted and non-overlapping);
+  `sequential-read-async` is the same read through the parquet crate's async
+  reader over tokio files — the IO pattern used by object-storage readers and
+  DataFusion's parquet source — isolating the cost of the async read path from
+  the rest of the stack. The sequential read modes honor `--select-columns`
+  and `--limit` but ignore `--memory-limit-gb` and `--target-partitions`.
 - `--select-columns <n>`: number of extra float32 columns in the SELECT
   (default: all)
 - `--limit <n>`: add a LIMIT to exercise TopK / early termination

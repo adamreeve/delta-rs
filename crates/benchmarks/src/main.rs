@@ -96,7 +96,7 @@ enum Command {
         table_path: PathBuf,
 
         /// Configurations to benchmark (comma separated); defaults to all of
-        /// baseline, declared, pushdown, unordered, sequential-read,
+        /// baseline, declared, unordered, sequential-read,
         /// sequential-read-async
         #[arg(long, value_enum, value_delimiter = ',')]
         modes: Option<Vec<SortBenchMode>>,
@@ -242,7 +242,6 @@ async fn main() -> anyhow::Result<()> {
                 vec![
                     SortBenchMode::Baseline,
                     SortBenchMode::Declared,
-                    SortBenchMode::Pushdown,
                     SortBenchMode::Unordered,
                     SortBenchMode::SequentialRead,
                     SortBenchMode::SequentialReadAsync,
@@ -266,11 +265,10 @@ async fn main() -> anyhow::Result<()> {
                         println!("--- {} plan ---\n{}", mode.name(), report.plan.trim_end());
                     }
                     println!(
-                        "mode={} iter={iter} sort_exec={} spm={} buffer={} provider_ms={} plan_ms={} first_batch_ms={} total_ms={} rows={} batches={} sorted={} peak_rss_mb={}",
+                        "mode={} iter={iter} sort_exec={} spm={} provider_ms={} plan_ms={} first_batch_ms={} total_ms={} rows={} batches={} sorted={} peak_rss_mb={}",
                         mode.name(),
                         report.has_sort_exec,
                         report.has_sort_preserving_merge,
-                        report.has_buffer_exec,
                         report.provider.as_millis(),
                         report.planning.as_millis(),
                         report

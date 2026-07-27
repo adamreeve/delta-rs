@@ -455,7 +455,6 @@ async fn get_data_scan_plan(
         predicate,
         config.table_parquet_options.as_ref(),
         file_sort_order,
-        config.file_sort_order_grouping,
     )
     .await?;
 
@@ -573,10 +572,6 @@ async fn get_read_plan(
     table_parquet_options: Option<&TableParquetOptions>,
     // Sort order (over `parquet_read_schema`) that every data file adheres to.
     file_sort_order: Option<LexOrdering>,
-    // Whether to pre-arrange file groups by statistics so `file_sort_order`
-    // validates at planning time. When false the default grouping is kept and
-    // satisfying the ordering is left to DataFusion's sort-pushdown rule.
-    file_sort_order_grouping: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut plans = Vec::new();
 
@@ -659,13 +654,13 @@ async fn get_read_plan(
 
         let files = files.into_iter().map(|file| file.0).collect_vec();
         let file_groups = match &file_sort_order {
-            Some(ordering) if file_sort_order_grouping => split_file_groups_for_ordering(
+            Some(ordering) => split_file_groups_for_ordering(
                 files,
                 ordering,
                 &full_table_schema,
                 state.config().options().execution.target_partitions,
             ),
-            _ => partitioned_files_to_file_groups(files),
+            None => partitioned_files_to_file_groups(files),
         };
         let (file_groups, statistics) =
             compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
@@ -1107,7 +1102,6 @@ mod tests {
             None,
             None,
             None,
-            true,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1133,7 +1127,6 @@ mod tests {
             None,
             None,
             None,
-            true,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1164,7 +1157,6 @@ mod tests {
             None,
             None,
             None,
-            true,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1244,7 +1236,6 @@ mod tests {
             None,
             None,
             None,
-            true,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1285,7 +1276,6 @@ mod tests {
             None,
             None,
             None,
-            true,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1386,7 +1376,6 @@ mod tests {
             None,
             None,
             None,
-            true,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1456,7 +1445,6 @@ mod tests {
             Some(&predicate),
             None,
             None,
-            true,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1525,7 +1513,6 @@ mod tests {
             Some(&predicate),
             None,
             None,
-            true,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1607,7 +1594,6 @@ mod tests {
             Some(&predicate),
             None,
             None,
-            true,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1686,7 +1672,6 @@ mod tests {
             Some(&predicate),
             None,
             None,
-            true,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1766,7 +1751,6 @@ mod tests {
             Some(&predicate),
             None,
             None,
-            true,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1858,7 +1842,6 @@ mod tests {
             Some(&predicate),
             None,
             None,
-            true,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
