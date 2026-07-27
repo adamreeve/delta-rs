@@ -413,10 +413,10 @@ impl DeltaScan {
         self
     }
 
-    /// Validate that a configured file sort order only references top-level
-    /// data columns that exist in the scan schema. Partition columns are
-    /// materialized above the parquet scan, so they cannot participate in a
-    /// file-level sort order, and nested fields are not supported.
+    /// Validate that a configured file sort order only references distinct
+    /// top-level data columns that exist in the scan schema. Partition columns
+    /// are materialized above the parquet scan, so they cannot participate in
+    /// a file-level sort order, and nested fields are not supported.
     fn validate_file_sort_order(
         config: &DeltaScanConfig,
         snapshot: &SnapshotWrapper,
@@ -426,7 +426,14 @@ impl DeltaScan {
             .table_configuration()
             .metadata()
             .partition_columns();
+        let mut seen = std::collections::HashSet::new();
         for sort_column in &config.file_sort_order {
+            if !seen.insert(sort_column.column.as_str()) {
+                return Err(DataFusionError::Plan(format!(
+                    "file sort order column '{}' is declared more than once",
+                    sort_column.column
+                )));
+            }
             if partition_columns.contains(&sort_column.column) {
                 return Err(DataFusionError::Plan(format!(
                     "file sort order column '{}' is a partition column; only data columns can participate in a file sort order",
@@ -441,7 +448,7 @@ impl DeltaScan {
                     )));
                 }
                 return Err(DataFusionError::Plan(format!(
-                    "file sort order column '{}' does not exist in the table schema",
+                    "file sort order column '{}' does not exist in the scan schema",
                     sort_column.column
                 )));
             }
