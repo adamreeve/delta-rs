@@ -191,6 +191,13 @@ async fn delta_table_sort_order_validation() -> TestResult<()> {
         .await
         .expect_err("unknown column sort order should be rejected");
     assert!(err.to_string().contains("does not exist"), "{err}");
+
+    let err = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("nested.field")])
+        .await
+        .expect_err("nested field sort order should be rejected");
+    assert!(err.to_string().contains("top-level"), "{err}");
     Ok(())
 }
 

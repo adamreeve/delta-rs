@@ -413,9 +413,10 @@ impl DeltaScan {
         self
     }
 
-    /// Validate that a configured file sort order only references data columns
-    /// that exist in the scan schema. Partition columns are materialized above
-    /// the parquet scan, so they cannot participate in a file-level sort order.
+    /// Validate that a configured file sort order only references top-level
+    /// data columns that exist in the scan schema. Partition columns are
+    /// materialized above the parquet scan, so they cannot participate in a
+    /// file-level sort order, and nested fields are not supported.
     fn validate_file_sort_order(
         config: &DeltaScanConfig,
         snapshot: &SnapshotWrapper,
@@ -433,6 +434,12 @@ impl DeltaScan {
                 )));
             }
             if scan_schema.field_with_name(&sort_column.column).is_err() {
+                if sort_column.column.contains('.') {
+                    return Err(DataFusionError::Plan(format!(
+                        "file sort order column '{}' looks like a nested field reference; only top-level columns can participate in a file sort order",
+                        sort_column.column
+                    )));
+                }
                 return Err(DataFusionError::Plan(format!(
                     "file sort order column '{}' does not exist in the table schema",
                     sort_column.column

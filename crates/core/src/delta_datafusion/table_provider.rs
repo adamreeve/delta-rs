@@ -175,7 +175,8 @@ impl DeltaScanConfigBuilder {
 /// data. See [`TableProviderBuilder::with_file_sort_order`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSortColumn {
-    /// Logical (table schema) column name.
+    /// Logical (table schema) column name. Must name a top-level column;
+    /// nested fields are not supported.
     pub column: String,
     /// Whether the column is sorted descending rather than ascending.
     pub descending: bool,
@@ -430,8 +431,9 @@ impl TableProviderBuilder {
     /// The declared order is trusted: files whose data is not actually sorted
     /// this way will produce incorrectly ordered query results.
     ///
-    /// Only regular data columns are supported. Partition columns are injected
-    /// above the parquet scan and cannot participate in a file-level sort order.
+    /// Only regular top-level data columns are supported. Partition columns are
+    /// injected above the parquet scan and cannot participate in a file-level
+    /// sort order, and nested fields (e.g. `a.b`) cannot be used as sort columns.
     pub fn with_file_sort_order(
         mut self,
         columns: impl IntoIterator<Item = FileSortColumn>,
