@@ -473,6 +473,170 @@ async fn delta_table_descending_sort_order_degrades_for_ascending_query() -> Tes
     Ok(())
 }
 
+// --- Overlapping file ranges ---
+
+/// Batch with the given timestamps (in seconds, must be sorted ascending) and
+/// matching values, using the unpartitioned two-column schema.
+fn timestamps_batch(seconds: Vec<i64>) -> TestResult<RecordBatch> {
+    let timestamps: Vec<i64> = seconds.iter().map(|s| s * 1_000_000).collect();
+    Ok(RecordBatch::try_new(
+        desc_write_schema(),
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(timestamps)),
+            Arc::new(Int64Array::from(seconds)),
+        ],
+    )?)
+}
+
+/// Create an unpartitioned Delta table with one file per entry of `files`,
+/// each file sorted by timestamp ascending. The timestamp ranges of the files
+/// are free to overlap.
+async fn overlapping_delta_table(files: Vec<Vec<i64>>) -> TestResult<DeltaTable> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "timestamp".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
+                false,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+
+    let expected_files = files.len();
+    for seconds in files {
+        table = table
+            .write(vec![timestamps_batch(seconds)?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), expected_files);
+    Ok(table)
+}
+
+/// Four files where each file's timestamp range overlaps the start of the
+/// next one: [0, 110), [100, 210), [200, 310), [300, 410).
+fn chain_overlapping_files() -> Vec<Vec<i64>> {
+    [0i64, 100, 200, 300]
+        .into_iter()
+        .map(|start| (start..start + 110).collect())
+        .collect()
+}
+
+/// Run `ORDER BY timestamp` with the given target partition count and return
+/// the rendered plan and the collected timestamps.
+async fn query_sorted_with_target_partitions(
+    table: &DeltaTable,
+    target_partitions: usize,
+) -> TestResult<(String, Vec<i64>)> {
+    let ctx = create_session().into_inner();
+    ctx.sql(&format!(
+        "SET datafusion.execution.target_partitions = {target_partitions}"
+    ))
+    .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok((rendered, collect_timestamps(&batches)))
+}
+
+/// With chain-overlapping files and more than one target partition, the
+/// statistics-based grouping interleaves the files into two groups whose
+/// members are non-overlapping, so the declared order is preserved and no
+/// `SortExec` is needed.
+#[tokio::test]
+async fn delta_table_chain_overlapping_files_avoid_sort() -> TestResult<()> {
+    let table = overlapping_delta_table(chain_overlapping_files()).await?;
+    let (rendered, timestamps) = query_sorted_with_target_partitions(&table, 2).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("2 groups"),
+        "expected the files to be split into 2 groups:\n{rendered}"
+    );
+    assert_eq!(timestamps.len(), 440);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
+/// With a single target partition, chain-overlapping files cannot form one
+/// ordered group; the grouping overflows the target and still produces two
+/// non-overlapping groups, so the sort is still avoided.
+#[tokio::test]
+async fn delta_table_chain_overlapping_files_single_target_partition() -> TestResult<()> {
+    let table = overlapping_delta_table(chain_overlapping_files()).await?;
+    let (rendered, timestamps) = query_sorted_with_target_partitions(&table, 1).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("2 groups"),
+        "expected the files to be split into 2 groups:\n{rendered}"
+    );
+    assert_eq!(timestamps.len(), 440);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
+/// When every file overlaps every other file and there are more files than
+/// target partitions, no file can share a group with any other: the grouping
+/// degrades to one group per file. The declared order is still preserved (a
+/// single sorted file per group) so the sort is avoided, at the cost of more
+/// scan partitions than requested.
+#[tokio::test]
+async fn delta_table_fully_overlapping_files_one_group_per_file() -> TestResult<()> {
+    // File i holds timestamps i, i + 4, i + 8, ...: every file spans almost
+    // the entire [0, 400) range, so all files overlap each other.
+    let files: Vec<Vec<i64>> = (0i64..4)
+        .map(|file| (0..100).map(|row| row * 4 + file).collect())
+        .collect();
+    let table = overlapping_delta_table(files).await?;
+    let (rendered, timestamps) = query_sorted_with_target_partitions(&table, 2).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("4 groups"),
+        "expected one group per file:\n{rendered}"
+    );
+    assert_eq!(timestamps.len(), 400);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
 // --- Column-mapped table ---
 
 /// Physical parquet column names for the hand-written column-mapped table.
