@@ -25,6 +25,7 @@ use deltalake_core::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilde
 use deltalake_core::parquet::arrow::ProjectionMask;
 use deltalake_core::parquet::basic::Compression;
 use deltalake_core::parquet::file::properties::WriterProperties;
+use deltalake_core::parquet::file::statistics::Statistics as ParquetStatistics;
 use deltalake_core::protocol::SaveMode;
 use deltalake_core::{open_table, DeltaResult, DeltaTable, DeltaTableError};
 use futures::StreamExt;
@@ -242,6 +243,13 @@ pub enum SortBenchMode {
     /// No ORDER BY on the query at all: data is read in arbitrary order with
     /// no sorting needed. Lower bound for the cost of producing sorted output.
     Unordered,
+    /// Sequential single-threaded read of every data file with the parquet
+    /// crate directly (no delta-rs scan, no DataFusion), in ascending order of
+    /// each file's minimum timestamp. Represents production workloads that
+    /// read parquet files directly and in a known order; because the files
+    /// are internally sorted and non-overlapping, the concatenated stream is
+    /// globally ordered without any sorting work.
+    SequentialRead,
 }
 
 impl SortBenchMode {
@@ -251,6 +259,7 @@ impl SortBenchMode {
             SortBenchMode::Declared => "declared",
             SortBenchMode::Pushdown => "pushdown",
             SortBenchMode::Unordered => "unordered",
+            SortBenchMode::SequentialRead => "sequential_read",
         }
     }
 }
@@ -344,6 +353,132 @@ fn peak_rss_mb() -> Option<u64> {
     Some(kb / 1024)
 }
 
+/// Sequentially read every live data file with the parquet crate directly:
+/// no delta-rs scan, no DataFusion. See [`SortBenchMode::SequentialRead`].
+///
+/// The delta log is used only to list the live files; they are then ordered
+/// by the minimum timestamp in their parquet footer statistics — the stand-in
+/// for a production naming or layout convention that makes the read order
+/// known up front. Reading is single-threaded, one file at a time;
+/// `memory_limit_bytes` and `target_partitions` are ignored. The batch size
+/// matches DataFusion's default (8192) and the output ordering is verified
+/// exactly like in the DataFusion modes.
+async fn run_sequential_read(
+    table_url: &Url,
+    params: &SortBenchParams,
+) -> DeltaResult<SortBenchReport> {
+    let provider_start = Instant::now();
+    let table = open_table(table_url.clone()).await?;
+    let root = table_url.to_file_path().map_err(|_| {
+        DeltaTableError::generic("sequential-read mode requires a local file:// table")
+    })?;
+    let extra_columns = extra_column_names(&table)?;
+    let selected = params
+        .select_columns
+        .map(|n| n.min(extra_columns.len()))
+        .unwrap_or(extra_columns.len());
+
+    // The generated schema is flat, so arrow field indices equal parquet leaf
+    // indices: leaf 0 is the timestamp, leaves 1..=selected the value columns.
+    let leaves: Vec<usize> = (0..=selected).collect();
+
+    let mut files: Vec<(i64, std::path::PathBuf)> = Vec::new();
+    for file in table.snapshot()?.log_data().iter() {
+        let path = root.join(file.path().to_string());
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?;
+        let min = match reader.metadata().row_group(0).column(0).statistics() {
+            Some(ParquetStatistics::Int64(stats)) => stats.min_opt().copied(),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            DeltaTableError::generic(format!(
+                "missing int64 min statistic for the timestamp column of {}",
+                path.display()
+            ))
+        })?;
+        files.push((min, path));
+    }
+    files.sort_unstable();
+    let provider_elapsed = provider_start.elapsed();
+
+    let exec_start = Instant::now();
+    let mut first_batch = None;
+    let mut rows = 0usize;
+    let mut batches = 0usize;
+    let mut sorted = Some(true);
+    let mut first_violation = None;
+    let mut last_ts: Option<i64> = None;
+    let mut remaining = params.limit;
+    'files: for (_, path) in &files {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+        let mask = ProjectionMask::leaves(builder.parquet_schema(), leaves.iter().copied());
+        let reader = builder
+            .with_projection(mask)
+            .with_batch_size(8192)
+            .build()?;
+        for batch in reader {
+            let mut batch = batch?;
+            if let Some(remaining) = remaining {
+                if batch.num_rows() > remaining {
+                    batch = batch.slice(0, remaining);
+                }
+            }
+            if first_batch.is_none() {
+                first_batch = Some(exec_start.elapsed());
+            }
+            batches += 1;
+            let timestamps = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| DeltaTableError::generic("unexpected type for timestamp column"))?
+                .values();
+            for (row, &ts) in timestamps.iter().enumerate() {
+                if let Some(last) = last_ts {
+                    if ts < last {
+                        sorted = Some(false);
+                        if first_violation.is_none() {
+                            first_violation = Some(format!(
+                                "batch={batches} row={} ts={ts} previous_ts={last}",
+                                rows + row
+                            ));
+                        }
+                    }
+                }
+                last_ts = Some(ts);
+            }
+            rows += batch.num_rows();
+            if let Some(rem) = remaining.as_mut() {
+                *rem -= batch.num_rows();
+                if *rem == 0 {
+                    break 'files;
+                }
+            }
+        }
+    }
+    let total = exec_start.elapsed();
+
+    Ok(SortBenchReport {
+        plan: format!(
+            "SequentialParquetRead: files={}, columns={}, batch_size=8192 (parquet crate, bypasses delta-rs scan and DataFusion)",
+            files.len(),
+            selected + 1,
+        ),
+        has_sort_exec: false,
+        has_sort_preserving_merge: false,
+        has_buffer_exec: false,
+        provider: provider_elapsed,
+        planning: Duration::ZERO,
+        first_batch,
+        total,
+        rows,
+        batches,
+        sorted,
+        first_violation,
+        peak_rss_mb: peak_rss_mb(),
+    })
+}
+
 /// Run one sorted streaming query against the table and measure it.
 ///
 /// A fresh session (and hence a cold file-metadata cache) is used every call.
@@ -351,6 +486,9 @@ pub async fn run_sort_bench_once(
     table_url: &Url,
     params: &SortBenchParams,
 ) -> DeltaResult<SortBenchReport> {
+    if params.mode == SortBenchMode::SequentialRead {
+        return run_sequential_read(table_url, params).await;
+    }
     let table = open_table(table_url.clone()).await?;
     let extra_columns = extra_column_names(&table)?;
     let sql = build_query(&extra_columns, params);
@@ -383,6 +521,9 @@ pub async fn run_sort_bench_once(
         SortBenchMode::Pushdown => builder
             .with_file_sort_order([FileSortColumn::asc(TIMESTAMP_COLUMN)])
             .with_file_sort_order_grouping(false),
+        SortBenchMode::SequentialRead => {
+            unreachable!("sequential_read is handled by run_sequential_read")
+        }
     };
     let provider = builder.await?;
     let provider_elapsed = provider_start.elapsed();

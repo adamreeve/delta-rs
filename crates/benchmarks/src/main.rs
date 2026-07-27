@@ -96,7 +96,7 @@ enum Command {
         table_path: PathBuf,
 
         /// Configurations to benchmark (comma separated); defaults to all of
-        /// baseline, declared, pushdown, unordered
+        /// baseline, declared, pushdown, unordered, sequential-read
         #[arg(long, value_enum, value_delimiter = ',')]
         modes: Option<Vec<SortBenchMode>>,
 
@@ -242,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
                     SortBenchMode::Declared,
                     SortBenchMode::Pushdown,
                     SortBenchMode::Unordered,
+                    SortBenchMode::SequentialRead,
                 ]
             });
             let memory_limit_bytes = match memory_limit_gb {

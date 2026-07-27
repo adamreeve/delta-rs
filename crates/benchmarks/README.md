@@ -115,15 +115,22 @@ SortPreservingMergeExec, `buffer` = BufferExec), planning time, time to first
 batch, total time, and whether the streamed rows were actually in order
 (`sorted`).
 
-- `--modes <baseline,declared,pushdown,unordered>`: configurations to compare
-  (default all). `baseline` declares no ordering and needs a full `SortExec`;
-  `declared` uses `with_file_sort_order`, satisfying the ORDER BY at planning
-  time with a merge over parallel pre-grouped ordered partitions; `pushdown`
-  also declares the sort order but disables statistics-based file grouping,
-  leaving the ORDER BY to DataFusion's sort-pushdown optimizer rule (file
-  reorder at optimization time plus a `BufferExec` under the merge);
-  `unordered` drops the ORDER BY entirely, reading in arbitrary order with no
-  sorting needed, as a lower bound for comparison.
+- `--modes <baseline,declared,pushdown,unordered,sequential-read>`:
+  configurations to compare (default all). `baseline` declares no ordering and
+  needs a full `SortExec`; `declared` uses `with_file_sort_order`, satisfying
+  the ORDER BY at planning time with a merge over parallel pre-grouped ordered
+  partitions; `pushdown` also declares the sort order but disables
+  statistics-based file grouping, leaving the ORDER BY to DataFusion's
+  sort-pushdown optimizer rule (file reorder at optimization time plus a
+  `BufferExec` under the merge); `unordered` drops the ORDER BY entirely,
+  reading in arbitrary order with no sorting needed, as a lower bound for
+  comparison; `sequential-read` bypasses the delta-rs scan and DataFusion
+  entirely and reads the parquet files directly with the parquet crate,
+  single-threaded and one file at a time in ascending timestamp order
+  (representing production workloads that read parquet files in a known
+  order — the output is still globally sorted because the files are sorted
+  and non-overlapping). `sequential-read` honors `--select-columns` and
+  `--limit` but ignores `--memory-limit-gb` and `--target-partitions`.
 - `--select-columns <n>`: number of extra float32 columns in the SELECT
   (default: all)
 - `--limit <n>`: add a LIMIT to exercise TopK / early termination
