@@ -275,7 +275,9 @@ fn create_plain_crypto_format(
     tpo.crypto.file_decryption = Some(
         (&decrypt)
             .try_into()
-            .map_err(|e| DeltaTableError::Generic(format!("{e}")))?,
+            .map_err(|e| DeltaTableError::Generic(format!(
+                "Failed to convert file decryption properties: {e}"
+            )))?,
     );
     let mut tbl_options = TableOptions::new();
     tbl_options.parquet = tpo;
