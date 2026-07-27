@@ -114,9 +114,11 @@ streamed to completion, reporting plan shape (`sort_exec`, `spm` =
 SortPreservingMergeExec), planning time, time to first batch, total time, and
 whether the streamed rows were actually in order (`sorted`).
 
-- `--modes <baseline,declared>`: provider configurations to compare (default
-  both). `baseline` declares no ordering and needs a full `SortExec`;
-  `declared` uses `with_file_sort_order`.
+- `--modes <baseline,declared,unordered>`: configurations to compare (default
+  all). `baseline` declares no ordering and needs a full `SortExec`;
+  `declared` uses `with_file_sort_order`; `unordered` drops the ORDER BY
+  entirely, reading in arbitrary order with no sorting needed, as a lower
+  bound for comparison.
 - `--select-columns <n>`: number of extra float32 columns in the SELECT
   (default: all)
 - `--limit <n>`: add a LIMIT to exercise TopK / early termination

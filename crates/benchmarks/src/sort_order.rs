@@ -235,6 +235,9 @@ pub enum SortBenchMode {
     Baseline,
     /// Sort order declared up front via `with_file_sort_order`.
     Declared,
+    /// No ORDER BY on the query at all: data is read in arbitrary order with
+    /// no sorting needed. Lower bound for the cost of producing sorted output.
+    Unordered,
 }
 
 impl SortBenchMode {
@@ -242,6 +245,7 @@ impl SortBenchMode {
         match self {
             SortBenchMode::Baseline => "baseline",
             SortBenchMode::Declared => "declared",
+            SortBenchMode::Unordered => "unordered",
         }
     }
 }
@@ -278,8 +282,10 @@ pub struct SortBenchReport {
     pub total: Duration,
     pub rows: usize,
     pub batches: usize,
-    /// Whether the streamed timestamps were globally non-decreasing.
-    pub sorted: bool,
+    /// Whether the streamed timestamps were globally non-decreasing; `None`
+    /// when the query had no ORDER BY (unordered mode) and order wasn't
+    /// checked.
+    pub sorted: Option<bool>,
     /// Description of the first out-of-order row, when `sorted` is false.
     pub first_violation: Option<String>,
     /// Peak RSS of the process so far (linux only); cumulative across
@@ -307,7 +313,10 @@ fn build_query(extra_columns: &[String], params: &SortBenchParams) -> String {
     for name in selected {
         select_list.push_str(&format!(", \"{name}\""));
     }
-    let mut sql = format!("SELECT {select_list} FROM t ORDER BY \"{TIMESTAMP_COLUMN}\"");
+    let mut sql = format!("SELECT {select_list} FROM t");
+    if params.mode != SortBenchMode::Unordered {
+        sql.push_str(&format!(" ORDER BY \"{TIMESTAMP_COLUMN}\""));
+    }
     if let Some(limit) = params.limit {
         sql.push_str(&format!(" LIMIT {limit}"));
     }
@@ -359,7 +368,7 @@ pub async fn run_sort_bench_once(
     let provider_start = Instant::now();
     let builder = table.table_provider();
     let builder = match params.mode {
-        SortBenchMode::Baseline => builder,
+        SortBenchMode::Baseline | SortBenchMode::Unordered => builder,
         SortBenchMode::Declared => {
             builder.with_file_sort_order([FileSortColumn::asc(TIMESTAMP_COLUMN)])
         }
@@ -374,12 +383,13 @@ pub async fn run_sort_bench_once(
     let planning_elapsed = planning_start.elapsed();
     let rendered = displayable(plan.as_ref()).indent(true).to_string();
 
+    let check_order = params.mode != SortBenchMode::Unordered;
     let exec_start = Instant::now();
     let mut stream = execute_stream(plan, ctx.task_ctx())?;
     let mut first_batch = None;
     let mut rows = 0usize;
     let mut batches = 0usize;
-    let mut sorted = true;
+    let mut sorted = check_order.then_some(true);
     let mut first_violation = None;
     let mut last_ts: Option<i64> = None;
     while let Some(batch) = stream.next().await {
@@ -388,25 +398,27 @@ pub async fn run_sort_bench_once(
             first_batch = Some(exec_start.elapsed());
         }
         batches += 1;
-        let timestamps = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .ok_or_else(|| DeltaTableError::generic("unexpected type for timestamp column"))?
-            .values();
-        for (row, &ts) in timestamps.iter().enumerate() {
-            if let Some(last) = last_ts {
-                if ts < last {
-                    sorted = false;
-                    if first_violation.is_none() {
-                        first_violation = Some(format!(
-                            "batch={batches} row={} ts={ts} previous_ts={last}",
-                            rows + row
-                        ));
+        if check_order {
+            let timestamps = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| DeltaTableError::generic("unexpected type for timestamp column"))?
+                .values();
+            for (row, &ts) in timestamps.iter().enumerate() {
+                if let Some(last) = last_ts {
+                    if ts < last {
+                        sorted = Some(false);
+                        if first_violation.is_none() {
+                            first_violation = Some(format!(
+                                "batch={batches} row={} ts={ts} previous_ts={last}",
+                                rows + row
+                            ));
+                        }
                     }
                 }
+                last_ts = Some(ts);
             }
-            last_ts = Some(ts);
         }
         rows += batch.num_rows();
     }

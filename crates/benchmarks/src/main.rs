@@ -95,8 +95,8 @@ enum Command {
         #[arg(long)]
         table_path: PathBuf,
 
-        /// Provider configurations to benchmark (comma separated); defaults
-        /// to both of baseline, declared
+        /// Configurations to benchmark (comma separated); defaults to all of
+        /// baseline, declared, unordered
         #[arg(long, value_enum, value_delimiter = ',')]
         modes: Option<Vec<SortBenchMode>>,
 
@@ -236,8 +236,13 @@ async fn main() -> anyhow::Result<()> {
             show_plan,
         } => {
             let table_url = ensure_table_uri(table_path.to_string_lossy().as_ref())?;
-            let modes =
-                modes.unwrap_or_else(|| vec![SortBenchMode::Baseline, SortBenchMode::Declared]);
+            let modes = modes.unwrap_or_else(|| {
+                vec![
+                    SortBenchMode::Baseline,
+                    SortBenchMode::Declared,
+                    SortBenchMode::Unordered,
+                ]
+            });
             let memory_limit_bytes = match memory_limit_gb {
                 0 => None,
                 gb => Some(gb * 1024 * 1024 * 1024),
@@ -269,7 +274,10 @@ async fn main() -> anyhow::Result<()> {
                         report.total.as_millis(),
                         report.rows,
                         report.batches,
-                        report.sorted,
+                        report
+                            .sorted
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
                         report
                             .peak_rss_mb
                             .map(|mb| mb.to_string())
