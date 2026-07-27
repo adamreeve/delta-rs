@@ -766,6 +766,153 @@ async fn delta_table_overlapping_files_beyond_group_cap_fall_back() -> TestResul
     Ok(())
 }
 
+// --- Nullable sort column ---
+
+/// A batch over the nullable-timestamp schema: the given seconds ascending,
+/// followed by `nulls` null timestamps (nulls last).
+fn nullable_batch(seconds: Vec<i64>, nulls: usize) -> TestResult<RecordBatch> {
+    let mut timestamps: Vec<Option<i64>> =
+        seconds.iter().map(|s| Some(s * 1_000_000)).collect();
+    let mut values: Vec<i64> = seconds;
+    for i in 0..nulls {
+        timestamps.push(None);
+        values.push(-(i as i64) - 1);
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(timestamps)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )?)
+}
+
+/// Create a table with a nullable timestamp column and two files, each
+/// internally sorted ascending with one null last, with non-overlapping
+/// non-null ranges. Reading the files back-to-back would put the first file's
+/// null before the second file's values.
+async fn nullable_sorted_delta_table() -> TestResult<DeltaTable> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "timestamp".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
+                true,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+
+    for start in [0i64, 100] {
+        table = table
+            .write(vec![nullable_batch((start..start + 100).collect(), 1)?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 2);
+    Ok(table)
+}
+
+/// Run `ORDER BY timestamp` (ascending nulls last) against the nullable table
+/// with the given target partition count and return the rendered plan and the
+/// collected (nullable) timestamps.
+async fn query_nullable_sorted(
+    table: &DeltaTable,
+    target_partitions: usize,
+) -> TestResult<(String, Vec<Option<i64>>)> {
+    let ctx = create_session().into_inner();
+    ctx.sql(&format!(
+        "SET datafusion.execution.target_partitions = {target_partitions}"
+    ))
+    .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\"")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let timestamps = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_primitive::<TimestampMicrosecondType>()
+                .iter()
+        })
+        .collect();
+    Ok((rendered, timestamps))
+}
+
+/// Check the nullable query returned all 202 rows ascending with the two
+/// nulls at the end (the ORDER BY default of ascending nulls last).
+fn assert_sorted_nulls_last(timestamps: &[Option<i64>]) {
+    assert_eq!(timestamps.len(), 202);
+    assert_eq!(timestamps.iter().filter(|ts| ts.is_none()).count(), 2);
+    let keys: Vec<(bool, Option<i64>)> = timestamps.iter().map(|ts| (ts.is_none(), *ts)).collect();
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted ascending nulls last: {timestamps:?}"
+    );
+}
+
+/// When several files containing nulls in the sort column share a scan
+/// partition, the declared ordering cannot be used: nulls sort at one end of
+/// *each file*, so concatenating files ordered by min/max interleaves the
+/// nulls into the middle of the stream, which min/max statistics cannot
+/// detect. The query must fall back to a full sort.
+#[tokio::test]
+async fn delta_table_sort_order_with_nulls_degrades() -> TestResult<()> {
+    let table = nullable_sorted_delta_table().await?;
+    // A single target partition forces both files into one group.
+    let (rendered, timestamps) = query_nullable_sorted(&table, 1).await?;
+
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+    assert_sorted_nulls_last(&timestamps);
+    Ok(())
+}
+
+/// With one file per scan partition, each partition upholds the declared
+/// ordering even though the sort column contains nulls (nulls last within a
+/// single sorted file), so the merge can still replace the full sort.
+#[tokio::test]
+async fn delta_table_sort_order_with_nulls_single_file_groups_avoids_sort() -> TestResult<()> {
+    let table = nullable_sorted_delta_table().await?;
+    let (rendered, timestamps) = query_nullable_sorted(&table, 2).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    assert_sorted_nulls_last(&timestamps);
+    Ok(())
+}
+
 // --- Column-mapped table ---
 
 /// Physical parquet column names for the hand-written column-mapped table.

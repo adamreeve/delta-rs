@@ -181,6 +181,40 @@ fn resolve_file_sort_order(
     LexOrdering::new(sort_exprs)
 }
 
+/// The longest prefix of `ordering` whose columns provably contain no nulls
+/// in any of the files: either the column is non-nullable in the read schema,
+/// or every file's statistics report an exact null count of zero.
+///
+/// Nulls sort at one end of *each file*, so concatenating multiple files into
+/// one ordered group interleaves each file's nulls into the middle of the
+/// group's stream. Min/max statistics cannot detect this, so an ordering on a
+/// column that may contain nulls must not be declared for multi-file groups.
+fn null_free_ordering_prefix(
+    ordering: &LexOrdering,
+    read_schema: &SchemaRef,
+    files: &[PartitionedFile],
+) -> Option<LexOrdering> {
+    let sort_exprs = ordering
+        .iter()
+        .take_while(|sort_expr| {
+            let Some(column) = sort_expr.expr.downcast_ref::<Column>() else {
+                return false;
+            };
+            if !read_schema.field(column.index()).is_nullable() {
+                return true;
+            }
+            files.iter().all(|file| {
+                file.statistics
+                    .as_ref()
+                    .and_then(|stats| stats.column_statistics.get(column.index()))
+                    .is_some_and(|column_stats| column_stats.null_count == Precision::Exact(0))
+            })
+        })
+        .cloned()
+        .collect_vec();
+    LexOrdering::new(sort_exprs)
+}
+
 /// Build scan file groups such that the files within each group are mutually
 /// non-overlapping and ordered on the declared file sort order, so reading a
 /// group sequentially preserves that order.
@@ -670,14 +704,34 @@ async fn get_read_plan(
         }
 
         let files = files.into_iter().map(|file| file.0);
-        let file_groups = match &file_sort_order {
-            Some(ordering) => split_file_groups_for_ordering(
-                files.collect(),
-                ordering,
-                &full_table_schema,
-                state.config().options().execution.target_partitions,
-            ),
-            None => partitioned_files_to_file_groups(files),
+        let (file_groups, store_sort_order) = match &file_sort_order {
+            Some(ordering) => {
+                let files = files.collect_vec();
+                let null_free_prefix =
+                    null_free_ordering_prefix(ordering, parquet_read_schema, &files);
+                let file_groups = split_file_groups_for_ordering(
+                    files,
+                    ordering,
+                    &full_table_schema,
+                    state.config().options().execution.target_partitions,
+                );
+                // A single sorted file per group upholds the full ordering even
+                // when sort columns contain nulls; multi-file groups only
+                // uphold the prefix of the ordering that is provably null-free
+                // (see `null_free_ordering_prefix`).
+                let store_sort_order = if file_groups.iter().all(|group| group.len() <= 1) {
+                    Some(ordering.clone())
+                } else {
+                    if null_free_prefix.as_ref().map_or(0, |prefix| prefix.len()) < ordering.len() {
+                        debug!(
+                            "file sort order columns may contain nulls; declaring only the null-free prefix of the ordering"
+                        );
+                    }
+                    null_free_prefix
+                };
+                (file_groups, store_sort_order)
+            }
+            None => (partitioned_files_to_file_groups(files), None),
         };
         let (file_groups, statistics) =
             compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
@@ -687,7 +741,7 @@ async fn get_read_plan(
             .with_statistics(statistics)
             .with_limit(limit)
             .with_expr_adapter(Some(adapter_factory.clone() as _));
-        if let Some(ordering) = file_sort_order.clone() {
+        if let Some(ordering) = store_sort_order {
             config_builder = config_builder.with_output_ordering(vec![ordering]);
         }
         let config = config_builder.build();

@@ -434,6 +434,12 @@ impl TableProviderBuilder {
     /// Only regular top-level data columns are supported. Partition columns are
     /// injected above the parquet scan and cannot participate in a file-level
     /// sort order, and nested fields (e.g. `a.b`) cannot be used as sort columns.
+    ///
+    /// Nullable sort columns are supported, but when several files are read
+    /// back-to-back within one scan partition the ordering is only used for
+    /// the leading sort columns whose file statistics prove they contain no
+    /// nulls: each file's nulls would otherwise surface mid-stream, where they
+    /// violate the ordering.
     pub fn with_file_sort_order(
         mut self,
         columns: impl IntoIterator<Item = FileSortColumn>,
