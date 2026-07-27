@@ -115,7 +115,7 @@ SortPreservingMergeExec, `buffer` = BufferExec), planning time, time to first
 batch, total time, and whether the streamed rows were actually in order
 (`sorted`).
 
-- `--modes <baseline,declared,pushdown,unordered,sequential-read>`:
+- `--modes <baseline,declared,pushdown,unordered,sequential-read,sequential-read-async>`:
   configurations to compare (default all). `baseline` declares no ordering and
   needs a full `SortExec`; `declared` uses `with_file_sort_order`, satisfying
   the ORDER BY at planning time with a merge over parallel pre-grouped ordered
@@ -129,8 +129,12 @@ batch, total time, and whether the streamed rows were actually in order
   single-threaded and one file at a time in ascending timestamp order
   (representing production workloads that read parquet files in a known
   order — the output is still globally sorted because the files are sorted
-  and non-overlapping). `sequential-read` honors `--select-columns` and
-  `--limit` but ignores `--memory-limit-gb` and `--target-partitions`.
+  and non-overlapping); `sequential-read-async` is the same read through the
+  parquet crate's async reader over tokio files — the IO pattern used by
+  object-storage readers and DataFusion's parquet source — isolating the cost
+  of the async read path from the rest of the stack. The sequential read
+  modes honor `--select-columns` and `--limit` but ignore `--memory-limit-gb`
+  and `--target-partitions`.
 - `--select-columns <n>`: number of extra float32 columns in the SELECT
   (default: all)
 - `--limit <n>`: add a LIMIT to exercise TopK / early termination

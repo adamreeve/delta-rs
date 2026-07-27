@@ -22,6 +22,7 @@ use deltalake_core::delta_datafusion::{
     create_session, DeltaRuntimeEnvBuilder, DeltaSessionContext, FileSortColumn,
 };
 use deltalake_core::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use deltalake_core::parquet::arrow::ParquetRecordBatchStreamBuilder;
 use deltalake_core::parquet::arrow::ProjectionMask;
 use deltalake_core::parquet::basic::Compression;
 use deltalake_core::parquet::file::properties::WriterProperties;
@@ -250,6 +251,11 @@ pub enum SortBenchMode {
     /// are internally sorted and non-overlapping, the concatenated stream is
     /// globally ordered without any sorting work.
     SequentialRead,
+    /// Like `sequential-read`, but through the parquet crate's async reader
+    /// over tokio files: the IO pattern used by object-storage readers (and
+    /// by DataFusion's parquet source), still without delta-rs or DataFusion.
+    /// Isolates the cost of the async read path from the rest of the stack.
+    SequentialReadAsync,
 }
 
 impl SortBenchMode {
@@ -260,6 +266,7 @@ impl SortBenchMode {
             SortBenchMode::Pushdown => "pushdown",
             SortBenchMode::Unordered => "unordered",
             SortBenchMode::SequentialRead => "sequential_read",
+            SortBenchMode::SequentialReadAsync => "sequential_read_async",
         }
     }
 }
@@ -353,19 +360,93 @@ fn peak_rss_mb() -> Option<u64> {
     Some(kb / 1024)
 }
 
+/// Per-batch accounting shared by the sequential read modes: applies the row
+/// limit, verifies ordering, and tracks batch/row counts and first-batch time.
+struct SequentialReadState {
+    exec_start: Instant,
+    first_batch: Option<Duration>,
+    rows: usize,
+    batches: usize,
+    sorted: bool,
+    first_violation: Option<String>,
+    last_ts: Option<i64>,
+    remaining: Option<usize>,
+}
+
+impl SequentialReadState {
+    fn new(exec_start: Instant, limit: Option<usize>) -> Self {
+        Self {
+            exec_start,
+            first_batch: None,
+            rows: 0,
+            batches: 0,
+            sorted: true,
+            first_violation: None,
+            last_ts: None,
+            remaining: limit,
+        }
+    }
+
+    /// Returns true when the row limit has been reached and reading should stop.
+    fn consume(&mut self, mut batch: RecordBatch) -> DeltaResult<bool> {
+        if let Some(remaining) = self.remaining {
+            if batch.num_rows() > remaining {
+                batch = batch.slice(0, remaining);
+            }
+        }
+        if self.first_batch.is_none() {
+            self.first_batch = Some(self.exec_start.elapsed());
+        }
+        self.batches += 1;
+        let timestamps = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or_else(|| DeltaTableError::generic("unexpected type for timestamp column"))?
+            .values();
+        for (row, &ts) in timestamps.iter().enumerate() {
+            if let Some(last) = self.last_ts {
+                if ts < last {
+                    self.sorted = false;
+                    if self.first_violation.is_none() {
+                        self.first_violation = Some(format!(
+                            "batch={} row={} ts={ts} previous_ts={last}",
+                            self.batches,
+                            self.rows + row
+                        ));
+                    }
+                }
+            }
+            self.last_ts = Some(ts);
+        }
+        self.rows += batch.num_rows();
+        if let Some(remaining) = self.remaining.as_mut() {
+            *remaining -= batch.num_rows();
+            if *remaining == 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
 /// Sequentially read every live data file with the parquet crate directly:
-/// no delta-rs scan, no DataFusion. See [`SortBenchMode::SequentialRead`].
+/// no delta-rs scan, no DataFusion. See [`SortBenchMode::SequentialRead`] and
+/// [`SortBenchMode::SequentialReadAsync`].
 ///
 /// The delta log is used only to list the live files; they are then ordered
 /// by the minimum timestamp in their parquet footer statistics — the stand-in
 /// for a production naming or layout convention that makes the read order
-/// known up front. Reading is single-threaded, one file at a time;
-/// `memory_limit_bytes` and `target_partitions` are ignored. The batch size
-/// matches DataFusion's default (8192) and the output ordering is verified
-/// exactly like in the DataFusion modes.
+/// known up front. Reading is single-threaded, one file at a time, using the
+/// sync arrow reader over `std::fs::File` or, when `async_reader` is set, the
+/// async arrow reader over `tokio::fs::File`. `memory_limit_bytes` and
+/// `target_partitions` are ignored. The batch size matches DataFusion's
+/// default (8192) and the output ordering is verified exactly like in the
+/// DataFusion modes.
 async fn run_sequential_read(
     table_url: &Url,
     params: &SortBenchParams,
+    async_reader: bool,
 ) -> DeltaResult<SortBenchReport> {
     let provider_start = Instant::now();
     let table = open_table(table_url.clone()).await?;
@@ -402,55 +483,30 @@ async fn run_sequential_read(
     let provider_elapsed = provider_start.elapsed();
 
     let exec_start = Instant::now();
-    let mut first_batch = None;
-    let mut rows = 0usize;
-    let mut batches = 0usize;
-    let mut sorted = Some(true);
-    let mut first_violation = None;
-    let mut last_ts: Option<i64> = None;
-    let mut remaining = params.limit;
+    let mut state = SequentialReadState::new(exec_start, params.limit);
     'files: for (_, path) in &files {
-        let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
-        let mask = ProjectionMask::leaves(builder.parquet_schema(), leaves.iter().copied());
-        let reader = builder
-            .with_projection(mask)
-            .with_batch_size(8192)
-            .build()?;
-        for batch in reader {
-            let mut batch = batch?;
-            if let Some(remaining) = remaining {
-                if batch.num_rows() > remaining {
-                    batch = batch.slice(0, remaining);
+        if async_reader {
+            let file = tokio::fs::File::open(path).await?;
+            let builder = ParquetRecordBatchStreamBuilder::new(file).await?;
+            let mask = ProjectionMask::leaves(builder.parquet_schema(), leaves.iter().copied());
+            let mut stream = builder
+                .with_projection(mask)
+                .with_batch_size(8192)
+                .build()?;
+            while let Some(batch) = stream.next().await {
+                if state.consume(batch?)? {
+                    break 'files;
                 }
             }
-            if first_batch.is_none() {
-                first_batch = Some(exec_start.elapsed());
-            }
-            batches += 1;
-            let timestamps = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| DeltaTableError::generic("unexpected type for timestamp column"))?
-                .values();
-            for (row, &ts) in timestamps.iter().enumerate() {
-                if let Some(last) = last_ts {
-                    if ts < last {
-                        sorted = Some(false);
-                        if first_violation.is_none() {
-                            first_violation = Some(format!(
-                                "batch={batches} row={} ts={ts} previous_ts={last}",
-                                rows + row
-                            ));
-                        }
-                    }
-                }
-                last_ts = Some(ts);
-            }
-            rows += batch.num_rows();
-            if let Some(rem) = remaining.as_mut() {
-                *rem -= batch.num_rows();
-                if *rem == 0 {
+        } else {
+            let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
+            let mask = ProjectionMask::leaves(builder.parquet_schema(), leaves.iter().copied());
+            let reader = builder
+                .with_projection(mask)
+                .with_batch_size(8192)
+                .build()?;
+            for batch in reader {
+                if state.consume(batch?)? {
                     break 'files;
                 }
             }
@@ -460,21 +516,22 @@ async fn run_sequential_read(
 
     Ok(SortBenchReport {
         plan: format!(
-            "SequentialParquetRead: files={}, columns={}, batch_size=8192 (parquet crate, bypasses delta-rs scan and DataFusion)",
+            "SequentialParquetRead: files={}, columns={}, batch_size=8192, reader={} (parquet crate, bypasses delta-rs scan and DataFusion)",
             files.len(),
             selected + 1,
+            if async_reader { "async" } else { "sync" },
         ),
         has_sort_exec: false,
         has_sort_preserving_merge: false,
         has_buffer_exec: false,
         provider: provider_elapsed,
         planning: Duration::ZERO,
-        first_batch,
+        first_batch: state.first_batch,
         total,
-        rows,
-        batches,
-        sorted,
-        first_violation,
+        rows: state.rows,
+        batches: state.batches,
+        sorted: Some(state.sorted),
+        first_violation: state.first_violation,
         peak_rss_mb: peak_rss_mb(),
     })
 }
@@ -486,8 +543,12 @@ pub async fn run_sort_bench_once(
     table_url: &Url,
     params: &SortBenchParams,
 ) -> DeltaResult<SortBenchReport> {
-    if params.mode == SortBenchMode::SequentialRead {
-        return run_sequential_read(table_url, params).await;
+    match params.mode {
+        SortBenchMode::SequentialRead => return run_sequential_read(table_url, params, false).await,
+        SortBenchMode::SequentialReadAsync => {
+            return run_sequential_read(table_url, params, true).await
+        }
+        _ => {}
     }
     let table = open_table(table_url.clone()).await?;
     let extra_columns = extra_column_names(&table)?;
@@ -521,8 +582,8 @@ pub async fn run_sort_bench_once(
         SortBenchMode::Pushdown => builder
             .with_file_sort_order([FileSortColumn::asc(TIMESTAMP_COLUMN)])
             .with_file_sort_order_grouping(false),
-        SortBenchMode::SequentialRead => {
-            unreachable!("sequential_read is handled by run_sequential_read")
+        SortBenchMode::SequentialRead | SortBenchMode::SequentialReadAsync => {
+            unreachable!("sequential read modes are handled by run_sequential_read")
         }
     };
     let provider = builder.await?;
