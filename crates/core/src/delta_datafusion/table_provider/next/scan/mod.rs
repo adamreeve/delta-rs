@@ -18,7 +18,7 @@ use std::{collections::VecDeque, pin::Pin, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_cast::{CastOptions, cast_with_options};
-use arrow_schema::{FieldRef, Schema, SchemaBuilder, SchemaRef};
+use arrow_schema::{FieldRef, Schema, SchemaBuilder, SchemaRef, SortOptions};
 use chrono::{TimeZone as _, Utc};
 use dashmap::DashMap;
 use datafusion::{
@@ -30,6 +30,7 @@ use datafusion::{
     datasource::physical_plan::{ParquetSource, parquet::CachedParquetFileReaderFactory},
     error::DataFusionError,
     execution::object_store::ObjectStoreUrl,
+    physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column},
     physical_plan::{
         ExecutionPlan,
         empty::EmptyExec,
@@ -39,8 +40,10 @@ use datafusion::{
     prelude::Expr,
 };
 use datafusion_datasource::{
-    PartitionedFile, TableSchema, compute_all_files_statistics, file_groups::FileGroup,
-    file_scan_config::FileScanConfigBuilder, source::DataSourceExec,
+    PartitionedFile, TableSchema, compute_all_files_statistics,
+    file_groups::FileGroup,
+    file_scan_config::{FileScanConfig, FileScanConfigBuilder},
+    source::DataSourceExec,
 };
 use datafusion_physical_expr_adapter::{
     BatchAdapter, BatchAdapterFactory, DefaultPhysicalExprAdapterFactory,
@@ -125,16 +128,101 @@ pub(super) async fn execution_plan(
     }
 
     get_data_scan_plan(
-        session,
-        scan_plan,
-        files,
-        transforms,
-        dvs,
-        metrics,
-        limit,
-        config.table_parquet_options.as_ref(),
+        session, config, scan_plan, files, transforms, dvs, metrics, limit,
     )
     .await
+}
+
+/// Resolve the configured per-file sort order into a physical ordering over
+/// the parquet read schema.
+///
+/// Column-mapped tables translate logical column names to physical parquet
+/// names. A sort column that is not part of the parquet scan (e.g. dropped by
+/// the query's projection) truncates the ordering there: the remaining prefix
+/// is still a valid ordering. Returns `None` when no order is configured or
+/// no prefix could be resolved.
+fn resolve_file_sort_order(
+    config: &DeltaScanConfig,
+    scan_plan: &KernelScanPlan,
+) -> Option<LexOrdering> {
+    if config.file_sort_order.is_empty() {
+        return None;
+    }
+    let table_config = scan_plan.table_configuration();
+    let column_mapping = table_config.is_feature_enabled(&TableFeature::ColumnMapping);
+    let read_schema = &scan_plan.parquet_read_schema;
+
+    let mut sort_exprs = Vec::with_capacity(config.file_sort_order.len());
+    for sort_column in &config.file_sort_order {
+        let physical_name = if column_mapping {
+            let Some(physical) = scan_plan
+                .scan
+                .logical_schema()
+                .field(&sort_column.column)
+                .and_then(|field| field.make_physical(table_config.column_mapping_mode()).ok())
+            else {
+                break;
+            };
+            physical.name().to_string()
+        } else {
+            sort_column.column.clone()
+        };
+        let Ok(index) = read_schema.index_of(&physical_name) else {
+            break;
+        };
+        sort_exprs.push(PhysicalSortExpr::new(
+            Arc::new(Column::new(&physical_name, index)),
+            SortOptions {
+                descending: sort_column.descending,
+                nulls_first: sort_column.nulls_first,
+            },
+        ));
+    }
+    LexOrdering::new(sort_exprs)
+}
+
+/// Build scan file groups such that the files within each group are mutually
+/// non-overlapping and ordered on the declared file sort order, so reading a
+/// group sequentially preserves that order.
+///
+/// Falls back to the default grouping when statistics are unavailable or a
+/// group would exceed the file-id dictionary key space; the declared output
+/// ordering is then dropped by DataFusion's statistics-based validation of
+/// scan orderings rather than producing wrong results.
+fn split_file_groups_for_ordering(
+    files: Vec<PartitionedFile>,
+    ordering: &LexOrdering,
+    table_schema: &SchemaRef,
+    target_partitions: usize,
+) -> Vec<FileGroup> {
+    let flat = vec![FileGroup::new(files.clone())];
+    match FileScanConfig::split_groups_by_statistics_with_target_partitions(
+        table_schema,
+        &flat,
+        ordering,
+        target_partitions.max(1),
+    ) {
+        Ok(groups)
+            if groups
+                .iter()
+                .all(|group| group.len() <= MAX_PARTITION_DICT_CARDINALITY) =>
+        {
+            groups
+        }
+        Ok(_) => {
+            debug!(
+                "file sort order grouping exceeded the file-id dictionary key space; falling back to default grouping"
+            );
+            partitioned_files_to_file_groups(files)
+        }
+        Err(err) => {
+            debug!(
+                error = %err,
+                "failed to group files by statistics for the declared file sort order; falling back to default grouping"
+            );
+            partitioned_files_to_file_groups(files)
+        }
+    }
 }
 
 /// Materialize deletion vector keep masks for every file in the scan that has one.
@@ -295,15 +383,16 @@ fn normalize_dv_keep_mask_for_api(
     Ok(mask)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn get_data_scan_plan(
     session: &dyn Session,
+    config: &DeltaScanConfig,
     scan_plan: KernelScanPlan,
     files: Vec<ScanFileContext>,
     transforms: HashMap<String, Arc<Expression>>,
     dvs: DashMap<String, Vec<bool>>,
     metrics: ExecutionPlanMetricsSet,
     limit: Option<usize>,
-    table_parquet_options: Option<&TableParquetOptions>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut partition_stats = HashMap::new();
 
@@ -355,6 +444,7 @@ async fn get_data_scan_plan(
         scan_plan.parquet_predicate.as_ref()
     };
     let file_id_field = scan_plan.contract.file_id_field.clone();
+    let file_sort_order = resolve_file_sort_order(config, &scan_plan);
     let pq_plan = get_read_plan(
         session,
         files_by_store,
@@ -363,7 +453,8 @@ async fn get_data_scan_plan(
         limit,
         &file_id_field,
         predicate,
-        table_parquet_options,
+        config.table_parquet_options.as_ref(),
+        file_sort_order,
     )
     .await?;
 
@@ -463,6 +554,7 @@ fn partitioned_files_to_file_groups_with_limit(
     file_groups
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn get_read_plan(
     state: &dyn Session,
     files_by_store: impl IntoIterator<Item = FilesByStore>,
@@ -478,6 +570,8 @@ async fn get_read_plan(
     file_id_field: &FieldRef,
     predicate: Option<&Expr>,
     table_parquet_options: Option<&TableParquetOptions>,
+    // Sort order (over `parquet_read_schema`) that every data file adheres to.
+    file_sort_order: Option<LexOrdering>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut plans = Vec::new();
 
@@ -558,16 +652,28 @@ async fn get_read_plan(
             }
         }
 
-        let file_groups = partitioned_files_to_file_groups(files.into_iter().map(|file| file.0));
+        let files = files.into_iter().map(|file| file.0).collect_vec();
+        let file_groups = match &file_sort_order {
+            Some(ordering) => split_file_groups_for_ordering(
+                files,
+                ordering,
+                &full_table_schema,
+                state.config().options().execution.target_partitions,
+            ),
+            None => partitioned_files_to_file_groups(files),
+        };
         let (file_groups, statistics) =
             compute_all_files_statistics(file_groups, full_table_schema, true, false)?;
 
-        let config = FileScanConfigBuilder::new(store_url, Arc::new(file_source))
+        let mut config_builder = FileScanConfigBuilder::new(store_url, Arc::new(file_source))
             .with_file_groups(file_groups)
             .with_statistics(statistics)
             .with_limit(limit)
-            .with_expr_adapter(Some(adapter_factory.clone() as _))
-            .build();
+            .with_expr_adapter(Some(adapter_factory.clone() as _));
+        if let Some(ordering) = file_sort_order.clone() {
+            config_builder = config_builder.with_output_ordering(vec![ordering]);
+        }
+        let config = config_builder.build();
 
         plans.push(DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>);
     }
@@ -995,6 +1101,7 @@ mod tests {
             &file_id_field,
             None,
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1017,6 +1124,7 @@ mod tests {
             &parquet_predicate_schema,
             Some(1),
             &file_id_field,
+            None,
             None,
             None,
         )
@@ -1046,6 +1154,7 @@ mod tests {
             &parquet_predicate_schema_extended,
             Some(1),
             &file_id_field,
+            None,
             None,
             None,
         )
@@ -1126,6 +1235,7 @@ mod tests {
             &file_id_field,
             None,
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1163,6 +1273,7 @@ mod tests {
             &parquet_predicate_schema_extended,
             None,
             &file_id_field,
+            None,
             None,
             None,
         )
@@ -1264,6 +1375,7 @@ mod tests {
             &file_id_field,
             None,
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1332,6 +1444,7 @@ mod tests {
             &file_id_field,
             Some(&predicate),
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1398,6 +1511,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
             None,
         )
         .await?;
@@ -1479,6 +1593,7 @@ mod tests {
             &file_id_field,
             Some(&predicate),
             None,
+            None,
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1555,6 +1670,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
             None,
         )
         .await?;
@@ -1633,6 +1749,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
             None,
         )
         .await?;
@@ -1723,6 +1840,7 @@ mod tests {
             None,
             &file_id_field,
             Some(&predicate),
+            None,
             None,
         )
         .await?;
