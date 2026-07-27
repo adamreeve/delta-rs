@@ -394,6 +394,46 @@ async fn delta_table_multi_column_sort_order_avoids_sort() -> TestResult<()> {
     Ok(())
 }
 
+/// An ORDER BY over a prefix of the declared multi-column sort order is
+/// satisfied by the declared ordering without a `SortExec`.
+#[tokio::test]
+async fn delta_table_sort_order_prefix_query_avoids_sort() -> TestResult<()> {
+    let table = multi_sorted_delta_table().await?;
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([
+            FileSortColumn::asc("timestamp"),
+            FileSortColumn::asc("object_id"),
+        ])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", object_id, value FROM test_table ORDER BY \"timestamp\"")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    let timestamps = collect_timestamps(&batches);
+    assert_eq!(timestamps.len(), (4 * 50 * OBJECTS_PER_TIMESTAMP) as usize);
+    assert!(
+        timestamps.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by timestamp"
+    );
+    Ok(())
+}
+
 // --- Descending sort order ---
 
 fn desc_write_schema() -> SchemaRef {
