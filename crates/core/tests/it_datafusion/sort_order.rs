@@ -201,6 +201,58 @@ async fn delta_table_sort_order_validation() -> TestResult<()> {
     Ok(())
 }
 
+/// Ordering by the partition key and then the file sort order requires a
+/// `SortExec`: partition columns cannot participate in the file sort order
+/// (they are injected above the parquet scan), so the scan only exposes the
+/// `timestamp` ordering and file groups may interleave partition values.
+#[tokio::test]
+async fn delta_table_sort_order_degrades_for_partition_key_prefix() -> TestResult<()> {
+    let table = sorted_delta_table().await?;
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+
+    let mut keys: Vec<(String, i64)> = Vec::new();
+    for batch in &batches {
+        // The partition column is produced by the kernel transform and may be
+        // dictionary-encoded or a view array; cast to plain Utf8 to read it.
+        let parts = arrow_cast::cast(batch.column(0), &DataType::Utf8)?;
+        let parts = parts.as_string::<i32>();
+        let timestamps = batch
+            .column(1)
+            .as_primitive::<TimestampMicrosecondType>()
+            .values();
+        keys.extend(
+            parts
+                .iter()
+                .map(|part| part.unwrap().to_string())
+                .zip(timestamps.iter().copied()),
+        );
+    }
+    assert_eq!(keys.len(), 400);
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by (part, timestamp)"
+    );
+    Ok(())
+}
+
 // --- Multi-column sort order ---
 
 /// Each timestamp appears once per object id, so ties on the leading sort
