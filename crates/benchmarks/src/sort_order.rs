@@ -235,6 +235,10 @@ pub enum SortBenchMode {
     Baseline,
     /// Sort order declared up front via `with_file_sort_order`.
     Declared,
+    /// Sort order declared but statistics-based file grouping disabled, so the
+    /// ORDER BY is satisfied by DataFusion's sort-pushdown optimizer rule
+    /// (file reorder at optimization time plus a BufferExec under the merge).
+    Pushdown,
     /// No ORDER BY on the query at all: data is read in arbitrary order with
     /// no sorting needed. Lower bound for the cost of producing sorted output.
     Unordered,
@@ -245,6 +249,7 @@ impl SortBenchMode {
         match self {
             SortBenchMode::Baseline => "baseline",
             SortBenchMode::Declared => "declared",
+            SortBenchMode::Pushdown => "pushdown",
             SortBenchMode::Unordered => "unordered",
         }
     }
@@ -272,6 +277,9 @@ pub struct SortBenchReport {
     pub plan: String,
     pub has_sort_exec: bool,
     pub has_sort_preserving_merge: bool,
+    /// Whether the plan contains a `BufferExec` (inserted by the sort-pushdown
+    /// optimizer rule when it eliminates a `SortExec`).
+    pub has_buffer_exec: bool,
     /// Time to build the table provider.
     pub provider: Duration,
     /// Time to plan the query.
@@ -372,6 +380,9 @@ pub async fn run_sort_bench_once(
         SortBenchMode::Declared => {
             builder.with_file_sort_order([FileSortColumn::asc(TIMESTAMP_COLUMN)])
         }
+        SortBenchMode::Pushdown => builder
+            .with_file_sort_order([FileSortColumn::asc(TIMESTAMP_COLUMN)])
+            .with_file_sort_order_grouping(false),
     };
     let provider = builder.await?;
     let provider_elapsed = provider_start.elapsed();
@@ -427,6 +438,7 @@ pub async fn run_sort_bench_once(
     Ok(SortBenchReport {
         has_sort_exec: rendered.contains("SortExec"),
         has_sort_preserving_merge: rendered.contains("SortPreservingMergeExec"),
+        has_buffer_exec: rendered.contains("BufferExec"),
         plan: rendered,
         provider: provider_elapsed,
         planning: planning_elapsed,

@@ -332,6 +332,131 @@ async fn delta_table_sorted_scan_avoids_sort() -> TestResult<()> {
     Ok(())
 }
 
+/// Create a Delta table whose files are all sorted by timestamp with fully
+/// non-overlapping ranges (single partition value), appended out of timestamp
+/// order so that the default file listing is not already min-sorted.
+async fn disjoint_delta_table() -> TestResult<DeltaTable> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "timestamp".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
+                false,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "part".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::String),
+                false,
+            ),
+        ])
+        .with_partition_columns(vec!["part"])
+        .await?;
+
+    for start in [200, 0, 300, 100] {
+        table = table
+            .write(vec![delta_write_batch("A", start, 100)?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 4);
+    Ok(table)
+}
+
+/// Plan and run `ORDER BY timestamp` against a provider with the file sort
+/// order declared but statistics-based file grouping disabled, with the
+/// `PushdownSort` optimizer rule toggled on or off.
+async fn plan_ungrouped_sorted_query(
+    table: &DeltaTable,
+    enable_sort_pushdown: bool,
+) -> TestResult<(String, Vec<RecordBatch>)> {
+    let ctx = create_session().into_inner();
+    ctx.sql(&format!(
+        "SET datafusion.optimizer.enable_sort_pushdown = {enable_sort_pushdown}"
+    ))
+    .await?
+    .collect()
+    .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .with_file_sort_order_grouping(false)
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value, part FROM test_table ORDER BY \"timestamp\"")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok((rendered, batches))
+}
+
+/// With statistics-based file grouping disabled, the declared ordering does
+/// not validate at planning time (the files are listed out of min/max order),
+/// so a `SortExec` is planned; DataFusion's sort-pushdown optimizer rule then
+/// reorders the files by statistics, restores the declared ordering, and
+/// eliminates the sort.
+#[tokio::test]
+async fn delta_table_sort_order_pushdown_avoids_sort() -> TestResult<()> {
+    let table = disjoint_delta_table().await?;
+
+    // Without the optimizer rule the query needs a full sort: the declared
+    // ordering alone is not enough while the file listing is unordered.
+    let (plan, batches) = plan_ungrouped_sorted_query(&table, false).await?;
+    assert!(
+        plan.contains("SortExec"),
+        "expected SortExec in plan without the pushdown rule:\n{plan}"
+    );
+    assert_sorted_result(&batches);
+
+    // With the rule, `try_pushdown_sort` reorders the disjoint files by their
+    // statistics and reports an exact ordering, so the sort is eliminated.
+    let (plan, batches) = plan_ungrouped_sorted_query(&table, true).await?;
+    assert!(
+        !plan.contains("SortExec"),
+        "expected the pushdown rule to eliminate the SortExec:\n{plan}"
+    );
+    assert_sorted_result(&batches);
+    Ok(())
+}
+
+/// Without statistics-based grouping, the sort pushdown can only reorder files
+/// within the existing groups; when files overlap it cannot claim an exact
+/// ordering and the full sort is kept, with correct results.
+#[tokio::test]
+async fn delta_table_sort_order_pushdown_keeps_sort_when_files_overlap() -> TestResult<()> {
+    let table = sorted_delta_table().await?;
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .with_file_sort_order_grouping(false)
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value, part FROM test_table ORDER BY \"timestamp\"")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+    assert_sorted_result(&batches);
+    Ok(())
+}
+
 /// When the query does not scan the declared sort column, the declared order
 /// cannot be exposed and the query falls back to a full sort with correct
 /// results.
@@ -388,3 +513,4 @@ async fn delta_table_sort_order_validation() -> TestResult<()> {
     assert!(err.to_string().contains("does not exist"), "{err}");
     Ok(())
 }
+

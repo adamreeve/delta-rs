@@ -111,14 +111,19 @@ cargo run --release -p delta-benchmarks -- sort-bench --table-path ./data/sorted
 
 For each mode the query `SELECT ... FROM t ORDER BY timestamp` is planned and
 streamed to completion, reporting plan shape (`sort_exec`, `spm` =
-SortPreservingMergeExec), planning time, time to first batch, total time, and
-whether the streamed rows were actually in order (`sorted`).
+SortPreservingMergeExec, `buffer` = BufferExec), planning time, time to first
+batch, total time, and whether the streamed rows were actually in order
+(`sorted`).
 
-- `--modes <baseline,declared,unordered>`: configurations to compare (default
-  all). `baseline` declares no ordering and needs a full `SortExec`;
-  `declared` uses `with_file_sort_order`; `unordered` drops the ORDER BY
-  entirely, reading in arbitrary order with no sorting needed, as a lower
-  bound for comparison.
+- `--modes <baseline,declared,pushdown,unordered>`: configurations to compare
+  (default all). `baseline` declares no ordering and needs a full `SortExec`;
+  `declared` uses `with_file_sort_order`, satisfying the ORDER BY at planning
+  time with a merge over parallel pre-grouped ordered partitions; `pushdown`
+  also declares the sort order but disables statistics-based file grouping,
+  leaving the ORDER BY to DataFusion's sort-pushdown optimizer rule (file
+  reorder at optimization time plus a `BufferExec` under the merge);
+  `unordered` drops the ORDER BY entirely, reading in arbitrary order with no
+  sorting needed, as a lower bound for comparison.
 - `--select-columns <n>`: number of extra float32 columns in the SELECT
   (default: all)
 - `--limit <n>`: add a LIMIT to exercise TopK / early termination
