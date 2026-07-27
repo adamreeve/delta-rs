@@ -185,16 +185,24 @@ fn resolve_file_sort_order(
 /// non-overlapping and ordered on the declared file sort order, so reading a
 /// group sequentially preserves that order.
 ///
-/// Falls back to the default grouping when statistics are unavailable or a
-/// group would exceed the file-id dictionary key space; the declared output
-/// ordering is then dropped by DataFusion's statistics-based validation of
-/// scan orderings rather than producing wrong results.
+/// The statistics-based grouping creates additional groups beyond the target
+/// partition count when file ranges overlap; with heavily overlapping files
+/// this degrades to one group per file. To bound the number of scan
+/// partitions, the result is only used when it stays within
+/// `max(64, 2 * target_partitions)` groups.
+///
+/// Falls back to the default grouping when that cap is exceeded, when
+/// statistics are unavailable, or when a group would exceed the file-id
+/// dictionary key space; the declared output ordering is then dropped by
+/// DataFusion's statistics-based validation of scan orderings rather than
+/// producing wrong results.
 fn split_file_groups_for_ordering(
     files: Vec<PartitionedFile>,
     ordering: &LexOrdering,
     table_schema: &SchemaRef,
     target_partitions: usize,
 ) -> Vec<FileGroup> {
+    let max_groups = usize::max(64, 2 * target_partitions);
     let flat = vec![FileGroup::new(files.clone())];
     match FileScanConfig::split_groups_by_statistics_with_target_partitions(
         table_schema,
@@ -203,16 +211,25 @@ fn split_file_groups_for_ordering(
         target_partitions.max(1),
     ) {
         Ok(groups)
-            if groups
-                .iter()
-                .all(|group| group.len() <= MAX_PARTITION_DICT_CARDINALITY) =>
+            if groups.len() <= max_groups
+                && groups
+                    .iter()
+                    .all(|group| group.len() <= MAX_PARTITION_DICT_CARDINALITY) =>
         {
             groups
         }
-        Ok(_) => {
-            debug!(
-                "file sort order grouping exceeded the file-id dictionary key space; falling back to default grouping"
-            );
+        Ok(groups) => {
+            if groups.len() > max_groups {
+                debug!(
+                    groups = groups.len(),
+                    max_groups,
+                    "file sort order grouping of heavily overlapping files produced too many groups; falling back to default grouping"
+                );
+            } else {
+                debug!(
+                    "file sort order grouping exceeded the file-id dictionary key space; falling back to default grouping"
+                );
+            }
             partitioned_files_to_file_groups(files)
         }
         Err(err) => {

@@ -699,6 +699,33 @@ async fn delta_table_fully_overlapping_files_one_group_per_file() -> TestResult<
     Ok(())
 }
 
+/// When overlapping files would need more groups than the cap of
+/// `max(64, 2 * target_partitions)` allows, the statistics-based grouping is
+/// abandoned: the scan uses the default grouping, DataFusion drops the
+/// unprovable ordering, and the query falls back to a full sort with correct
+/// results.
+#[tokio::test]
+async fn delta_table_overlapping_files_beyond_group_cap_fall_back() -> TestResult<()> {
+    // 65 mutually overlapping two-row files: file i covers [i, 1000 + i].
+    // With target_partitions = 1 the cap is max(64, 2) = 64, and mutual
+    // overlap would require one group per file (65).
+    let files: Vec<Vec<i64>> = (0i64..65).map(|i| vec![i, 1_000 + i]).collect();
+    let table = overlapping_delta_table(files).await?;
+    let (rendered, timestamps) = query_sorted_with_target_partitions(&table, 1).await?;
+
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("65 groups"),
+        "expected the grouping to fall back below one group per file:\n{rendered}"
+    );
+    assert_eq!(timestamps.len(), 130);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
 // --- Column-mapped table ---
 
 /// Physical parquet column names for the hand-written column-mapped table.
