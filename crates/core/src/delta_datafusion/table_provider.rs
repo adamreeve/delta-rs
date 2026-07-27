@@ -426,7 +426,7 @@ impl TableProviderBuilder {
     ///
     /// When set, scans expose this ordering to DataFusion, which can then avoid
     /// full sorts for queries whose `ORDER BY` matches (a prefix of) the file
-    /// sort order, provided file statistics show the files do not overlap.
+    /// sort order.
     ///
     /// The declared order is trusted: files whose data is not actually sorted
     /// this way will produce incorrectly ordered query results.
