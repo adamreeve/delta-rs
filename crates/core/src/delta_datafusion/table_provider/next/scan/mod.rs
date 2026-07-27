@@ -236,7 +236,7 @@ fn split_file_groups_for_ordering(
     table_schema: &SchemaRef,
     target_partitions: usize,
 ) -> Vec<FileGroup> {
-    let max_groups = usize::max(64, 2 * target_partitions);
+    let max_groups = usize::max(64, target_partitions.saturating_mul(2));
     let flat = vec![FileGroup::new(files.clone())];
     match FileScanConfig::split_groups_by_statistics_with_target_partitions(
         table_schema,
