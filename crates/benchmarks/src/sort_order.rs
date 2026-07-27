@@ -280,6 +280,9 @@ pub struct SortBenchParams {
     /// Override `datafusion.execution.target_partitions` (defaults to the
     /// number of CPU cores).
     pub target_partitions: Option<usize>,
+    /// Verify that the streamed timestamps are globally non-decreasing. Off by
+    /// default because the per-row check adds time to the measured run.
+    pub check_order: bool,
 }
 
 #[derive(Debug)]
@@ -299,8 +302,8 @@ pub struct SortBenchReport {
     pub rows: usize,
     pub batches: usize,
     /// Whether the streamed timestamps were globally non-decreasing; `None`
-    /// when the query had no ORDER BY (unordered mode) and order wasn't
-    /// checked.
+    /// when order wasn't checked (`check_order` disabled, or the query had no
+    /// ORDER BY in unordered mode).
     pub sorted: Option<bool>,
     /// Description of the first out-of-order row, when `sorted` is false.
     pub first_violation: Option<String>,
@@ -359,6 +362,7 @@ struct SequentialReadState {
     first_batch: Option<Duration>,
     rows: usize,
     batches: usize,
+    check_order: bool,
     sorted: bool,
     first_violation: Option<String>,
     last_ts: Option<i64>,
@@ -366,12 +370,13 @@ struct SequentialReadState {
 }
 
 impl SequentialReadState {
-    fn new(exec_start: Instant, limit: Option<usize>) -> Self {
+    fn new(exec_start: Instant, limit: Option<usize>, check_order: bool) -> Self {
         Self {
             exec_start,
             first_batch: None,
             rows: 0,
             batches: 0,
+            check_order,
             sorted: true,
             first_violation: None,
             last_ts: None,
@@ -390,26 +395,28 @@ impl SequentialReadState {
             self.first_batch = Some(self.exec_start.elapsed());
         }
         self.batches += 1;
-        let timestamps = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .ok_or_else(|| DeltaTableError::generic("unexpected type for timestamp column"))?
-            .values();
-        for (row, &ts) in timestamps.iter().enumerate() {
-            if let Some(last) = self.last_ts {
-                if ts < last {
-                    self.sorted = false;
-                    if self.first_violation.is_none() {
-                        self.first_violation = Some(format!(
-                            "batch={} row={} ts={ts} previous_ts={last}",
-                            self.batches,
-                            self.rows + row
-                        ));
+        if self.check_order {
+            let timestamps = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| DeltaTableError::generic("unexpected type for timestamp column"))?
+                .values();
+            for (row, &ts) in timestamps.iter().enumerate() {
+                if let Some(last) = self.last_ts {
+                    if ts < last {
+                        self.sorted = false;
+                        if self.first_violation.is_none() {
+                            self.first_violation = Some(format!(
+                                "batch={} row={} ts={ts} previous_ts={last}",
+                                self.batches,
+                                self.rows + row
+                            ));
+                        }
                     }
                 }
+                self.last_ts = Some(ts);
             }
-            self.last_ts = Some(ts);
         }
         self.rows += batch.num_rows();
         if let Some(remaining) = self.remaining.as_mut() {
@@ -433,8 +440,8 @@ impl SequentialReadState {
 /// sync arrow reader over `std::fs::File` or, when `async_reader` is set, the
 /// async arrow reader over `tokio::fs::File`. `memory_limit_bytes` and
 /// `target_partitions` are ignored. The batch size matches DataFusion's
-/// default (8192) and the output ordering is verified exactly like in the
-/// DataFusion modes.
+/// default (8192) and, when `check_order` is set, the output ordering is
+/// verified exactly like in the DataFusion modes.
 async fn run_sequential_read(
     table_url: &Url,
     params: &SortBenchParams,
@@ -475,7 +482,7 @@ async fn run_sequential_read(
     let provider_elapsed = provider_start.elapsed();
 
     let exec_start = Instant::now();
-    let mut state = SequentialReadState::new(exec_start, params.limit);
+    let mut state = SequentialReadState::new(exec_start, params.limit, params.check_order);
     'files: for (_, path) in &files {
         if async_reader {
             let file = tokio::fs::File::open(path).await?;
@@ -521,7 +528,7 @@ async fn run_sequential_read(
         total,
         rows: state.rows,
         batches: state.batches,
-        sorted: Some(state.sorted),
+        sorted: state.check_order.then_some(state.sorted),
         first_violation: state.first_violation,
         peak_rss_mb: peak_rss_mb(),
     })
@@ -586,7 +593,7 @@ pub async fn run_sort_bench_once(
     let planning_elapsed = planning_start.elapsed();
     let rendered = displayable(plan.as_ref()).indent(true).to_string();
 
-    let check_order = params.mode != SortBenchMode::Unordered;
+    let check_order = params.check_order && params.mode != SortBenchMode::Unordered;
     let exec_start = Instant::now();
     let mut stream = execute_stream(plan, ctx.task_ctx())?;
     let mut first_batch = None;

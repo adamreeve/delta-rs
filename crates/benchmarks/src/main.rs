@@ -125,6 +125,12 @@ enum Command {
         #[arg(long)]
         target_partitions: Option<usize>,
 
+        /// Verify that the streamed timestamps are globally non-decreasing.
+        /// Off by default because the per-row check adds time to the measured
+        /// run.
+        #[arg(long)]
+        check_order: bool,
+
         /// Print the physical plan for the first iteration of each mode
         #[arg(long)]
         show_plan: bool,
@@ -235,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
             iterations,
             memory_limit_gb,
             target_partitions,
+            check_order,
             show_plan,
         } => {
             let table_url = ensure_table_uri(table_path.to_string_lossy().as_ref())?;
@@ -260,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
                     limit,
                     memory_limit_bytes,
                     target_partitions,
+                    check_order,
                 };
                 for iter in 0..iterations {
                     let report = run_sort_bench_once(&table_url, &params).await?;
