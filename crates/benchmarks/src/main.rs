@@ -249,7 +249,9 @@ async fn main() -> anyhow::Result<()> {
             });
             let memory_limit_bytes = match memory_limit_gb {
                 0 => None,
-                gb => Some(gb * 1024 * 1024 * 1024),
+                gb => Some(gb.checked_mul(1024 * 1024 * 1024).ok_or_else(|| {
+                    anyhow::anyhow!("--memory-limit-gb {gb} is too large to convert to bytes")
+                })?),
             };
             for mode in modes {
                 let params = SortBenchParams {

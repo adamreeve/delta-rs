@@ -652,10 +652,10 @@ async fn get_read_plan(
             }
         }
 
-        let files = files.into_iter().map(|file| file.0).collect_vec();
+        let files = files.into_iter().map(|file| file.0);
         let file_groups = match &file_sort_order {
             Some(ordering) => split_file_groups_for_ordering(
-                files,
+                files.collect(),
                 ordering,
                 &full_table_schema,
                 state.config().options().execution.target_partitions,
