@@ -3,7 +3,6 @@
 //! This module implements [`DeltaScanExec`], the core execution plan that reads Parquet files
 //! and applies Delta Lake protocol transformations to produce logical table data.
 
-use std::any::Any;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -260,10 +259,6 @@ impl ExecutionPlan for DeltaScanExec {
         "DeltaScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -381,10 +376,10 @@ impl ExecutionPlan for DeltaScanExec {
         Some(Arc::new(new_plan))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        self.input
-            .partition_statistics(partition)
-            .and_then(|stats| self.map_statistics(stats))
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        let stats = self.input.partition_statistics(partition)?;
+        self.map_statistics(Arc::unwrap_or_clone(stats))
+            .map(Arc::new)
     }
 
     fn gather_filters_for_pushdown(
@@ -821,7 +816,7 @@ mod tests {
             .scan(&session.state(), None, &[col("letter").eq(lit("b"))], None)
             .await?;
 
-        let downcast = scan.as_any().downcast_ref::<DeltaScanExec>();
+        let downcast = scan.downcast_ref::<DeltaScanExec>();
         assert!(downcast.is_some());
         assert_eq!(downcast.unwrap().file_id_column.as_deref(), Some("file_id"));
 
@@ -898,7 +893,7 @@ mod tests {
             .scan(&session.state(), Some(&vec![id_idx]), &[], None)
             .await?;
 
-        let downcast = scan.as_any().downcast_ref::<DeltaScanExec>();
+        let downcast = scan.downcast_ref::<DeltaScanExec>();
         assert!(downcast.is_some());
         assert!(downcast.unwrap().file_id_column.is_none());
 
@@ -933,7 +928,6 @@ mod tests {
         let session = Arc::new(create_session().into_inner());
         let scan = provider.scan(&session.state(), None, &[], None).await?;
         let exec = scan
-            .as_any()
             .downcast_ref::<DeltaScanExec>()
             .expect("expected DeltaScanExec");
 
@@ -968,7 +962,6 @@ mod tests {
         let session = Arc::new(create_session().into_inner());
         let scan = provider.scan(&session.state(), None, &[], None).await?;
         let exec = scan
-            .as_any()
             .downcast_ref::<DeltaScanExec>()
             .expect("expected DeltaScanExec");
 
@@ -1006,7 +999,6 @@ mod tests {
         let session = Arc::new(create_session().into_inner());
         let scan = provider.scan(&session.state(), None, &[], None).await?;
         let exec = scan
-            .as_any()
             .downcast_ref::<DeltaScanExec>()
             .expect("expected DeltaScanExec");
 
@@ -1045,7 +1037,6 @@ mod tests {
         let session = Arc::new(create_session().into_inner());
         let scan = provider.scan(&session.state(), None, &[], None).await?;
         let exec = scan
-            .as_any()
             .downcast_ref::<DeltaScanExec>()
             .expect("expected DeltaScanExec");
 
@@ -1082,7 +1073,6 @@ mod tests {
         let session = Arc::new(create_session().into_inner());
         let scan = provider.scan(&session.state(), None, &[], None).await?;
         let exec = scan
-            .as_any()
             .downcast_ref::<DeltaScanExec>()
             .expect("expected DeltaScanExec");
 
@@ -1140,7 +1130,7 @@ mod tests {
             .scan(&session.state(), None, &[col("letter").eq(lit("b"))], None)
             .await?;
 
-        let downcast = scan.as_any().downcast_ref::<DeltaScanExec>();
+        let downcast = scan.downcast_ref::<DeltaScanExec>();
         assert!(downcast.is_some());
         assert!(downcast.unwrap().file_id_column.is_none());
 
@@ -1293,7 +1283,7 @@ mod tests {
         let filename_col = batches[0]
             .column_by_name("filename")
             .unwrap()
-            .as_string::<i32>();
+            .as_string_view();
 
         for i in 0..filename_col.len() {
             let filename = filename_col.value(i);
@@ -1480,7 +1470,7 @@ mod tests {
 
         let scan = provider.scan(&session.state(), None, &[], None).await?;
 
-        let downcast = scan.as_any().downcast_ref::<DeltaScanExec>();
+        let downcast = scan.downcast_ref::<DeltaScanExec>();
         assert!(downcast.is_some(), "Expected DeltaScanExec for DV test");
 
         let batches = collect(scan, session.task_ctx()).await?;
@@ -1510,7 +1500,6 @@ mod tests {
 
         let scan = provider.scan(&session.state(), None, &[], None).await?;
         let exec = scan
-            .as_any()
             .downcast_ref::<DeltaScanExec>()
             .expect("Expected DeltaScanExec");
 
@@ -1538,7 +1527,6 @@ mod tests {
 
         let scan = provider.scan(&session.state(), None, &[], None).await?;
         let exec = scan
-            .as_any()
             .downcast_ref::<DeltaScanExec>()
             .expect("Expected DeltaScanExec");
 
@@ -1670,7 +1658,6 @@ mod tests {
         let session = Arc::new(create_session().into_inner());
         let scan = provider.scan(&session.state(), None, &[], None).await?;
         let exec = scan
-            .as_any()
             .downcast_ref::<DeltaScanExec>()
             .expect("expected DeltaScanExec");
 
@@ -1709,7 +1696,6 @@ mod tests {
         let session = Arc::new(create_session().into_inner());
         let scan = provider.scan(&session.state(), None, &[], None).await?;
         let exec = scan
-            .as_any()
             .downcast_ref::<DeltaScanExec>()
             .expect("expected DeltaScanExec");
 

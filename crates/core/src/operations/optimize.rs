@@ -1566,7 +1566,6 @@ pub(super) mod zorder {
         use ::datafusion::prelude::SessionContext;
         use arrow_schema::DataType;
         use itertools::Itertools;
-        use std::any::Any;
 
         pub const ZORDER_UDF_NAME: &str = "zorder_key";
 
@@ -1595,10 +1594,6 @@ pub(super) mod zorder {
         pub struct ZOrderUDF;
 
         impl ScalarUDFImpl for ZOrderUDF {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-
             fn name(&self) -> &str {
                 ZORDER_UDF_NAME
             }

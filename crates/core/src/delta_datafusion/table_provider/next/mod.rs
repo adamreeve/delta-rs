@@ -25,7 +25,6 @@
 //! - planning the physical data file reads based on Datafusion's abstractions
 //! - applying Delta features by transforming the physical data into the table's logical schema
 //!
-use std::any::Any;
 use std::collections::HashSet;
 use std::{borrow::Cow, sync::Arc};
 
@@ -481,10 +480,6 @@ impl DeltaScan {
 
 #[async_trait::async_trait]
 impl TableProvider for DeltaScan {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.full_schema.clone()
     }
@@ -753,7 +748,6 @@ mod tests {
         ) -> Result<bool, DataFusionError> {
             let Some(scan_config) = datasource_exec
                 .data_source()
-                .as_any()
                 .downcast_ref::<FileScanConfig>()
             else {
                 return Ok(true);
@@ -773,11 +767,11 @@ mod tests {
         type Error = DataFusionError;
 
         fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
-            if let Some(delta_scan_exec) = plan.as_any().downcast_ref::<scan::DeltaScanExec>() {
+            if let Some(delta_scan_exec) = plan.downcast_ref::<scan::DeltaScanExec>() {
                 return self.pre_visit_delta_scan(delta_scan_exec);
             };
 
-            if let Some(datasource_exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
+            if let Some(datasource_exec) = plan.downcast_ref::<DataSourceExec>() {
                 return self.pre_visit_data_source(datasource_exec);
             }
 
@@ -795,20 +789,16 @@ mod tests {
         type Error = DataFusionError;
 
         fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
-            let Some(datasource_exec) = plan.as_any().downcast_ref::<DataSourceExec>() else {
+            let Some(datasource_exec) = plan.downcast_ref::<DataSourceExec>() else {
                 return Ok(true);
             };
             let Some(scan_config) = datasource_exec
                 .data_source()
-                .as_any()
                 .downcast_ref::<FileScanConfig>()
             else {
                 return Ok(true);
             };
-            let Some(parquet_source) = scan_config
-                .file_source
-                .as_any()
-                .downcast_ref::<ParquetSource>()
+            let Some(parquet_source) = scan_config.file_source.downcast_ref::<ParquetSource>()
             else {
                 return Ok(true);
             };
