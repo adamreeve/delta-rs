@@ -440,6 +440,14 @@ impl TableProviderBuilder {
     /// the leading sort columns whose file statistics prove they contain no
     /// nulls: each file's nulls would otherwise surface mid-stream, where they
     /// violate the ordering.
+    ///
+    /// Overlap between sort-column values in different files is handled.
+    /// Files are grouped such each group has non-overlapping values,
+    /// and then groups are merged using a sort-preserving merge.
+    /// The sorted result remains correct as long as each file is internally in
+    /// the declared order.
+    /// The number of groups is bounded, however, so if the reordering requires
+    /// too many groups, DataFusion will fall back to a regular sort.
     pub fn with_file_sort_order(
         mut self,
         columns: impl IntoIterator<Item = FileSortColumn>,
