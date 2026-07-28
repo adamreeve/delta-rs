@@ -808,8 +808,7 @@ async fn delta_table_overlapping_files_beyond_group_cap_fall_back() -> TestResul
 /// A batch over the nullable-timestamp schema: the given seconds ascending,
 /// followed by `nulls` null timestamps (nulls last).
 fn nullable_batch(seconds: Vec<i64>, nulls: usize) -> TestResult<RecordBatch> {
-    let mut timestamps: Vec<Option<i64>> =
-        seconds.iter().map(|s| Some(s * 1_000_000)).collect();
+    let mut timestamps: Vec<Option<i64>> = seconds.iter().map(|s| Some(s * 1_000_000)).collect();
     let mut values: Vec<i64> = seconds;
     for i in 0..nulls {
         timestamps.push(None);
@@ -1049,10 +1048,7 @@ fn create_column_mapped_table(root: &std::path::Path) -> TestResult<()> {
 
     let log_dir = root.join("_delta_log");
     std::fs::create_dir_all(&log_dir)?;
-    let commit: String = actions
-        .iter()
-        .map(|action| format!("{action}\n"))
-        .collect();
+    let commit: String = actions.iter().map(|action| format!("{action}\n")).collect();
     std::fs::write(log_dir.join("00000000000000000000.json"), commit)?;
     Ok(())
 }
