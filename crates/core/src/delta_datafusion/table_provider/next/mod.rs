@@ -327,11 +327,39 @@ pub struct DeletionVectorSelection {
     pub keep_mask: Vec<bool>,
 }
 
+/// Whether `path`, interpreted as a dot-separated path starting at a
+/// top-level column, resolves to a nested field of the schema. Used to
+/// distinguish a nested field reference from a plain unknown column when
+/// producing validation errors.
+fn resolves_to_nested_field(schema: &SchemaRef, path: &str) -> bool {
+    let mut parts = path.split('.');
+    let Some(root) = parts.next() else {
+        return false;
+    };
+    let Ok(field) = schema.field_with_name(root) else {
+        return false;
+    };
+    let mut data_type = field.data_type();
+    let mut nested = false;
+    for part in parts {
+        let DataType::Struct(fields) = data_type else {
+            return false;
+        };
+        let Some(child) = fields.iter().find(|field| field.name() == part) else {
+            return false;
+        };
+        data_type = child.data_type();
+        nested = true;
+    }
+    nested
+}
+
 impl DeltaScan {
     // create new delta scan
     pub fn new(snapshot: impl Into<SnapshotWrapper>, config: DeltaScanConfig) -> Result<Self> {
         let snapshot = snapshot.into();
         let scan_schema = config.table_schema(snapshot.table_configuration())?;
+        Self::validate_file_sort_order(&config, &snapshot, &scan_schema)?;
         let full_schema = if let Some(file_id_column) =
             config.provider_file_id_column(None, scan_schema.as_ref())
         {
@@ -410,6 +438,49 @@ impl DeltaScan {
     pub(crate) fn with_operation_id(mut self, operation_id: Uuid) -> Self {
         self.read_operation_id = Some(operation_id);
         self
+    }
+
+    /// Validate that a configured file sort order only references distinct
+    /// top-level data columns that exist in the scan schema. Partition columns
+    /// are materialized above the parquet scan, so they cannot participate in
+    /// a file-level sort order, and nested fields are not supported.
+    fn validate_file_sort_order(
+        config: &DeltaScanConfig,
+        snapshot: &SnapshotWrapper,
+        scan_schema: &SchemaRef,
+    ) -> Result<()> {
+        let partition_columns = snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        let mut seen = std::collections::HashSet::new();
+        for sort_column in &config.file_sort_order {
+            if !seen.insert(sort_column.column.as_str()) {
+                return Err(DataFusionError::Plan(format!(
+                    "file sort order column '{}' is declared more than once",
+                    sort_column.column
+                )));
+            }
+            if partition_columns.contains(&sort_column.column) {
+                return Err(DataFusionError::Plan(format!(
+                    "file sort order column '{}' is a partition column; only data columns can participate in a file sort order",
+                    sort_column.column
+                )));
+            }
+            if scan_schema.field_with_name(&sort_column.column).is_err() {
+                if resolves_to_nested_field(scan_schema, &sort_column.column) {
+                    return Err(DataFusionError::Plan(format!(
+                        "file sort order column '{}' is a nested field reference; only top-level columns can participate in a file sort order",
+                        sort_column.column
+                    )));
+                }
+                return Err(DataFusionError::Plan(format!(
+                    "file sort order column '{}' does not exist in the scan schema",
+                    sort_column.column
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn ensure_supported_reader_features(&self) -> std::result::Result<(), TransactionError> {
