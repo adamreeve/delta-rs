@@ -327,6 +327,33 @@ pub struct DeletionVectorSelection {
     pub keep_mask: Vec<bool>,
 }
 
+/// Whether `path`, interpreted as a dot-separated path starting at a
+/// top-level column, resolves to a nested field of the schema. Used to
+/// distinguish a nested field reference from a plain unknown column when
+/// producing validation errors.
+fn resolves_to_nested_field(schema: &SchemaRef, path: &str) -> bool {
+    let mut parts = path.split('.');
+    let Some(root) = parts.next() else {
+        return false;
+    };
+    let Ok(field) = schema.field_with_name(root) else {
+        return false;
+    };
+    let mut data_type = field.data_type();
+    let mut nested = false;
+    for part in parts {
+        let DataType::Struct(fields) = data_type else {
+            return false;
+        };
+        let Some(child) = fields.iter().find(|field| field.name() == part) else {
+            return false;
+        };
+        data_type = child.data_type();
+        nested = true;
+    }
+    nested
+}
+
 impl DeltaScan {
     // create new delta scan
     pub fn new(snapshot: impl Into<SnapshotWrapper>, config: DeltaScanConfig) -> Result<Self> {
@@ -441,9 +468,9 @@ impl DeltaScan {
                 )));
             }
             if scan_schema.field_with_name(&sort_column.column).is_err() {
-                if sort_column.column.contains('.') {
+                if resolves_to_nested_field(scan_schema, &sort_column.column) {
                     return Err(DataFusionError::Plan(format!(
-                        "file sort order column '{}' looks like a nested field reference; only top-level columns can participate in a file sort order",
+                        "file sort order column '{}' is a nested field reference; only top-level columns can participate in a file sort order",
                         sort_column.column
                     )));
                 }

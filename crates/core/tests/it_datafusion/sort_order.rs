@@ -10,7 +10,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::physical_plan::displayable;
 use deltalake_core::DeltaTable;
 use deltalake_core::delta_datafusion::{FileSortColumn, create_session};
-use deltalake_core::kernel::{DataType as DeltaDataType, PrimitiveType, StructField};
+use deltalake_core::kernel::{DataType as DeltaDataType, PrimitiveType, StructField, StructType};
 use deltalake_core::protocol::SaveMode;
 use deltalake_test::TestResult;
 
@@ -229,7 +229,35 @@ async fn delta_table_sort_order_validation() -> TestResult<()> {
         .expect_err("unknown column sort order should be rejected");
     assert!(err.to_string().contains("does not exist"), "{err}");
 
+    // A dotted name that does not resolve to a nested field is reported as a
+    // plain unknown column, not as a nested field reference.
     let err = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("nested.field")])
+        .await
+        .expect_err("unknown dotted column sort order should be rejected");
+    assert!(err.to_string().contains("does not exist"), "{err}");
+
+    let struct_table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "timestamp".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
+                false,
+            ),
+            StructField::new(
+                "nested".to_string(),
+                DeltaDataType::Struct(Box::new(StructType::try_new(vec![StructField::new(
+                    "field".to_string(),
+                    DeltaDataType::Primitive(PrimitiveType::Long),
+                    true,
+                )])?)),
+                true,
+            ),
+        ])
+        .await?;
+    let err = struct_table
         .table_provider()
         .with_file_sort_order([FileSortColumn::asc("nested.field")])
         .await
