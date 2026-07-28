@@ -111,8 +111,9 @@ cargo run --release -p delta-benchmarks -- sort-bench --table-path ./data/sorted
 
 For each mode the query `SELECT ... FROM t ORDER BY timestamp` is planned and
 streamed to completion, reporting plan shape (`sort_exec`, `spm` =
-SortPreservingMergeExec), planning time, time to first batch, total time, and
-whether the streamed rows were actually in order (`sorted`).
+SortPreservingMergeExec), planning time, time to first batch, total time, and —
+when `--check-order` is passed — whether the streamed rows were actually in
+order (`sorted`).
 
 - `--modes <baseline,declared,unordered,sequential-read,sequential-read-async>`:
   configurations to compare (default all). `baseline` declares no ordering and
@@ -138,4 +139,8 @@ whether the streamed rows were actually in order (`sorted`).
   baseline full sort spills instead of exhausting memory (default 0 = no
   limit)
 - `--target-partitions <n>`: override `datafusion.execution.target_partitions`
+- `--check-order`: verify that the streamed timestamps are globally
+  non-decreasing, reported as `sorted` with a description of the first
+  violation. Off by default because the per-row check adds time to the
+  measured run.
 - `--show-plan`: print the physical plan for the first iteration of each mode
