@@ -137,6 +137,43 @@ async fn delta_table_sorted_scan_avoids_sort() -> TestResult<()> {
     Ok(())
 }
 
+/// A LIMIT on an ordered query needs no TopK sort when the file sort order is
+/// declared: the fetch terminates the pre-ordered scan early instead.
+#[tokio::test]
+async fn delta_table_sort_order_limit_avoids_topk() -> TestResult<()> {
+    let table = sorted_delta_table().await?;
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value, part FROM test_table ORDER BY \"timestamp\" LIMIT 10")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec (TopK) in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("fetch=10"),
+        "expected the limit to be pushed into the plan as fetch=10:\n{rendered}"
+    );
+    let timestamps = collect_timestamps(&batches);
+    let expected: Vec<i64> = (0..10).map(|s| s * 1_000_000).collect();
+    assert_eq!(
+        timestamps, expected,
+        "expected the 10 smallest timestamps in order"
+    );
+    Ok(())
+}
+
 /// When the query does not scan the declared sort column, the declared order
 /// cannot be exposed and the query falls back to a full sort with correct
 /// results.
