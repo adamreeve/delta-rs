@@ -989,9 +989,11 @@ async fn delta_table_overlapping_files_beyond_group_cap_fall_back() -> TestResul
 // - `enable_round_robin_repartition` inserts a round-robin `RepartitionExec`
 //   above a scan that benefits from input partitioning.
 //   `RepartitionExec::partition_statistics` marks all column statistics
-//   inexact, so `ProgressiveEvalRule` bails.
-//   `DeltaScanExec::benefits_from_input_partitioning` opts out of this
-//   when the scan declares an output ordering.
+//   inexact, so the partition ranges become unprovable, and `EnforceSorting`
+//   adds a `SortExec` to repair the ordering the repartition destroyed.
+//   `ProgressiveEvalRule` handles this by stripping the round-robin
+//   repartition (and the sort it made redundant) when the stripped plan
+//   qualifies for `ProgressiveEvalExec`, keeping the repartition otherwise.
 // - `repartition_file_scans` splits single-file groups into byte ranges at
 //   the source. Each range carries the whole file's statistics, so
 //   partitions reading ranges of the same file have overlapping min/max and
@@ -1038,10 +1040,12 @@ async fn delta_table_more_target_partitions_than_files_file_split_defeats_progre
     Ok(())
 }
 
-/// With `repartition_file_scans` disabled, the scan keeps fewer partitions
-/// than the target: no round-robin `RepartitionExec` is inserted above it
-/// (the scan does not benefit from input partitioning), the scan partitions
-/// stay non-overlapping, and the merge is replaced by `ProgressiveEvalExec`.
+/// With `repartition_file_scans` disabled, the scan keeps its per-file
+/// partitions. `EnforceDistribution` inserts a round-robin `RepartitionExec`
+/// to reach the target partition count (and `EnforceSorting` a `SortExec` to
+/// repair the ordering it destroys), but `ProgressiveEvalRule` strips both:
+/// the scan partitions stay non-overlapping and the merge is replaced by
+/// `ProgressiveEvalExec`.
 #[tokio::test]
 async fn delta_table_more_target_partitions_than_files_uses_progressive_eval() -> TestResult<()> {
     let table = overlapping_delta_table(two_non_overlapping_files()).await?;
@@ -1077,10 +1081,10 @@ async fn delta_table_more_target_partitions_than_files_uses_progressive_eval() -
     Ok(())
 }
 
-/// Without a declared sort order there are no ordering claims to protect, so
-/// the scan keeps the default behaviour and benefits from input partitioning:
-/// a round-robin `RepartitionExec` raises the scan's parallelism to the
-/// target partition count.
+/// Without a declared sort order the scan partitions have no provable
+/// ordering, so `ProgressiveEvalRule` leaves the plan alone: the round-robin
+/// `RepartitionExec` raising the scan's parallelism to the target partition
+/// count is kept.
 #[tokio::test]
 async fn delta_table_unordered_scan_gets_round_robin_repartition() -> TestResult<()> {
     let table = overlapping_delta_table(two_non_overlapping_files()).await?;
@@ -1110,6 +1114,44 @@ async fn delta_table_unordered_scan_gets_round_robin_repartition() -> TestResult
     let timestamps = collect_timestamps(&batches);
     assert_eq!(timestamps.len(), 200);
     assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
+/// A query with no ORDER BY has no merge to optimize, so declaring a file
+/// sort order must not cost the scan its parallelism: the round-robin
+/// `RepartitionExec` raising the scan's partition count to the target is
+/// kept.
+#[tokio::test]
+async fn delta_table_ordered_scan_unordered_query_gets_round_robin_repartition() -> TestResult<()> {
+    let table = overlapping_delta_table(two_non_overlapping_files()).await?;
+
+    let ctx = create_session().into_inner();
+    for (key, value) in MANY_CORE_OPTIONS
+        .iter()
+        .copied()
+        .chain([("datafusion.optimizer.repartition_file_scans", "false")])
+    {
+        ctx.sql(&format!("SET {key} = {value}")).await?;
+    }
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value FROM test_table")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        rendered.contains("RoundRobinBatch"),
+        "expected round-robin RepartitionExec in plan:\n{rendered}"
+    );
+
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let timestamps = collect_timestamps(&batches);
+    assert_eq!(timestamps.len(), 200);
     Ok(())
 }
 

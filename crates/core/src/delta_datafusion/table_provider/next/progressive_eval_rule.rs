@@ -10,11 +10,13 @@
 
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Statistics;
-use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, ScalarValue};
-use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{LexOrdering, Partitioning};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties as _};
 
@@ -47,12 +49,27 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
             else {
                 return Ok(Transformed::no(plan));
             };
-            let input = merge.input();
-            let Some(ranges) = ordered_partition_ranges(input, merge.expr()) else {
+            // Round-robin repartitioning inserted for parallelism defeats this
+            // optimization: `RepartitionExec` reports all column statistics as
+            // inexact, and interleaving batches destroys the per-partition
+            // ranges anyway. A serial progressive evaluation gains nothing from
+            // the extra partitions, so strip such repartitions and test whether
+            // the stripped plan qualifies. If it does not, keep the original
+            // plan (and its parallelism).
+            let input = remove_parallelism_nodes(Arc::clone(merge.input()))?;
+            // Stripping a repartition can only expose more ordering, but be
+            // defensive: each partition of the new input must still be sorted
+            // by the merge ordering for concatenation to be valid.
+            if !input
+                .equivalence_properties()
+                .ordering_satisfy(merge.expr().iter().cloned())?
+            {
+                return Ok(Transformed::no(plan));
+            }
+            let Some(ranges) = ordered_partition_ranges(&input, merge.expr()) else {
                 return Ok(Transformed::no(plan));
             };
-            let replacement =
-                ProgressiveEvalExec::new(Arc::clone(input), Some(ranges), merge.fetch());
+            let replacement = ProgressiveEvalExec::new(input, Some(ranges), merge.fetch());
             Ok(Transformed::yes(Arc::new(replacement) as _))
         })
         .data()
@@ -65,6 +82,67 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// Remove plan nodes that only exist to raise or repair parallelism from the
+/// subtree feeding a merge, where they defeat this optimization without
+/// benefiting a serial progressive evaluation:
+///
+/// - Round-robin [`RepartitionExec`] nodes are inserted purely to spread work
+///   across partitions. Hash repartitions (which place rows deliberately) are
+///   left alone.
+/// - [`SortExec`] nodes whose input already satisfies their ordering are
+///   typically left behind by the repartition removal: `EnforceSorting` adds
+///   them to repair the ordering the repartition destroyed. Being blocking
+///   operators, they would also forfeit the streaming behaviour of
+///   [`ProgressiveEvalExec`]. Sorts with a fetch limit their output, so they
+///   are kept.
+///
+/// Sorts are checked in a second pass so that each check sees the input's
+/// ordering as recomputed after the repartition below it was removed.
+/// Traversal stops at a nested [`SortPreservingMergeExec`], whose subtree is
+/// considered on its own when the enclosing `transform_down` reaches it.
+fn remove_parallelism_nodes(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    let stripped = plan
+        .transform_down(|plan| {
+            let plan_ref = plan.as_ref() as &dyn ExecutionPlan;
+            if let Some(repartition) = plan_ref.downcast_ref::<RepartitionExec>() {
+                if matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_)) {
+                    return Ok(Transformed::new(
+                        Arc::clone(repartition.input()),
+                        true,
+                        TreeNodeRecursion::Continue,
+                    ));
+                }
+            } else if plan_ref.downcast_ref::<SortPreservingMergeExec>().is_some() {
+                return Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump));
+            }
+            Ok(Transformed::no(plan))
+        })
+        .data()?;
+    stripped
+        .transform_down(|plan| {
+            let plan_ref = plan.as_ref() as &dyn ExecutionPlan;
+            if let Some(sort) = plan_ref.downcast_ref::<SortExec>() {
+                if sort.fetch().is_none()
+                    && sort.preserve_partitioning()
+                    && sort
+                        .input()
+                        .equivalence_properties()
+                        .ordering_satisfy(sort.expr().iter().cloned())?
+                {
+                    return Ok(Transformed::new(
+                        Arc::clone(sort.input()),
+                        true,
+                        TreeNodeRecursion::Continue,
+                    ));
+                }
+            } else if plan_ref.downcast_ref::<SortPreservingMergeExec>().is_some() {
+                return Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump));
+            }
+            Ok(Transformed::no(plan))
+        })
+        .data()
 }
 
 /// To be able to convert to a ProgressiveEval, we need the partitions to
@@ -192,8 +270,21 @@ mod tests {
 
     impl StatsExec {
         fn new(stats: Vec<Statistics>) -> Arc<dyn ExecutionPlan> {
+            Self::with_ordering(stats, None)
+        }
+
+        fn with_ordering(
+            stats: Vec<Statistics>,
+            ordering: Option<LexOrdering>,
+        ) -> Arc<dyn ExecutionPlan> {
+            let eq_properties = match ordering {
+                Some(ordering) => {
+                    EquivalenceProperties::new_with_orderings(test_schema(), vec![ordering])
+                }
+                None => EquivalenceProperties::new(test_schema()),
+            };
             let cache = Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(test_schema()),
+                eq_properties,
                 Partitioning::UnknownPartitioning(stats.len()),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
@@ -554,5 +645,152 @@ mod tests {
         let ordering = LexOrdering::new(vec![asc(1, "id")]).unwrap();
 
         assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    fn t_asc_ordering() -> LexOrdering {
+        LexOrdering::new(vec![asc(0, "t")]).unwrap()
+    }
+
+    /// Ordered scan with two non-overlapping partitions.
+    fn non_overlapping_ordered_scan() -> Arc<dyn ExecutionPlan> {
+        StatsExec::with_ordering(
+            vec![
+                partition(vec![exact_i64(0, 99, 0), exact_i64(0, 10, 0)]),
+                partition(vec![exact_i64(100, 200, 0), exact_i64(0, 10, 0)]),
+            ],
+            Some(t_asc_ordering()),
+        )
+    }
+
+    fn optimize(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        ProgressiveEvalRule::new()
+            .optimize(plan, &ConfigOptions::default())
+            .unwrap()
+    }
+
+    #[test]
+    fn round_robin_repartition_and_redundant_sort_are_removed() {
+        // The shape EnforceDistribution + EnforceSorting leave behind when
+        // parallelising an ordered scan: a round-robin repartition raising
+        // the partition count and a sort repairing the ordering it destroyed.
+        let repartition = Arc::new(
+            RepartitionExec::try_new(
+                non_overlapping_ordered_scan(),
+                Partitioning::RoundRobinBatch(4),
+            )
+            .unwrap(),
+        );
+        let sort =
+            Arc::new(SortExec::new(t_asc_ordering(), repartition).with_preserve_partitioning(true));
+        let merge = Arc::new(SortPreservingMergeExec::new(t_asc_ordering(), sort));
+
+        let optimized = optimize(merge);
+
+        let progressive = (optimized.as_ref() as &dyn ExecutionPlan)
+            .downcast_ref::<ProgressiveEvalExec>()
+            .expect("expected ProgressiveEvalExec");
+        assert!(
+            (progressive.input().as_ref() as &dyn ExecutionPlan)
+                .downcast_ref::<StatsExec>()
+                .is_some(),
+            "expected repartition and sort to be stripped from the input"
+        );
+    }
+
+    #[test]
+    fn sort_with_fetch_is_kept() {
+        // A sort with a fetch limits its output; removing it would change
+        // results, so it must survive even when the ordering is redundant.
+        // Its statistics account for the fetch and become inexact, so the
+        // whole optimization bails and the original plan is kept.
+        let repartition = Arc::new(
+            RepartitionExec::try_new(
+                non_overlapping_ordered_scan(),
+                Partitioning::RoundRobinBatch(4),
+            )
+            .unwrap(),
+        );
+        let sort = Arc::new(
+            SortExec::new(t_asc_ordering(), repartition)
+                .with_preserve_partitioning(true)
+                .with_fetch(Some(5)),
+        );
+        let merge = Arc::new(SortPreservingMergeExec::new(t_asc_ordering(), sort));
+
+        let optimized = optimize(merge);
+
+        assert!(
+            (optimized.as_ref() as &dyn ExecutionPlan)
+                .downcast_ref::<SortPreservingMergeExec>()
+                .is_some(),
+            "expected the plan to be left unchanged"
+        );
+        assert_eq!(count_nodes::<SortExec>(&optimized), 1);
+        assert_eq!(count_nodes::<RepartitionExec>(&optimized), 1);
+    }
+
+    #[test]
+    fn hash_repartition_is_kept() {
+        // Hash repartitions place rows deliberately; the rule must not touch
+        // them, and without provable ordering the merge stays.
+        let repartition = Arc::new(
+            RepartitionExec::try_new(
+                non_overlapping_ordered_scan(),
+                Partitioning::Hash(vec![Arc::new(Column::new("t", 0))], 4),
+            )
+            .unwrap(),
+        );
+        let merge = Arc::new(SortPreservingMergeExec::new(t_asc_ordering(), repartition));
+
+        let optimized = optimize(Arc::clone(&merge) as _);
+
+        assert!(
+            (optimized.as_ref() as &dyn ExecutionPlan)
+                .downcast_ref::<SortPreservingMergeExec>()
+                .is_some(),
+            "expected the plan to be left unchanged"
+        );
+        assert_eq!(count_nodes::<RepartitionExec>(&optimized), 1);
+    }
+
+    #[test]
+    fn repartition_is_kept_when_partitions_overlap() {
+        // If the stripped plan still does not qualify for progressive
+        // evaluation, the original plan (and its parallelism) is kept.
+        let scan = StatsExec::with_ordering(
+            vec![
+                partition(vec![exact_i64(0, 150, 0), exact_i64(0, 10, 0)]),
+                partition(vec![exact_i64(100, 200, 0), exact_i64(0, 10, 0)]),
+            ],
+            Some(t_asc_ordering()),
+        );
+        let repartition =
+            Arc::new(RepartitionExec::try_new(scan, Partitioning::RoundRobinBatch(4)).unwrap());
+        let merge = Arc::new(SortPreservingMergeExec::new(t_asc_ordering(), repartition));
+
+        let optimized = optimize(merge);
+
+        assert!(
+            (optimized.as_ref() as &dyn ExecutionPlan)
+                .downcast_ref::<SortPreservingMergeExec>()
+                .is_some(),
+            "expected the plan to be left unchanged"
+        );
+        assert_eq!(count_nodes::<RepartitionExec>(&optimized), 1);
+    }
+
+    fn count_nodes<T: ExecutionPlan>(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        let mut count = 0;
+        plan.apply(|node| {
+            if (node.as_ref() as &dyn ExecutionPlan)
+                .downcast_ref::<T>()
+                .is_some()
+            {
+                count += 1;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        count
     }
 }
