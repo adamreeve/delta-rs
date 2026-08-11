@@ -62,6 +62,10 @@ pub use self::exec::DeltaScanExec;
 use self::exec_meta::DeltaScanMetaExec;
 pub(crate) use self::plan::{KernelScanPlan, ProjectedScanContract, supports_filters_pushdown};
 use self::replay::{ScanFileContext, ScanFileStream};
+use self::sort_bounds::{
+    FileSortBounds, ScanSortBounds, bounds_from_statistics, compare_bound_rows,
+    parse_file_sort_bounds,
+};
 use super::FileSelection;
 use crate::{
     DeltaTableError,
@@ -77,6 +81,7 @@ mod exec;
 mod exec_meta;
 mod plan;
 mod replay;
+mod sort_bounds;
 
 type ScanMetadataStream = Pin<Box<dyn Stream<Item = Result<ScanMetadata, DeltaTableError>> + Send>>;
 
@@ -215,41 +220,101 @@ fn null_free_ordering_prefix(
     LexOrdering::new(sort_exprs)
 }
 
-/// Cut a globally ordered, mutually non-overlapping file list into contiguous
-/// groups. Group boundaries follow the ordering, so the groups themselves are
+/// Cut a globally ordered, mutually non-overlapping item list into contiguous
+/// chunks. Chunk boundaries follow the ordering, so the chunks themselves are
 /// non-overlapping and range-ordered.
 ///
-/// Produces exactly `target_partitions` groups (none when there are no files,
-/// fewer only when there are not enough files, more only to stay within the
-/// file-id dictionary key space), with group sizes differing by at most one
-/// file.
-fn chunk_ordered_files(files: Vec<PartitionedFile>, target_partitions: usize) -> Vec<FileGroup> {
-    if files.is_empty() {
+/// Produces exactly `target_partitions` chunks (none when there are no items,
+/// fewer only when there are not enough items, more only to stay within the
+/// file-id dictionary key space), with chunk sizes differing by at most one.
+fn chunk_ordered<T>(items: Vec<T>, target_partitions: usize) -> Vec<Vec<T>> {
+    if items.is_empty() {
         return Vec::new();
     }
-    let num_files = files.len();
+    let num_items = items.len();
     let num_groups = target_partitions
-        .clamp(1, num_files)
-        .max(num_files.div_ceil(MAX_PARTITION_DICT_CARDINALITY));
-    let base_size = num_files / num_groups;
-    let leftover = num_files % num_groups;
-    let mut files = files.into_iter();
+        .clamp(1, num_items)
+        .max(num_items.div_ceil(MAX_PARTITION_DICT_CARDINALITY));
+    let base_size = num_items / num_groups;
+    let leftover = num_items % num_groups;
+    let mut items = items.into_iter();
     (0..num_groups)
         .map(|group| {
-            // The first `leftover` groups take one extra file.
+            // The first `leftover` groups take one extra item.
             let size = base_size + usize::from(group < leftover);
-            files.by_ref().take(size).collect::<FileGroup>()
+            items.by_ref().take(size).collect()
         })
         .collect()
+}
+
+/// Resolve every file's sort boundary rows and order the file list by them.
+///
+/// Boundary rows come from the file's sort-bounds tag when present (exact
+/// first/last rows) and fall back to composed min/max statistics (loose but
+/// conservative); the two are freely mixable, see [`FileSortBounds`]. Returns
+/// the files with their bounds, sorted by first row, when every file has
+/// usable bounds and adjacent files do not overlap (touching boundaries are
+/// allowed — concatenation is then still non-strictly ordered). Returns
+/// `None` when any file lacks bounds, values are incomparable, or two files
+/// overlap.
+fn order_files_by_bounds(
+    files: Vec<PartitionedFile>,
+    ordering: &LexOrdering,
+    sort_bounds: &HashMap<String, FileSortBounds>,
+) -> Option<Vec<(PartitionedFile, FileSortBounds)>> {
+    let mut entries = files
+        .into_iter()
+        .map(|file| {
+            let bounds = sort_bounds
+                .get(file.object_meta.location.as_ref())
+                .cloned()
+                .or_else(|| bounds_from_statistics(file.statistics.as_deref()?, ordering))?;
+            (bounds.first.len() >= ordering.len() && bounds.last.len() >= ordering.len())
+                .then_some((file, bounds))
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let mut incomparable = false;
+    entries.sort_by(|a, b| {
+        compare_bound_rows(&a.1.first, &b.1.first, ordering).unwrap_or_else(|| {
+            incomparable = true;
+            std::cmp::Ordering::Equal
+        })
+    });
+    if incomparable {
+        return None;
+    }
+
+    for pair in entries.windows(2) {
+        // The next file's first row must not precede this file's last row.
+        if compare_bound_rows(&pair[1].1.first, &pair[0].1.last, ordering)?
+            == std::cmp::Ordering::Less
+        {
+            return None;
+        }
+    }
+    Some(entries)
+}
+
+/// File groups for an ordered scan, with the proof that produced them.
+struct OrderedFileGroups {
+    groups: Vec<FileGroup>,
+    /// Boundary rows per group over the full declared ordering, present when
+    /// the groups are contiguous, range-ordered chunks of a globally
+    /// non-overlapping file list (the [`order_files_by_bounds`] path).
+    group_bounds: Option<Vec<FileSortBounds>>,
 }
 
 /// Build scan file groups such that the files within each group are mutually
 /// non-overlapping and ordered on the declared file sort order, so reading a
 /// group sequentially preserves that order.
 ///
-/// When every file is non-overlapping with every other file, the ordered file
-/// list is cut into contiguous groups that are also non-overlapping *between*
-/// each other.
+/// When every file is non-overlapping with every other file — checked with
+/// exact per-file boundary rows from sort-bounds tags where available, and
+/// composed min/max statistics otherwise (see [`order_files_by_bounds`]) —
+/// the ordered file list is cut into contiguous groups that are also
+/// non-overlapping *between* each other, and the per-group boundary rows are
+/// returned as the proof.
 ///
 /// Otherwise, the statistics-based grouping creates additional groups beyond
 /// the target partition count when file ranges overlap; with heavily
@@ -267,29 +332,34 @@ fn split_file_groups_for_ordering(
     ordering: &LexOrdering,
     table_schema: &SchemaRef,
     target_partitions: usize,
-) -> Vec<FileGroup> {
+    sort_bounds: &HashMap<String, FileSortBounds>,
+) -> OrderedFileGroups {
     let max_groups = usize::max(64, target_partitions.saturating_mul(2));
-    let flat = vec![FileGroup::new(files.clone())];
 
-    // First-fit bin packing yields a single group exactly when all files are
-    // mutually non-overlapping on the sort order. On the overlapping path this
-    // duplicates the statistics analysis of the grouping below, which is fine:
-    // it is a cheap planning-time pass over per-file min/max values.
-    match FileScanConfig::split_groups_by_statistics(table_schema, &flat, ordering) {
-        Ok(mut groups) if groups.len() == 1 => {
-            let ordered_files = groups.remove(0).into_inner();
-            let groups = chunk_ordered_files(ordered_files, target_partitions);
-            return groups;
+    // Globally non-overlapping files: cut into contiguous range-ordered
+    // groups and keep the per-group boundary rows as the proof.
+    if let Some(ordered) = order_files_by_bounds(files.clone(), ordering, sort_bounds) {
+        let mut groups = Vec::new();
+        let mut group_bounds = Vec::new();
+        for chunk in chunk_ordered(ordered, target_partitions) {
+            let first = chunk.first().expect("chunks are non-empty").1.first.clone();
+            let last = chunk.last().expect("chunks are non-empty").1.last.clone();
+            groups.push(
+                chunk
+                    .into_iter()
+                    .map(|(file, _)| file)
+                    .collect::<FileGroup>(),
+            );
+            group_bounds.push(FileSortBounds { first, last });
         }
-        // Overlapping files: fall through to the balanced target-partitions
-        // grouping below.
-        Ok(_) => {}
-        // Missing/unusable statistics: the grouping below fails the same way
-        // and takes its default-grouping fallback.
-        Err(_) => {}
+        return OrderedFileGroups {
+            groups,
+            group_bounds: Some(group_bounds),
+        };
     }
 
-    match FileScanConfig::split_groups_by_statistics_with_target_partitions(
+    let flat = vec![FileGroup::new(files.clone())];
+    let groups = match FileScanConfig::split_groups_by_statistics_with_target_partitions(
         table_schema,
         &flat,
         ordering,
@@ -324,6 +394,10 @@ fn split_file_groups_for_ordering(
             );
             partitioned_files_to_file_groups(files)
         }
+    };
+    OrderedFileGroups {
+        groups,
+        group_bounds: None,
     }
 }
 
@@ -498,6 +572,31 @@ async fn get_data_scan_plan(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut partition_stats = HashMap::new();
 
+    let file_sort_order = resolve_file_sort_order(config, &scan_plan);
+    // The declared sort columns (logical names) and their read-schema types
+    // for the resolved ordering prefix, used to interpret per-file sort-bounds
+    // tags below.
+    let declared_sort_prefix = file_sort_order
+        .as_ref()
+        .map(|ordering| &config.file_sort_order[..ordering.len()]);
+    let sort_column_types = file_sort_order.as_ref().map(|ordering| {
+        ordering
+            .iter()
+            .map(|sort_expr| {
+                let column = sort_expr
+                    .expr
+                    .downcast_ref::<Column>()
+                    .expect("resolved file sort order exprs are columns");
+                scan_plan
+                    .parquet_read_schema
+                    .field(column.index())
+                    .data_type()
+                    .clone()
+            })
+            .collect_vec()
+    });
+    let mut file_sort_bounds: HashMap<String, FileSortBounds> = HashMap::new();
+
     // Convert the files into datafusions `PartitionedFile`s grouped by the object store they are stored in
     // this is used to create a DataSourceExec plan for each store
     // To correlate the data with the original file, we add the file url as a partition value
@@ -506,11 +605,33 @@ async fn get_data_scan_plan(
         if let Some(part_stata) = &f.partitions {
             update_partition_stats(part_stata, &f.stats, &mut partition_stats)?;
         }
+        let location = Path::from_url_path(f.file_url.path())?;
+        if let (Some(declared), Some(types), Some(tags)) = (
+            declared_sort_prefix,
+            sort_column_types.as_deref(),
+            f.tags.as_ref(),
+        ) && let Some(bounds) = parse_file_sort_bounds(tags, declared, types)
+        {
+            // Align the value representation with file statistics (view type
+            // mapping) so tag- and statistics-derived bounds stay comparable.
+            let map_row = |row: Vec<_>| {
+                row.into_iter()
+                    .map(|v| config.map_scalar_value(v))
+                    .collect()
+            };
+            file_sort_bounds.insert(
+                location.to_string(),
+                FileSortBounds {
+                    first: map_row(bounds.first),
+                    last: map_row(bounds.last),
+                },
+            );
+        }
         // We create a PartitionedFile from the ObjectMeta to avoid any surprises in path encoding
         // that may arise from using the 'new' method directly. i.e. the 'new' method encodes paths
         // segments again, which may lead to double-encoding in some cases.
         let mut partitioned_file: PartitionedFile = ObjectMeta {
-            location: Path::from_url_path(f.file_url.path())?,
+            location,
             size: f.size,
             last_modified: Utc.timestamp_nanos(0),
             e_tag: None,
@@ -546,8 +667,7 @@ async fn get_data_scan_plan(
         scan_plan.parquet_predicate.as_ref()
     };
     let file_id_field = scan_plan.contract.file_id_field.clone();
-    let file_sort_order = resolve_file_sort_order(config, &scan_plan);
-    let pq_plan = get_read_plan(
+    let (pq_plan, scan_sort_bounds) = get_read_plan(
         session,
         files_by_store,
         &scan_plan.parquet_read_schema,
@@ -557,6 +677,7 @@ async fn get_data_scan_plan(
         predicate,
         config.table_parquet_options.as_ref(),
         file_sort_order,
+        &file_sort_bounds,
     )
     .await?;
 
@@ -567,7 +688,8 @@ async fn get_data_scan_plan(
         Arc::new(dvs),
         partition_stats,
         metrics,
-    );
+    )
+    .with_scan_sort_bounds(scan_sort_bounds);
 
     Ok(Arc::new(exec))
 }
@@ -674,8 +796,12 @@ async fn get_read_plan(
     table_parquet_options: Option<&TableParquetOptions>,
     // Sort order (over `parquet_read_schema`) that every data file adheres to.
     file_sort_order: Option<LexOrdering>,
-) -> Result<Arc<dyn ExecutionPlan>> {
+    // Per-file sort boundary rows (keyed by object store path) parsed from
+    // sort-bounds tags, over the resolved `file_sort_order` prefix.
+    file_sort_bounds: &HashMap<String, FileSortBounds>,
+) -> Result<(Arc<dyn ExecutionPlan>, Option<ScanSortBounds>)> {
     let mut plans = Vec::new();
+    let mut scan_sort_bounds: Option<ScanSortBounds> = None;
 
     let pq_options = table_parquet_options
         .cloned()
@@ -705,8 +831,7 @@ async fn get_read_plan(
 
         // Set encryption factory if configured
         if let Some(factory_id) = &pq_options.crypto.factory_id {
-            let encryption_factory =
-                state.runtime_env().parquet_encryption_factory(factory_id)?;
+            let encryption_factory = state.runtime_env().parquet_encryption_factory(factory_id)?;
             file_source = file_source.with_encryption_factory(encryption_factory);
         }
 
@@ -761,11 +886,15 @@ async fn get_read_plan(
                 let null_free_prefix =
                     null_free_ordering_prefix(ordering, parquet_read_schema, &files);
                 let null_free_len = null_free_prefix.as_ref().map_or(0, |prefix| prefix.len());
-                let file_groups = split_file_groups_for_ordering(
+                let OrderedFileGroups {
+                    groups: file_groups,
+                    group_bounds,
+                } = split_file_groups_for_ordering(
                     files,
                     ordering,
                     &full_table_schema,
                     state.config().options().execution.target_partitions,
+                    file_sort_bounds,
                 );
                 // A single sorted file per group upholds the full ordering even
                 // when sort columns contain nulls; multi-file groups only
@@ -781,6 +910,20 @@ async fn get_read_plan(
                     }
                     null_free_prefix
                 };
+                // Groups proven contiguous and range-ordered: keep the
+                // per-partition boundary rows, truncated to the ordering
+                // prefix the scan actually claims.
+                if let (Some(claimed), Some(bounds)) = (&store_sort_order, group_bounds)
+                    && !bounds.is_empty()
+                {
+                    scan_sort_bounds = Some(ScanSortBounds {
+                        ordering: claimed.clone(),
+                        partitions: bounds
+                            .into_iter()
+                            .map(|group| group.truncated(claimed.len()))
+                            .collect(),
+                    });
+                }
                 (file_groups, store_sort_order)
             }
             None => (partitioned_files_to_file_groups(files), None),
@@ -801,11 +944,17 @@ async fn get_read_plan(
         plans.push(DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>);
     }
 
-    Ok(match plans.len() {
-        0 => Arc::new(EmptyExec::new(full_read_schema.clone())),
-        1 => plans.remove(0),
-        _ => UnionExec::try_new(plans)?,
-    })
+    // Partition bounds index into a single scan's partitions; a union over
+    // multiple stores breaks that correspondence.
+    let scan_sort_bounds = (plans.len() == 1).then_some(scan_sort_bounds).flatten();
+    Ok((
+        match plans.len() {
+            0 => Arc::new(EmptyExec::new(full_read_schema.clone())),
+            1 => plans.remove(0),
+            _ => UnionExec::try_new(plans)?,
+        },
+        scan_sort_bounds,
+    ))
 }
 
 // Small helper to reuse some code between exec and exec_meta
@@ -980,20 +1129,52 @@ mod tests {
             stats_file("b", 100, 199),
         ];
 
-        let groups =
-            split_file_groups_for_ordering(files, &int64_asc_ordering(), &int64_sort_schema(), 2);
+        let OrderedFileGroups {
+            groups,
+            group_bounds,
+        } = split_file_groups_for_ordering(
+            files,
+            &int64_asc_ordering(),
+            &int64_sort_schema(),
+            2,
+            &HashMap::new(),
+        );
 
         assert_eq!(groups.len(), 2);
         assert_eq!(group_paths(&groups[0]), vec!["a.parquet", "b.parquet"]);
         assert_eq!(group_paths(&groups[1]), vec!["c.parquet", "d.parquet"]);
+        // The proof path applies: per-group boundary rows over the ordering.
+        let bounds = group_bounds.expect("non-overlapping files produce group bounds");
+        assert_eq!(
+            bounds
+                .iter()
+                .map(|b| (b.first.clone(), b.last.clone()))
+                .collect_vec(),
+            vec![
+                (
+                    vec![ScalarValue::Int64(Some(0))],
+                    vec![ScalarValue::Int64(Some(199))]
+                ),
+                (
+                    vec![ScalarValue::Int64(Some(200))],
+                    vec![ScalarValue::Int64(Some(399))]
+                ),
+            ]
+        );
     }
 
     #[test]
     fn test_split_file_groups_more_targets_than_files() {
         let files = vec![stats_file("a", 0, 99), stats_file("b", 100, 199)];
 
-        let groups =
-            split_file_groups_for_ordering(files, &int64_asc_ordering(), &int64_sort_schema(), 8);
+        let groups = split_file_groups_for_ordering(
+            files,
+            &int64_asc_ordering(),
+            &int64_sort_schema(),
+            8,
+            &HashMap::new(),
+        )
+        .groups;
 
         assert_eq!(groups.len(), 2);
     }
@@ -1007,11 +1188,21 @@ mod tests {
             stats_file("c", 200, 299),
         ];
 
-        let groups =
-            split_file_groups_for_ordering(files, &int64_asc_ordering(), &int64_sort_schema(), 2);
+        let OrderedFileGroups {
+            groups,
+            group_bounds,
+        } = split_file_groups_for_ordering(
+            files,
+            &int64_asc_ordering(),
+            &int64_sort_schema(),
+            2,
+            &HashMap::new(),
+        );
 
-        // Files within each group must still be non-overlapping.
+        // Files within each group must still be non-overlapping, and no
+        // non-overlap proof can be produced.
         assert!(groups.len() >= 2);
+        assert!(group_bounds.is_none());
     }
 
     #[test]
@@ -1021,25 +1212,190 @@ mod tests {
             PartitionedFile::new("memory:///b.parquet", 100),
         ];
 
-        let groups =
-            split_file_groups_for_ordering(files, &int64_asc_ordering(), &int64_sort_schema(), 2);
+        let OrderedFileGroups {
+            groups,
+            group_bounds,
+        } = split_file_groups_for_ordering(
+            files,
+            &int64_asc_ordering(),
+            &int64_sort_schema(),
+            2,
+            &HashMap::new(),
+        );
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
+        assert!(group_bounds.is_none());
+    }
+
+    fn int64_stats(min: i64, max: i64) -> ColumnStatistics {
+        ColumnStatistics {
+            null_count: Precision::Exact(0),
+            min_value: Precision::Exact(ScalarValue::Int64(Some(min))),
+            max_value: Precision::Exact(ScalarValue::Int64(Some(max))),
+            ..Default::default()
+        }
+    }
+
+    /// A `PartitionedFile` with exact statistics for two Int64 sort columns.
+    fn stats_file2(path: &str, day: (i64, i64), hour: (i64, i64)) -> PartitionedFile {
+        let mut file = PartitionedFile::new(format!("{path}.parquet"), 100);
+        file.statistics = Some(Arc::new(Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Exact(100),
+            column_statistics: vec![int64_stats(day.0, day.1), int64_stats(hour.0, hour.1)],
+        }));
+        file
+    }
+
+    fn day_hour_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Int64, false),
+            Field::new("hour", DataType::Int64, false),
+        ]))
+    }
+
+    fn day_hour_ordering() -> LexOrdering {
+        let asc = SortOptions {
+            descending: false,
+            nulls_first: false,
+        };
+        LexOrdering::new(vec![
+            PhysicalSortExpr::new(Arc::new(Column::new("day", 0)), asc),
+            PhysicalSortExpr::new(Arc::new(Column::new("hour", 1)), asc),
+        ])
+        .unwrap()
+    }
+
+    fn int64_bounds(first: [i64; 2], last: [i64; 2]) -> FileSortBounds {
+        let row = |values: [i64; 2]| {
+            values
+                .into_iter()
+                .map(|v| ScalarValue::Int64(Some(v)))
+                .collect_vec()
+        };
+        FileSortBounds {
+            first: row(first),
+            last: row(last),
+        }
+    }
+
+    /// Boundary-touching files on a multi-column sort order: composed
+    /// min/max rows overlap even though the actual boundary rows do not.
+    /// File a holds rows (1,2)..(2,0), file b rows (2,5)..(3,1).
+    fn touching_day_hour_files() -> Vec<PartitionedFile> {
+        vec![
+            stats_file2("a", (1, 2), (0, 2)),
+            stats_file2("b", (2, 3), (1, 5)),
+        ]
+    }
+
+    fn touching_day_hour_bounds() -> HashMap<String, FileSortBounds> {
+        HashMap::from_iter([
+            ("a.parquet".to_string(), int64_bounds([1, 2], [2, 0])),
+            ("b.parquet".to_string(), int64_bounds([2, 5], [3, 1])),
+        ])
     }
 
     #[test]
-    fn test_chunk_ordered_files_hits_target_partition_count_exactly() {
+    fn test_split_file_groups_composed_stats_false_positive_without_tags() {
+        // Without tag bounds the composed min/max rows say the files overlap
+        // (b's composed first row (2,1) precedes a's composed last row
+        // (2,2)), so no proof is produced.
+        let OrderedFileGroups { group_bounds, .. } = split_file_groups_for_ordering(
+            touching_day_hour_files(),
+            &day_hour_ordering(),
+            &day_hour_schema(),
+            1,
+            &HashMap::new(),
+        );
+        assert!(group_bounds.is_none());
+    }
+
+    #[test]
+    fn test_split_file_groups_tag_bounds_admit_boundary_touching_files() {
+        // Exact boundary rows prove the files disjoint: b starts at (2,5),
+        // after a's last row (2,0). One target partition puts both files in
+        // one contiguous group — exactly what composed stats would reject.
+        let OrderedFileGroups {
+            groups,
+            group_bounds,
+        } = split_file_groups_for_ordering(
+            touching_day_hour_files(),
+            &day_hour_ordering(),
+            &day_hour_schema(),
+            1,
+            &touching_day_hour_bounds(),
+        );
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(group_paths(&groups[0]), vec!["a.parquet", "b.parquet"]);
+        let bounds = group_bounds.expect("tag bounds prove the files non-overlapping");
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0], int64_bounds([1, 2], [3, 1]));
+    }
+
+    #[test]
+    fn test_split_file_groups_mixes_tag_and_stats_bounds() {
+        // Only file a carries tag bounds; file c is proven disjoint from it
+        // by composed statistics alone (strictly greater on the first
+        // column). The mix still yields a proof.
+        let files = vec![
+            stats_file2("c", (3, 4), (0, 9)),
+            stats_file2("a", (1, 2), (0, 2)),
+        ];
+        let tag_bounds =
+            HashMap::from_iter([("a.parquet".to_string(), int64_bounds([1, 2], [2, 0]))]);
+
+        let OrderedFileGroups {
+            groups,
+            group_bounds,
+        } = split_file_groups_for_ordering(
+            files,
+            &day_hour_ordering(),
+            &day_hour_schema(),
+            1,
+            &tag_bounds,
+        );
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(group_paths(&groups[0]), vec!["a.parquet", "c.parquet"]);
+        assert_eq!(
+            group_bounds.expect("mixed bounds still prove non-overlap"),
+            vec![int64_bounds([1, 2], [4, 9])]
+        );
+    }
+
+    #[test]
+    fn test_split_file_groups_tag_bounds_detect_true_overlap() {
+        // Tag bounds that genuinely overlap: b's first row (1,9) precedes
+        // a's last row (2,0), so b starts inside a's range — no proof.
+        let bounds = HashMap::from_iter([
+            ("a.parquet".to_string(), int64_bounds([1, 2], [2, 0])),
+            ("b.parquet".to_string(), int64_bounds([1, 9], [3, 1])),
+        ]);
+        let OrderedFileGroups { group_bounds, .. } = split_file_groups_for_ordering(
+            touching_day_hour_files(),
+            &day_hour_ordering(),
+            &day_hour_schema(),
+            1,
+            &bounds,
+        );
+        assert!(group_bounds.is_none());
+    }
+
+    #[test]
+    fn test_chunk_ordered_hits_target_partition_count_exactly() {
         // A shortfall (e.g. ceil(100 / 24) = 5 → only 20 groups) makes
         // DataFusion repartition the scan, destroying the ordering claims.
         let files = (0..100)
             .map(|i| PartitionedFile::new(format!("f{i}.parquet"), 0))
             .collect_vec();
 
-        let groups = chunk_ordered_files(files, 24);
+        let groups = chunk_ordered(files, 24);
         assert_eq!(groups.len(), 24);
         assert!(groups.iter().all(|group| (4..=5).contains(&group.len())));
-        assert_eq!(groups.iter().map(FileGroup::len).sum::<usize>(), 100);
+        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), 100);
         // Contiguity: files stay in their original order across the groups.
         let flattened = groups
             .iter()
@@ -1053,18 +1409,18 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_ordered_files_empty_input_produces_no_groups() {
-        let groups = chunk_ordered_files(Vec::new(), 4);
+    fn test_chunk_ordered_empty_input_produces_no_groups() {
+        let groups = chunk_ordered::<PartitionedFile>(Vec::new(), 4);
         assert!(groups.is_empty());
     }
 
     #[test]
-    fn test_chunk_ordered_files_respects_dictionary_cardinality_limit() {
+    fn test_chunk_ordered_respects_dictionary_cardinality_limit() {
         let files = (0..=MAX_PARTITION_DICT_CARDINALITY)
             .map(|i| PartitionedFile::new(format!("memory:///f{i}.parquet"), 0))
             .collect_vec();
 
-        let groups = chunk_ordered_files(files, 1);
+        let groups = chunk_ordered(files, 1);
         assert_eq!(groups.len(), 2);
         assert!(
             groups
@@ -1358,7 +1714,7 @@ mod tests {
         let parquet_predicate_schema =
             build_parquet_predicate_schema(&arrow_schema, &file_id_field);
 
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema,
@@ -1368,6 +1724,7 @@ mod tests {
             None,
             None,
             None,
+            &HashMap::new(),
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1383,7 +1740,7 @@ mod tests {
         assert_batches_sorted_eq!(&expected, &batches);
 
         // respect limits
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema,
@@ -1393,6 +1750,7 @@ mod tests {
             None,
             None,
             None,
+            &HashMap::new(),
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1413,7 +1771,7 @@ mod tests {
         ]));
         let parquet_predicate_schema_extended =
             build_parquet_predicate_schema(&arrow_schema_extended, &file_id_field);
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema_extended,
@@ -1423,6 +1781,7 @@ mod tests {
             None,
             None,
             None,
+            &HashMap::new(),
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1492,7 +1851,7 @@ mod tests {
         let parquet_predicate_schema =
             build_parquet_predicate_schema(&arrow_schema, &file_id_field);
 
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema,
@@ -1502,6 +1861,7 @@ mod tests {
             None,
             None,
             None,
+            &HashMap::new(),
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1532,7 +1892,7 @@ mod tests {
         ]));
         let parquet_predicate_schema_extended =
             build_parquet_predicate_schema(&arrow_schema_extended, &file_id_field);
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema_extended,
@@ -1542,6 +1902,7 @@ mod tests {
             None,
             None,
             None,
+            &HashMap::new(),
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1632,7 +1993,7 @@ mod tests {
         let parquet_predicate_schema =
             build_parquet_predicate_schema(&arrow_schema, &file_id_field);
 
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema,
@@ -1642,6 +2003,7 @@ mod tests {
             None,
             None,
             None,
+            &HashMap::new(),
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1701,7 +2063,7 @@ mod tests {
             build_parquet_predicate_schema(&arrow_schema, &file_id_field);
 
         let predicate = col("id").eq(lit(2i32));
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store.clone(),
             &arrow_schema,
@@ -1711,6 +2073,7 @@ mod tests {
             Some(&predicate),
             None,
             None,
+            &HashMap::new(),
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1769,7 +2132,7 @@ mod tests {
             build_parquet_predicate_schema(&logical_schema, &file_id_field);
         let predicate = col("missing").eq(lit(1i32));
 
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store,
             &parquet_read_schema,
@@ -1779,6 +2142,7 @@ mod tests {
             Some(&predicate),
             None,
             None,
+            &HashMap::new(),
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1850,7 +2214,7 @@ mod tests {
             build_parquet_predicate_schema(&parquet_read_schema, &file_id_field);
 
         let predicate = col("name").eq(lit(ScalarValue::Utf8View(Some("bob".to_string()))));
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store,
             &parquet_read_schema,
@@ -1860,6 +2224,7 @@ mod tests {
             Some(&predicate),
             None,
             None,
+            &HashMap::new(),
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -1928,7 +2293,7 @@ mod tests {
             build_parquet_predicate_schema(&parquet_read_schema, &file_id_field);
 
         let predicate = col("name").eq(lit("bob"));
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store,
             &parquet_read_schema,
@@ -1938,6 +2303,7 @@ mod tests {
             Some(&predicate),
             None,
             None,
+            &HashMap::new(),
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2007,7 +2373,7 @@ mod tests {
             build_parquet_predicate_schema(&parquet_read_schema, &file_id_field);
 
         let predicate = col(physical_name).eq(lit("bob"));
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store,
             &parquet_read_schema,
@@ -2017,6 +2383,7 @@ mod tests {
             Some(&predicate),
             None,
             None,
+            &HashMap::new(),
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;
@@ -2098,7 +2465,7 @@ mod tests {
             build_parquet_predicate_schema(&parquet_read_schema, &file_id_field);
 
         let predicate = col("data").eq(lit(ScalarValue::BinaryView(Some(b"bbb".to_vec()))));
-        let plan = get_read_plan(
+        let (plan, _) = get_read_plan(
             &session.state(),
             files_by_store,
             &parquet_read_schema,
@@ -2108,6 +2475,7 @@ mod tests {
             Some(&predicate),
             None,
             None,
+            &HashMap::new(),
         )
         .await?;
         let batches = collect(plan, session.task_ctx()).await?;

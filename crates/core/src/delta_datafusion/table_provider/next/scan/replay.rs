@@ -212,10 +212,11 @@ where
                     .files
                     .into_iter()
                     .map(|ctx| {
-                        let (stats, partitions) = file_statistics
-                            .remove(&ctx.file_url)
-                            .unwrap_or_else(|| (Statistics::new_unknown(&physical_arrow), None));
-                        ScanFileContext::new(ctx, stats, partitions)
+                        let (stats, partitions, tags) =
+                            file_statistics.remove(&ctx.file_url).unwrap_or_else(|| {
+                                (Statistics::new_unknown(&physical_arrow), None, None)
+                            });
+                        ScanFileContext::new(ctx, stats, partitions, tags)
                     })
                     .collect_vec())))
             }
@@ -242,13 +243,14 @@ where
 ///
 /// # Returns
 ///
-/// A map from file URL to DataFusion statistics and optional partition values.
+/// A map from file URL to DataFusion statistics, optional partition values,
+/// and the file's Add action tags.
 fn extract_file_statistics(
     scan: &KernelScan,
     scan_config: &DeltaScanConfig,
     parsed_stats: RecordBatch,
     stats_projection: &StatsProjection,
-) -> HashMap<Url, (Statistics, Option<StructData>)> {
+) -> HashMap<Url, (Statistics, Option<StructData>, Option<FileTags>)> {
     (0..parsed_stats.num_rows())
         .map(move |idx| LogicalFileView::new(parsed_stats.clone(), idx))
         .filter_map(|view| {
@@ -322,6 +324,7 @@ fn extract_file_statistics(
                         column_statistics,
                     },
                     view.partition_values(),
+                    view.tags(),
                 ),
             ))
         })
@@ -389,17 +392,28 @@ pub(crate) struct ScanFileContext {
     pub stats: Statistics,
     /// Partition values for the file.
     pub partitions: Option<StructData>,
+    /// Tags recorded on the file's Add action, if any.
+    pub tags: Option<FileTags>,
 }
+
+/// Free-form `Map<String, String>` metadata from an Add action's `tags` field.
+pub(crate) type FileTags = std::collections::HashMap<String, Option<String>>;
 
 impl ScanFileContext {
     /// Create a new `ScanFileContext` with the given file URL, size, and statistics.
-    fn new(inner: ScanFileContextInner, stats: Statistics, partitions: Option<StructData>) -> Self {
+    fn new(
+        inner: ScanFileContextInner,
+        stats: Statistics,
+        partitions: Option<StructData>,
+        tags: Option<FileTags>,
+    ) -> Self {
         Self {
             file_url: inner.file_url,
             size: inner.size,
             transform: inner.transform,
             stats,
             partitions,
+            tags,
         }
     }
 }

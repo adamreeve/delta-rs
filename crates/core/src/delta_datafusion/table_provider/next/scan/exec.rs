@@ -40,6 +40,7 @@ use delta_kernel::{EvaluationHandler, ExpressionRef};
 use futures::stream::{Stream, StreamExt};
 
 use super::plan::KernelScanPlan;
+use super::sort_bounds::ScanSortBounds;
 use crate::delta_datafusion::file_id::file_id_field;
 use crate::kernel::ARROW_HANDLER;
 use crate::kernel::arrow::engine_ext::ExpressionEvaluatorExt;
@@ -180,6 +181,12 @@ pub struct DeltaScanExec {
     properties: Arc<PlanProperties>,
     /// Aggregated partition column statistics
     partition_stats: HashMap<String, ColumnStatistics>,
+    /// Proven per-partition sort boundary rows, in output schema terms: the
+    /// input partitions are contiguous, range-ordered, mutually
+    /// non-overlapping chunks of the declared file sort order, so their
+    /// concatenation in partition order is sorted on `sort_bounds.ordering`.
+    /// The ordering is also claimed in this exec's equivalence properties.
+    sort_bounds: Option<ScanSortBounds>,
 }
 
 impl DisplayAs for DeltaScanExec {
@@ -195,6 +202,9 @@ impl DisplayAs for DeltaScanExec {
                 }
                 if let Some(row_index_field) = self.scan_plan.contract.retained_row_index_field() {
                     write!(f, ": row_index_column={}", row_index_field.name())?;
+                }
+                if let Some(bounds) = &self.sort_bounds {
+                    write!(f, ": sort_bounds={}", bounds.partitions.len())?;
                 }
                 Ok(())
             }
@@ -235,19 +245,110 @@ impl DeltaScanExec {
             input_file_id_column,
             file_id_column,
             properties,
+            sort_bounds: None,
         }
     }
 
-    /// Rebuild this exec around a new input plan, recomputing plan properties.
+    /// Attach proven per-partition sort bounds, expressed over the inner
+    /// parquet read schema (see [`super::get_read_plan`]).
+    ///
+    /// The ordering is mapped to this exec's output schema (truncating at the
+    /// first column that does not survive into the output) and added to the
+    /// exec's claimed orderings. This claim intentionally does not rely on the
+    /// input's own ordering claims: DataFusion validates multi-file group
+    /// orderings with composed min/max statistics, which reject
+    /// boundary-touching groups that the exact per-file bounds have proven
+    /// non-overlapping. The physical read order of the grouped files is what
+    /// this scan constructed, so the claim holds regardless.
+    pub(crate) fn with_scan_sort_bounds(self, bounds: Option<ScanSortBounds>) -> Self {
+        let mapped = bounds.and_then(|bounds| self.map_sort_bounds_to_output(bounds));
+        self.apply_output_sort_bounds(mapped)
+    }
+
+    /// Proven per-partition sort bounds over this exec's output schema, when
+    /// the scan partitions are contiguous range-ordered chunks of the
+    /// declared file sort order.
+    // Consumed by the ProgressiveEval optimizer rule (follow-up); kept
+    // exercised via `DisplayAs` until then.
+    #[allow(dead_code)]
+    pub(crate) fn partition_sort_bounds(&self) -> Option<&ScanSortBounds> {
+        self.sort_bounds.as_ref()
+    }
+
+    /// Map sort bounds from the inner parquet read schema to this exec's
+    /// output schema, truncating at the first sort column that does not
+    /// survive (a prefix of the ordering, with correspondingly truncated
+    /// boundary rows, remains valid).
+    fn map_sort_bounds_to_output(&self, bounds: ScanSortBounds) -> Option<ScanSortBounds> {
+        let output_schema = &self.scan_plan.contract.output_schema;
+        let mut mapped = Vec::new();
+        for sort_expr in bounds.ordering.iter() {
+            let Some(column) = sort_expr.expr.downcast_ref::<Column>() else {
+                break;
+            };
+            let Some(logical_name) = input_to_logical_column_name(&self.scan_plan, column.name())
+            else {
+                break;
+            };
+            let Ok(index) = output_schema.index_of(&logical_name) else {
+                break;
+            };
+            mapped.push(PhysicalSortExpr::new(
+                Arc::new(Column::new(&logical_name, index)),
+                sort_expr.options,
+            ));
+        }
+        let mapped_len = mapped.len();
+        let ordering = LexOrdering::new(mapped)?;
+        Some(ScanSortBounds {
+            ordering,
+            partitions: bounds
+                .partitions
+                .into_iter()
+                .map(|partition| partition.truncated(mapped_len))
+                .collect(),
+        })
+    }
+
+    /// Store sort bounds already expressed over the output schema, dropping
+    /// them unless they line up with the input's partitioning, and rebuild
+    /// the plan properties to claim (or stop claiming) the proven ordering.
+    fn apply_output_sort_bounds(mut self, bounds: Option<ScanSortBounds>) -> Self {
+        let bounds = bounds.filter(|bounds| {
+            !bounds.partitions.is_empty()
+                && bounds.partitions.len() == self.input.properties().partitioning.partition_count()
+        });
+        let mut orderings = derive_output_orderings(&self.scan_plan, &self.input);
+        if let Some(bounds) = &bounds {
+            orderings.push(bounds.ordering.clone());
+        }
+        self.properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new_with_orderings(
+                Arc::clone(&self.scan_plan.contract.output_schema),
+                orderings,
+            ),
+            self.input.properties().partitioning.clone(),
+            self.input.properties().emission_type,
+            self.input.properties().boundedness,
+        ));
+        self.sort_bounds = bounds;
+        self
+    }
+
+    /// Rebuild this exec around a new input plan, recomputing plan properties
+    /// and revalidating the sort bounds against the new input's partitioning.
     fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        Arc::new(Self::new(
-            self.scan_plan.clone(),
-            input,
-            self.transforms.clone(),
-            self.selection_vectors.clone(),
-            self.partition_stats.clone(),
-            self.metrics.clone(),
-        ))
+        Arc::new(
+            Self::new(
+                self.scan_plan.clone(),
+                input,
+                self.transforms.clone(),
+                self.selection_vectors.clone(),
+                self.partition_stats.clone(),
+                self.metrics.clone(),
+            )
+            .apply_output_sort_bounds(self.sort_bounds.clone()),
+        )
     }
 
     /// Transform the statistics from the inner physical parquet read plan to the logical
@@ -391,10 +492,11 @@ impl ExecutionPlan for DeltaScanExec {
         }
 
         if let Some(input) = self.input.repartitioned(target_partitions, config)? {
-            Ok(Some(Arc::new(Self {
-                input,
-                ..self.clone()
-            })))
+            // Rebuild rather than struct-update: the new input may have a
+            // different partitioning, so plan properties must be recomputed
+            // and the per-partition sort bounds revalidated (they are dropped
+            // when the partition count no longer matches).
+            Ok(Some(self.with_new_input(input)))
         } else {
             Ok(None)
         }

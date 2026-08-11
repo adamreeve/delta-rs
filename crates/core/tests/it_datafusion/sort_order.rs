@@ -1818,3 +1818,254 @@ async fn delta_table_progressive_eval_matches_sort_baseline() -> TestResult<()> 
     assert_eq!(optimized_rows, baseline_rows);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Per-file sort-bounds tags: exact boundary rows recorded on Add actions
+// prove non-overlap where composed min/max statistics report false positives.
+// ---------------------------------------------------------------------------
+
+fn day_hour_write_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("day", DataType::Int64, false),
+        Field::new("hour", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]))
+}
+
+fn day_hour_batch(rows: &[(i64, i64)]) -> TestResult<RecordBatch> {
+    let days: Vec<i64> = rows.iter().map(|(day, _)| *day).collect();
+    let hours: Vec<i64> = rows.iter().map(|(_, hour)| *hour).collect();
+    let values: Vec<i64> = (0..rows.len() as i64).collect();
+    Ok(RecordBatch::try_new(
+        day_hour_write_schema(),
+        vec![
+            Arc::new(Int64Array::from(days)),
+            Arc::new(Int64Array::from(hours)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )?)
+}
+
+/// The per-file rows for [`boundary_touching_table`], keyed by the file's
+/// minimum day value. Every file is sorted on (day, hour) and truly disjoint
+/// from its neighbours — file d ends at (d+1, 3) and file d+1 starts at
+/// (d+1, 5) — but the *composed* min/max rows overlap at every boundary:
+/// file d+1's composed first row (d+1, min hour = 3) precedes file d's
+/// composed last row (d+1, max hour = 7).
+fn boundary_touching_rows(day: i64) -> Vec<(i64, i64)> {
+    let start_hour = if day == 1 { 0 } else { 5 };
+    vec![(day, start_hour), (day, 7), (day + 1, 3)]
+}
+
+/// A table of four files sorted on (day, hour) whose true row ranges are
+/// disjoint while their composed min/max statistics overlap at every file
+/// boundary.
+async fn boundary_touching_table() -> TestResult<DeltaTable> {
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "day".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "hour".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .await?;
+    for day in 1..=4 {
+        table = table
+            .write(vec![day_hour_batch(&boundary_touching_rows(day))?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 4);
+    Ok(table)
+}
+
+/// Re-add every file of the table with a sort-bounds tag recording its true
+/// first and last (day, hour) rows.
+async fn commit_sort_bounds_tags(mut table: DeltaTable) -> TestResult<DeltaTable> {
+    use deltalake_core::kernel::Action;
+    use deltalake_core::kernel::transaction::CommitBuilder;
+    use deltalake_core::protocol::DeltaOperation;
+    use futures::TryStreamExt;
+
+    let log_store = table.log_store();
+    let views: Vec<_> = table
+        .snapshot()?
+        .snapshot()
+        .file_views(log_store.as_ref(), None)
+        .try_collect()
+        .await?;
+    assert_eq!(views.len(), 4);
+
+    let actions = views
+        .into_iter()
+        .map(|view| {
+            #[allow(deprecated)]
+            let mut add = view.add_action();
+            // Identify the file by its day range from the written stats.
+            let stats: serde_json::Value =
+                serde_json::from_str(add.stats.as_deref().expect("written files carry stats"))
+                    .expect("stats are JSON");
+            let day = stats["minValues"]["day"]
+                .as_i64()
+                .expect("day min is recorded");
+            let rows = boundary_touching_rows(day);
+            let first = rows.first().unwrap();
+            let last = rows.last().unwrap();
+            let tag = serde_json::json!({
+                "columns": [
+                    {"name": "day", "descending": false, "nullsFirst": false},
+                    {"name": "hour", "descending": false, "nullsFirst": false},
+                ],
+                "first": [first.0.to_string(), first.1.to_string()],
+                "last": [last.0.to_string(), last.1.to_string()],
+            });
+            add.tags = Some(std::collections::HashMap::from([(
+                "delta-rs.fileSortBounds".to_string(),
+                Some(tag.to_string()),
+            )]));
+            Action::Add(add)
+        })
+        .collect::<Vec<_>>();
+
+    let operation = DeltaOperation::Write {
+        mode: SaveMode::Append,
+        partition_by: None,
+        predicate: None,
+    };
+    CommitBuilder::default()
+        .with_actions(actions)
+        .build(Some(table.snapshot()?), log_store.clone(), operation)
+        .await?;
+    table.update_state().await?;
+    assert_eq!(table.snapshot()?.log_data().num_files(), 4);
+    Ok(table)
+}
+
+fn collect_day_hour_rows(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let days = batch.column(0).as_primitive::<Int64Type>();
+            let hours = batch.column(1).as_primitive::<Int64Type>();
+            days.values()
+                .iter()
+                .copied()
+                .zip(hours.values().iter().copied())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+async fn day_hour_plan_and_rows(
+    table: &DeltaTable,
+    target_partitions: usize,
+) -> TestResult<(String, Vec<(i64, i64)>)> {
+    let ctx = create_session().into_inner();
+    ctx.sql(&format!(
+        "SET datafusion.execution.target_partitions = {target_partitions}"
+    ))
+    .await?
+    .collect()
+    .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("day"), FileSortColumn::asc("hour")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+    let df = ctx
+        .sql("SELECT day, hour, value FROM test_table ORDER BY day, hour")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    Ok((rendered, collect_day_hour_rows(&batches)))
+}
+
+fn assert_day_hour_sorted(rows: &[(i64, i64)]) {
+    assert_eq!(rows.len(), 12);
+    assert!(
+        rows.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by (day, hour): {rows:?}"
+    );
+}
+
+/// Without tags, the composed min/max rows overlap at every file boundary,
+/// so the statistics-based grouping splits the touching files into extra
+/// interleaved groups (exceeding the partition target) and carries no
+/// non-overlap proof. With sort-bounds tags the exact boundary rows prove the
+/// files disjoint: they form a single contiguous group matching the target,
+/// with the proof recorded on the scan.
+#[tokio::test]
+async fn delta_table_sort_bounds_tags_group_touching_files_contiguously() -> TestResult<()> {
+    let table = boundary_touching_table().await?;
+
+    // Control: interleaved fallback grouping, more groups than the target of
+    // one, no proven bounds (each group is internally non-overlapping, so
+    // the ordering still holds and no SortExec is needed — at the cost of
+    // extra partitions that a later merge must combine).
+    let (rendered, rows) = day_hour_plan_and_rows(&table, 1).await?;
+    assert!(
+        rendered.contains("2 groups"),
+        "expected the fallback grouping to exceed the partition target:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("sort_bounds"),
+        "expected no proven bounds without tags:\n{rendered}"
+    );
+    assert_day_hour_sorted(&rows);
+
+    // With tags: one contiguous group of all four files, ordering claimed by
+    // the scan from the tag-proven bounds.
+    let table = commit_sort_bounds_tags(table).await?;
+    let (rendered, rows) = day_hour_plan_and_rows(&table, 1).await?;
+    assert!(
+        rendered.contains("{1 group:"),
+        "expected a single contiguous file group:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec with sort-bounds tags:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("sort_bounds=1"),
+        "expected DeltaScanExec to report its proven partition bounds:\n{rendered}"
+    );
+    assert_day_hour_sorted(&rows);
+    Ok(())
+}
+
+/// Multi-file groups proven by tags keep the ordering claim even though
+/// DataFusion's own statistics validation would reject the groups; the
+/// partitions merge without re-sorting.
+#[tokio::test]
+async fn delta_table_sort_bounds_tags_with_multi_file_groups() -> TestResult<()> {
+    let table = commit_sort_bounds_tags(boundary_touching_table().await?).await?;
+
+    let (rendered, rows) = day_hour_plan_and_rows(&table, 2).await?;
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec with sort-bounds tags:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("sort_bounds=2"),
+        "expected two proven partitions:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected the partitions to be merged:\n{rendered}"
+    );
+    assert_day_hour_sorted(&rows);
+    Ok(())
+}
