@@ -19,6 +19,7 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties as _};
 
 use super::progressive_eval::ProgressiveEvalExec;
+use super::scan::{DeltaScanExec, ScanSortBounds};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -67,10 +68,134 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
     }
 }
 
+/// Per-partition boundary values for the ordering being checked, one entry
+/// per sort column.
+///
+/// `starts` sorts at or before every row of the partition and `ends` at or
+/// after. `null_hazards` counts, per sort column, the nulls that could sort
+/// *outside* those bounds: min/max statistics exclude nulls, so nulls can
+/// hide beyond them, while exact boundary rows include nulls by construction
+/// and carry zero hazards.
+struct PartitionBoundary {
+    starts: Vec<ScalarValue>,
+    ends: Vec<ScalarValue>,
+    null_hazards: Vec<usize>,
+}
+
+/// How per-partition [`PartitionBoundary`] values for an ordering are
+/// obtained.
+trait OrderingBoundarySource {
+    fn boundary(&self, partition: usize) -> Option<PartitionBoundary>;
+}
+
+/// Boundary values composed from per-column min/max partition statistics:
+/// loose (the composed rows need not exist) but conservative, with real null
+/// counts for the boundary-hazard guard.
+struct StatisticsBoundarySource<'a> {
+    plan: &'a Arc<dyn ExecutionPlan>,
+    ordering: &'a LexOrdering,
+}
+
+impl OrderingBoundarySource for StatisticsBoundarySource<'_> {
+    fn boundary(&self, partition: usize) -> Option<PartitionBoundary> {
+        let stats = self.plan.partition_statistics(Some(partition)).ok()?;
+        get_ordering_stats(&stats, self.ordering)
+    }
+}
+
+/// Exact boundary rows recorded on a [`DeltaScanExec`] below the merge input
+/// (sourced from per-file sort-bounds tags at scan build time). The scan only
+/// records bounds that contain *every* row of the partition, nulls included
+/// (tag-derived boundary rows, or statistics of provably null-free columns),
+/// so nothing can sort outside them: the hazard counts are zero. Rows are
+/// truncated to the prefix length of the ordering being checked.
+struct ScanBoundsSource<'a> {
+    bounds: &'a ScanSortBounds,
+    prefix_len: usize,
+}
+
+impl OrderingBoundarySource for ScanBoundsSource<'_> {
+    fn boundary(&self, partition: usize) -> Option<PartitionBoundary> {
+        let bounds = self.bounds.partitions.get(partition)?;
+        Some(PartitionBoundary {
+            starts: bounds.first.get(..self.prefix_len)?.to_vec(),
+            ends: bounds.last.get(..self.prefix_len)?.to_vec(),
+            null_hazards: vec![0; self.prefix_len],
+        })
+    }
+}
+
+/// Walk from the merge input down to a [`DeltaScanExec`] and return its
+/// recorded per-partition sort bounds.
+///
+/// The walk aborts at any node that could break the correspondence between
+/// the scan's partitions and the merge input's partitions, or re-index the
+/// sort columns: nodes with more than one child, nodes that do not maintain
+/// their input order, nodes that change the partition count, and nodes that
+/// change the schema. (A `FilterExec`, for example, passes: it only shrinks
+/// each partition, and rows that survive still lie within the scan's bounds.)
+fn find_scan_sort_bounds(plan: &Arc<dyn ExecutionPlan>) -> Option<&ScanSortBounds> {
+    let mut current = plan;
+    loop {
+        if let Some(scan) = (current.as_ref() as &dyn ExecutionPlan).downcast_ref::<DeltaScanExec>()
+        {
+            return scan.partition_sort_bounds();
+        }
+        let children = current.children();
+        let [child] = children.as_slice() else {
+            return None;
+        };
+        if !current
+            .maintains_input_order()
+            .first()
+            .copied()
+            .unwrap_or(false)
+            || current.output_partitioning().partition_count()
+                != child.output_partitioning().partition_count()
+            || current.schema() != child.schema()
+        {
+            return None;
+        }
+        current = child;
+    }
+}
+
+/// Whether the merge ordering is a per-column prefix of the ordering the
+/// scan's bounds are recorded in: same column and same sort options at every
+/// position. A concatenation sorted under the recorded ordering is sorted
+/// under any prefix of it, and the bounds' leading values line up
+/// positionally with the merge's sort columns. Positional [`Column`] equality
+/// (name and index) is exact because [`find_scan_sort_bounds`] only walks
+/// through schema-preserving nodes.
+fn bounds_cover_ordering(bounds: &ScanSortBounds, ordering: &LexOrdering) -> bool {
+    ordering.len() <= bounds.ordering.len()
+        && ordering
+            .iter()
+            .zip(bounds.ordering.iter())
+            .all(|(merge_expr, scan_expr)| {
+                merge_expr.options == scan_expr.options
+                    && match (
+                        merge_expr.expr.downcast_ref::<Column>(),
+                        scan_expr.expr.downcast_ref::<Column>(),
+                    ) {
+                        (Some(merge_column), Some(scan_column)) => merge_column == scan_column,
+                        _ => false,
+                    }
+            })
+}
+
 /// To be able to convert to a ProgressiveEval, we need the partitions to
 /// be ordered with respect to each other.
 /// If this is the case, return a vector of the (start, end) range for the first
 /// sort term from each partition, otherwise return None.
+///
+/// Boundary values come from exact per-partition sort bounds recorded on a
+/// [`DeltaScanExec`] below the merge input where available, falling back to
+/// composed min/max partition statistics per partition (the statistics
+/// interval is a superset of the exact one, so mixing the two stays
+/// conservative). Exact bounds distinguish boundary-touching partitions from
+/// genuinely overlapping ones on multi-column orderings, where composed
+/// min/max rows report false overlaps.
 ///
 /// Each partition boundary is checked by walking the sort columns: a strictly
 /// ordered column proves the boundary (later columns are irrelevant), an equal
@@ -81,34 +206,44 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
 /// partition (including among rows tied on all preceding sort columns, which
 /// they would follow), and nulls sorting first anywhere in the later one.
 /// Columns after a strict break are never relied on, so their nulls are
-/// harmless.
+/// harmless. Exact bounds carry no such hazard (see
+/// [`OrderingBoundarySource`]).
 fn ordered_partition_ranges(
     plan: &Arc<dyn ExecutionPlan>,
     ordering: &LexOrdering,
 ) -> Option<Vec<(ScalarValue, ScalarValue)>> {
     let partition_count = plan.output_partitioning().partition_count();
-    let mut prev_ends: Vec<ScalarValue> = Vec::new();
-    let mut prev_null_counts: Vec<usize> = Vec::new();
+    let scan_source = find_scan_sort_bounds(plan)
+        .filter(|bounds| bounds_cover_ordering(bounds, ordering))
+        .map(|bounds| ScanBoundsSource {
+            bounds,
+            prefix_len: ordering.len(),
+        });
+    let stats_source = StatisticsBoundarySource { plan, ordering };
+
+    let mut prev: Option<PartitionBoundary> = None;
     let mut first_col_ordering = Vec::with_capacity(partition_count);
     for partition_idx in 0..partition_count {
-        let partition_stats = plan.partition_statistics(Some(partition_idx)).ok()?;
-        let (starts, ends, null_counts) = get_ordering_stats(&partition_stats, ordering)?;
-        if partition_idx != 0 {
+        let boundary = scan_source
+            .as_ref()
+            .and_then(|source| source.boundary(partition_idx))
+            .or_else(|| stats_source.boundary(partition_idx))?;
+        if let Some(prev) = &prev {
             // Check partition is ordered correctly with respect to the previous partition
             for (i, sort_expr) in ordering.iter().enumerate() {
                 // Reject nulls that could sort onto the wrong side of this
                 // boundary; see the function docs.
-                let boundary_null_count = if sort_expr.options.nulls_first {
-                    null_counts[i]
+                let boundary_null_hazard = if sort_expr.options.nulls_first {
+                    boundary.null_hazards[i]
                 } else {
-                    prev_null_counts[i]
+                    prev.null_hazards[i]
                 };
-                if boundary_null_count != 0 {
+                if boundary_null_hazard != 0 {
                     return None;
                 }
                 // Incomparable values (partial_cmp is None) bail out rather
                 // than being silently treated as equal.
-                let cmp = starts[i].partial_cmp(&prev_ends[i])?;
+                let cmp = boundary.starts[i].partial_cmp(&prev.ends[i])?;
                 let cmp = if sort_expr.options.descending {
                     cmp.reverse()
                 } else {
@@ -124,9 +259,8 @@ fn ordered_partition_ranges(
                 }
             }
         }
-        first_col_ordering.push((starts[0].clone(), ends[0].clone()));
-        prev_ends = ends;
-        prev_null_counts = null_counts;
+        first_col_ordering.push((boundary.starts[0].clone(), boundary.ends[0].clone()));
+        prev = Some(boundary);
     }
     Some(first_col_ordering)
 }
@@ -134,7 +268,7 @@ fn ordered_partition_ranges(
 fn get_ordering_stats(
     stats: &Arc<Statistics>,
     ordering: &LexOrdering,
-) -> Option<(Vec<ScalarValue>, Vec<ScalarValue>, Vec<usize>)> {
+) -> Option<PartitionBoundary> {
     let mut starts = Vec::with_capacity(ordering.len());
     let mut ends = Vec::with_capacity(ordering.len());
     let mut null_counts = Vec::with_capacity(ordering.len());
@@ -170,7 +304,11 @@ fn get_ordering_stats(
         null_counts.push(*col_stats.null_count.get_value()?);
     }
 
-    Some((starts, ends, null_counts))
+    Some(PartitionBoundary {
+        starts,
+        ends,
+        null_hazards: null_counts,
+    })
 }
 
 #[cfg(test)]
@@ -554,5 +692,41 @@ mod tests {
         let ordering = LexOrdering::new(vec![asc(1, "id")]).unwrap();
 
         assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    fn scan_bounds(exprs: Vec<PhysicalSortExpr>) -> ScanSortBounds {
+        ScanSortBounds {
+            ordering: LexOrdering::new(exprs).unwrap(),
+            partitions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bounds_cover_matching_ordering_and_prefixes() {
+        let bounds = scan_bounds(vec![asc(0, "t"), asc(1, "id")]);
+
+        let full = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+        assert!(bounds_cover_ordering(&bounds, &full));
+
+        // A merge on a prefix of the recorded ordering is covered.
+        let prefix = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        assert!(bounds_cover_ordering(&bounds, &prefix));
+    }
+
+    #[test]
+    fn bounds_do_not_cover_incompatible_orderings() {
+        let bounds = scan_bounds(vec![asc(0, "t")]);
+
+        // Longer than the recorded ordering.
+        let longer = LexOrdering::new(vec![asc(0, "t"), asc(1, "id")]).unwrap();
+        assert!(!bounds_cover_ordering(&bounds, &longer));
+
+        // Same column, different direction / null placement.
+        let reversed = LexOrdering::new(vec![desc(0, "t")]).unwrap();
+        assert!(!bounds_cover_ordering(&bounds, &reversed));
+
+        // Different column at the same position.
+        let other_column = LexOrdering::new(vec![asc(1, "id")]).unwrap();
+        assert!(!bounds_cover_ordering(&bounds, &other_column));
     }
 }

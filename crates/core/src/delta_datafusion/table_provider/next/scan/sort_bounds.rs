@@ -90,6 +90,14 @@ struct SortBoundsTag {
 /// Both are valid inputs to [`compare_bound_rows`]-based overlap checks — a
 /// loose bound can only make the check reject more, never accept wrongly.
 /// Values are non-null by construction (both constructors reject nulls).
+///
+/// Caveat on the containment contract: min/max statistics exclude nulls, so
+/// statistics-derived bounds only contain *all* rows when the sort columns
+/// are provably null-free for the file — null rows sort outside the composed
+/// interval. Tag-derived bounds are real rows of a file sorted with its
+/// declared null placement, so they contain null rows too. Consumers that
+/// rely on full containment must gate statistics-derived bounds accordingly
+/// (see the scan grouping's `order_files_by_bounds`).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FileSortBounds {
     /// Sort-key values of the first row (directional: for a descending

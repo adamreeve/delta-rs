@@ -62,9 +62,9 @@ pub use self::exec::DeltaScanExec;
 use self::exec_meta::DeltaScanMetaExec;
 pub(crate) use self::plan::{KernelScanPlan, ProjectedScanContract, supports_filters_pushdown};
 use self::replay::{ScanFileContext, ScanFileStream};
+pub(crate) use self::sort_bounds::ScanSortBounds;
 use self::sort_bounds::{
-    FileSortBounds, ScanSortBounds, bounds_from_statistics, compare_bound_rows,
-    parse_file_sort_bounds,
+    FileSortBounds, bounds_from_statistics, compare_bound_rows, parse_file_sort_bounds,
 };
 use super::FileSelection;
 use crate::{
@@ -257,20 +257,35 @@ fn chunk_ordered<T>(items: Vec<T>, target_partitions: usize) -> Vec<Vec<T>> {
 /// allowed — concatenation is then still non-strictly ordered). Returns
 /// `None` when any file lacks bounds, values are incomparable, or two files
 /// overlap.
+///
+/// The boolean on each entry records whether the bounds are *containing*:
+/// every row of the file, nulls included, lies within them under the
+/// ordering's total order. Tag-derived bounds are containing by construction
+/// (real boundary rows of a sorted file). Statistics-derived bounds exclude
+/// nulls, so they are containing only when the sort columns are provably
+/// null-free for the file; with nulls present they still order the non-null
+/// row ranges correctly (matching the pre-existing min/max grouping
+/// behaviour, whose ordering claims are gated elsewhere), but they must not
+/// be presented downstream as bounding all rows.
 fn order_files_by_bounds(
     files: Vec<PartitionedFile>,
     ordering: &LexOrdering,
+    read_schema: &SchemaRef,
     sort_bounds: &HashMap<String, FileSortBounds>,
-) -> Option<Vec<(PartitionedFile, FileSortBounds)>> {
+) -> Option<Vec<(PartitionedFile, FileSortBounds, bool)>> {
     let mut entries = files
         .into_iter()
         .map(|file| {
-            let bounds = sort_bounds
-                .get(file.object_meta.location.as_ref())
-                .cloned()
-                .or_else(|| bounds_from_statistics(file.statistics.as_deref()?, ordering))?;
+            let (bounds, containing) =
+                match sort_bounds.get(file.object_meta.location.as_ref()).cloned() {
+                    Some(bounds) => (bounds, true),
+                    None => (
+                        bounds_from_statistics(file.statistics.as_deref()?, ordering)?,
+                        file_sort_columns_null_free(&file, ordering, read_schema),
+                    ),
+                };
             (bounds.first.len() >= ordering.len() && bounds.last.len() >= ordering.len())
-                .then_some((file, bounds))
+                .then_some((file, bounds, containing))
         })
         .collect::<Option<Vec<_>>>()?;
 
@@ -296,12 +311,37 @@ fn order_files_by_bounds(
     Some(entries)
 }
 
+/// Whether every sort column of the ordering provably contains no nulls in
+/// this file: non-nullable in the read schema, or an exact null count of
+/// zero in the file's statistics.
+fn file_sort_columns_null_free(
+    file: &PartitionedFile,
+    ordering: &LexOrdering,
+    read_schema: &SchemaRef,
+) -> bool {
+    ordering.iter().all(|sort_expr| {
+        let Some(column) = sort_expr.expr.downcast_ref::<Column>() else {
+            return false;
+        };
+        if !read_schema.field(column.index()).is_nullable() {
+            return true;
+        }
+        file.statistics
+            .as_ref()
+            .and_then(|stats| stats.column_statistics.get(column.index()))
+            .is_some_and(|column_stats| column_stats.null_count == Precision::Exact(0))
+    })
+}
+
 /// File groups for an ordered scan, with the proof that produced them.
 struct OrderedFileGroups {
     groups: Vec<FileGroup>,
     /// Boundary rows per group over the full declared ordering, present when
     /// the groups are contiguous, range-ordered chunks of a globally
-    /// non-overlapping file list (the [`order_files_by_bounds`] path).
+    /// non-overlapping file list (the [`order_files_by_bounds`] path) *and*
+    /// every file's bounds contain all of its rows, nulls included. Consumers
+    /// (the ProgressiveEval rule) rely on that containment, so groups built
+    /// from null-blind statistics bounds carry no proof.
     group_bounds: Option<Vec<FileSortBounds>>,
 }
 
@@ -338,7 +378,12 @@ fn split_file_groups_for_ordering(
 
     // Globally non-overlapping files: cut into contiguous range-ordered
     // groups and keep the per-group boundary rows as the proof.
-    if let Some(ordered) = order_files_by_bounds(files.clone(), ordering, sort_bounds) {
+    if let Some(ordered) = order_files_by_bounds(files.clone(), ordering, table_schema, sort_bounds)
+    {
+        // A group's boundary rows only bound *all* of the group's rows when
+        // every member file's bounds do; otherwise the groups are still
+        // contiguous but carry no proof.
+        let all_containing = ordered.iter().all(|(_, _, containing)| *containing);
         let mut groups = Vec::new();
         let mut group_bounds = Vec::new();
         for chunk in chunk_ordered(ordered, target_partitions) {
@@ -347,14 +392,14 @@ fn split_file_groups_for_ordering(
             groups.push(
                 chunk
                     .into_iter()
-                    .map(|(file, _)| file)
+                    .map(|(file, _, _)| file)
                     .collect::<FileGroup>(),
             );
             group_bounds.push(FileSortBounds { first, last });
         }
         return OrderedFileGroups {
             groups,
-            group_bounds: Some(group_bounds),
+            group_bounds: all_containing.then_some(group_bounds),
         };
     }
 
@@ -1364,6 +1409,42 @@ mod tests {
             group_bounds.expect("mixed bounds still prove non-overlap"),
             vec![int64_bounds([1, 2], [4, 9])]
         );
+    }
+
+    #[test]
+    fn test_split_file_groups_nullable_stats_bounds_carry_no_proof() {
+        // Files order cleanly on min/max, but file b holds nulls in the
+        // (nullable) sort column: min/max bounds cannot contain its null
+        // rows, so the groups are still contiguous but carry no proof.
+        let nullable_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, true)]));
+        let mut file_b = PartitionedFile::new("b.parquet", 100);
+        file_b.statistics = Some(Arc::new(Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Exact(100),
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(1),
+                min_value: Precision::Exact(ScalarValue::Int64(Some(100))),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(199))),
+                ..Default::default()
+            }],
+        }));
+        let files = vec![stats_file("a", 0, 99), file_b];
+
+        let OrderedFileGroups {
+            groups,
+            group_bounds,
+        } = split_file_groups_for_ordering(
+            files,
+            &int64_asc_ordering(),
+            &nullable_schema,
+            1,
+            &HashMap::new(),
+        );
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(group_paths(&groups[0]), vec!["a.parquet", "b.parquet"]);
+        assert!(group_bounds.is_none());
     }
 
     #[test]

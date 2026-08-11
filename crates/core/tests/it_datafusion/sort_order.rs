@@ -2054,8 +2054,10 @@ async fn delta_table_sort_bounds_tags_group_touching_files_contiguously() -> Tes
 }
 
 /// Multi-file groups proven by tags keep the ordering claim even though
-/// DataFusion's own statistics validation would reject the groups; the
-/// partitions merge without re-sorting.
+/// DataFusion's own statistics validation would reject the groups, and the
+/// exact partition bounds let the ProgressiveEval rule replace the merge
+/// with a plain concatenation — composed min/max statistics alone would
+/// report the partitions as overlapping at the shared day boundary.
 #[tokio::test]
 async fn delta_table_sort_bounds_tags_with_multi_file_groups() -> TestResult<()> {
     let table = commit_sort_bounds_tags(boundary_touching_table().await?).await?;
@@ -2070,8 +2072,12 @@ async fn delta_table_sort_bounds_tags_with_multi_file_groups() -> TestResult<()>
         "expected two proven partitions:\n{rendered}"
     );
     assert!(
-        rendered.contains("SortPreservingMergeExec"),
-        "expected the partitions to be merged:\n{rendered}"
+        rendered.contains("ProgressiveEvalExec"),
+        "expected the proven partitions to be concatenated:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortPreservingMergeExec"),
+        "expected no merge over the non-overlapping partitions:\n{rendered}"
     );
     assert_day_hour_sorted(&rows);
     Ok(())
