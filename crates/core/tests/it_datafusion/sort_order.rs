@@ -1893,6 +1893,10 @@ async fn boundary_touching_table() -> TestResult<DeltaTable> {
 
 /// Re-add every file of the table with a sort-bounds tag recording its true
 /// first and last (day, hour) rows.
+///
+/// Log replay deduplicates Add actions by file path (a snapshot holds at most
+/// one Add per path, the newest winning), so re-adding an existing path
+/// updates its metadata rather than duplicating the file.
 async fn commit_sort_bounds_tags(mut table: DeltaTable) -> TestResult<DeltaTable> {
     use deltalake_core::kernel::Action;
     use deltalake_core::kernel::transaction::CommitBuilder;
@@ -1935,6 +1939,9 @@ async fn commit_sort_bounds_tags(mut table: DeltaTable) -> TestResult<DeltaTable
                 "delta-rs.fileSortBounds".to_string(),
                 Some(tag.to_string()),
             )]));
+            // Metadata-only re-add: no new data arrives, so streaming
+            // consumers must not treat these files as fresh input.
+            add.data_change = false;
             Action::Add(add)
         })
         .collect::<Vec<_>>();
