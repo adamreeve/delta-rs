@@ -1081,6 +1081,44 @@ async fn delta_table_more_target_partitions_than_files_uses_progressive_eval() -
     Ok(())
 }
 
+/// When the file ranges overlap, the scan partitions can never qualify for
+/// `ProgressiveEvalExec`, so if a round-robin `RepartitionExec` were inserted
+/// above the ordered scan to reach the spare target partitions,
+/// `ProgressiveEvalRule` would bail on the overlap check and leave the
+/// repartition — and the blocking full-table `SortExec` repairing the
+/// ordering it destroyed — in the plan. Each partition already upholds the
+/// declared ordering, so the streaming merge alone must suffice: no
+/// repartition, no sort.
+#[tokio::test]
+async fn delta_table_overlapping_files_spare_target_partitions_keep_streaming_merge()
+-> TestResult<()> {
+    // Two files whose timestamp ranges overlap: [0, 100) and [50, 150).
+    let files: Vec<Vec<i64>> = vec![(0..100).collect(), (50..150).collect()];
+    let table = overlapping_delta_table(files).await?;
+    let options: Vec<(&str, &str)> = MANY_CORE_OPTIONS
+        .iter()
+        .copied()
+        .chain([("datafusion.optimizer.repartition_file_scans", "false")])
+        .collect();
+    let (rendered, timestamps) = query_sorted_with_session_options(&table, &options).await?;
+
+    assert!(
+        !rendered.contains("RepartitionExec"),
+        "expected no RepartitionExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    assert_eq!(timestamps.len(), 200);
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+    Ok(())
+}
+
 /// Without a declared sort order the scan partitions have no provable
 /// ordering, so `ProgressiveEvalRule` leaves the plan alone: the round-robin
 /// `RepartitionExec` raising the scan's parallelism to the target partition
