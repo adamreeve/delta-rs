@@ -80,19 +80,23 @@ fn file_url_of(file: &PartitionedFile) -> Option<String> {
 }
 
 /// Compare two partition-prefix value tuples under the prefix column options.
-fn cmp_prefix(a: &[ScalarValue], b: &[ScalarValue], prefix: &[PrefixColumn]) -> Ordering {
+///
+/// Returns `None` when a pair of values is incomparable (e.g. mismatched
+/// [`ScalarValue`] variants), so callers can reject the pushdown rather than
+/// silently treat them as equal.
+fn cmp_prefix(a: &[ScalarValue], b: &[ScalarValue], prefix: &[PrefixColumn]) -> Option<Ordering> {
     for ((lhs, rhs), col) in a.iter().zip(b.iter()).zip(prefix.iter()) {
-        let ord = lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal);
+        let ord = lhs.partial_cmp(rhs)?;
         let ord = if col.options.descending {
             ord.reverse()
         } else {
             ord
         };
         if ord != Ordering::Equal {
-            return ord;
+            return Some(ord);
         }
     }
-    Ordering::Equal
+    Some(Ordering::Equal)
 }
 
 /// Plan a sort pushdown for the requested `order`, or return `None` when it
@@ -231,17 +235,32 @@ pub(super) fn plan_sort_pushdown(
     }
 
     // --- Bucket files by partition-prefix tuple, ordered by the prefix. ---
-    entries.sort_by(|a, b| cmp_prefix(&a.prefix_values, &b.prefix_values, &prefix));
+    // The sort is best-effort: it needs a total order, so incomparable values
+    // fall back to `Equal` and may land anywhere. The strict boundary check
+    // below is what makes the resulting bucket order sound.
+    entries.sort_by(|a, b| {
+        cmp_prefix(&a.prefix_values, &b.prefix_values, &prefix).unwrap_or(Ordering::Equal)
+    });
 
-    let mut buckets: Vec<Vec<PartitionedFile>> = Vec::new();
-    let mut current_key: Option<Vec<ScalarValue>> = None;
+    let mut buckets: Vec<(Vec<ScalarValue>, Vec<PartitionedFile>)> = Vec::new();
     for entry in entries {
-        if current_key.as_deref() == Some(entry.prefix_values.as_slice()) {
-            buckets.last_mut().expect("bucket started").push(entry.file);
-        } else {
-            current_key = Some(entry.prefix_values);
-            buckets.push(vec![entry.file]);
+        match buckets.last_mut() {
+            Some((key, files)) if *key == entry.prefix_values => files.push(entry.file),
+            _ => buckets.push((entry.prefix_values, vec![entry.file])),
         }
+    }
+
+    // Every bucket must be strictly ordered against its predecessor: the groups
+    // are concatenated in this order and the scan advertises the result as an
+    // output ordering. Bucket boundaries are cut on `PartialEq` while the sort
+    // above uses `cmp_prefix`, so the two can disagree — an incomparable pair,
+    // or one that compares equal without being equal, must reject the pushdown
+    // rather than emit an out-of-order concatenation.
+    if !buckets
+        .windows(2)
+        .all(|pair| cmp_prefix(&pair[0].0, &pair[1].0, &prefix) == Some(Ordering::Less))
+    {
+        return Ok(None);
     }
 
     // Guard against pathological partition cardinality producing an unbounded
@@ -272,7 +291,7 @@ pub(super) fn plan_sort_pushdown(
     };
 
     let mut ordered_buckets: Vec<Vec<PartitionedFile>> = Vec::with_capacity(buckets.len());
-    for bucket in buckets {
+    for (_, bucket) in buckets {
         let Some(suffix_ordering) = suffix_ordering.as_ref().filter(|_| bucket.len() > 1) else {
             ordered_buckets.push(bucket);
             continue;
@@ -590,6 +609,35 @@ mod tests {
     }
 
     #[test]
+    fn incomparable_partition_values_are_not_supported() {
+        // Mismatched `ScalarValue` variants for one partition column are
+        // incomparable. The best-effort sort cannot order them, and bucket
+        // boundaries are cut on `PartialEq`, so without the strict boundary
+        // check the buckets would be concatenated in an arbitrary order while
+        // the scan advertises `[part, timestamp]` as an output ordering.
+        let files = vec![file("a0", 0, 99, 0), file("b0", 100, 199, 0)];
+        let mut partition_values_by_file = HashMap::new();
+        partition_values_by_file.insert("a0".to_string(), values("A"));
+        partition_values_by_file.insert("b0".to_string(), vec![ScalarValue::Int64(Some(1))]);
+        let order = vec![asc(0, "part"), asc(1, "timestamp")];
+
+        let plan = plan_sort_pushdown(
+            &order,
+            &output_schema(),
+            &parquet_read_schema(),
+            &["part".to_string()],
+            Some(&file_sort_order()),
+            &partition_values_by_file,
+            &parquet_table_schema(),
+            files,
+            4,
+        )
+        .unwrap();
+
+        assert!(plan.is_none());
+    }
+
+    #[test]
     fn nulls_in_a_multi_file_bucket_suffix_are_not_supported() {
         let mut fixture = Fixture::new(&[("a0", "A", 0, 99), ("a1", "A", 100, 199)]);
         // Give the second file a nullable-looking timestamp column with nulls.
@@ -678,12 +726,11 @@ mod tests {
         RecordBatch::try_new(schema, vec![timestamps, values, parts]).unwrap()
     }
 
-    #[tokio::test]
-    async fn e2e_partition_prefix_sort_avoids_sort_and_uses_progressive_eval() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::TimestampMicrosecondType;
-
-        use crate::delta_datafusion::{FileSortColumn, create_session};
+    /// Four files across two partition values: every file sorted by timestamp,
+    /// non-overlapping within a partition, overlapping across partitions — so
+    /// `ORDER BY part, timestamp` is only answerable without a sort by
+    /// regrouping the files per partition value.
+    async fn partitioned_sorted_table() -> crate::DeltaTable {
         use crate::protocol::SaveMode;
 
         let mut table = crate::DeltaTable::new_in_memory()
@@ -699,7 +746,91 @@ mod tests {
                 .await
                 .unwrap();
         }
+        table
+    }
 
+    /// Sort-pushdown state is only valid for the file grouping it was computed
+    /// for, and `per_partition_stats` is indexed by execution partition.
+    /// Swapping in a child with a different partition count must drop the
+    /// advertised ordering — no `SortExec` remains above to correct it.
+    #[tokio::test]
+    async fn with_new_children_drops_pushdown_state_when_partition_count_changes() {
+        use datafusion::physical_expr::Partitioning;
+        use datafusion::physical_plan::repartition::RepartitionExec;
+        use datafusion::physical_plan::{
+            ExecutionPlan, ExecutionPlanProperties, SortOrderPushdownResult,
+        };
+
+        use crate::delta_datafusion::{FileSortColumn, create_session};
+
+        let table = partitioned_sorted_table().await;
+        let ctx = create_session().into_inner();
+        let provider = table
+            .table_provider()
+            .with_file_sort_order([FileSortColumn::asc("timestamp")])
+            .await
+            .unwrap();
+
+        let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let schema = scan.schema();
+        let sort_col = |name: &str| {
+            PhysicalSortExpr::new(
+                Arc::new(Column::new(name, schema.index_of(name).unwrap())),
+                SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            )
+        };
+        let order = vec![sort_col("part"), sort_col("timestamp")];
+
+        let pushed = match scan.try_pushdown_sort(&order).unwrap() {
+            SortOrderPushdownResult::Exact { inner } => inner,
+            other => panic!("expected an exact pushdown, got {other:?}"),
+        };
+
+        let leads_with_part = |plan: &Arc<dyn ExecutionPlan>| {
+            plan.properties()
+                .equivalence_properties()
+                .oeq_class()
+                .iter()
+                .any(|ordering| {
+                    ordering
+                        .iter()
+                        .next()
+                        .and_then(|sort_expr| sort_expr.expr.downcast_ref::<Column>())
+                        .is_some_and(|col| col.name() == "part")
+                })
+        };
+        assert!(
+            leads_with_part(&pushed),
+            "a successful pushdown should advertise a `part`-leading ordering"
+        );
+
+        let child = Arc::clone(pushed.children()[0]);
+        let repartitioned = Arc::new(
+            RepartitionExec::try_new(
+                child,
+                Partitioning::RoundRobinBatch(pushed.output_partitioning().partition_count() + 1),
+            )
+            .unwrap(),
+        );
+        let swapped = pushed.with_new_children(vec![repartitioned]).unwrap();
+
+        assert!(
+            !leads_with_part(&swapped),
+            "stale `part`-leading ordering survived a partition-count change"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_partition_prefix_sort_avoids_sort_and_uses_progressive_eval() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::TimestampMicrosecondType;
+
+        use crate::delta_datafusion::{FileSortColumn, create_session};
+
+        let table = partitioned_sorted_table().await;
         let ctx = create_session().into_inner();
         let provider = table
             .table_provider()

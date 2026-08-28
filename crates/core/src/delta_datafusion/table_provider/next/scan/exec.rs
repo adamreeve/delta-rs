@@ -297,14 +297,31 @@ impl DeltaScanExec {
         ))
     }
 
-    /// Rebuild this exec around a new input plan, recomputing plan properties and
-    /// preserving any sort-pushdown state.
+    /// Rebuild this exec around a new input plan, recomputing plan properties.
+    ///
+    /// Sort-pushdown state describes one specific regrouping of the child's file
+    /// groups, and `per_partition_stats` is indexed by execution partition. A
+    /// replacement child with a different partition count invalidates both, so
+    /// drop them rather than advertise an ordering that no longer holds — there
+    /// is no `SortExec` left above us to correct it.
     fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let same_partitioning = input.properties().partitioning.partition_count()
+            == self.input.properties().partitioning.partition_count();
+        let (pushed_sort_order, per_partition_stats) = if same_partitioning {
+            (
+                self.pushed_sort_order.clone(),
+                self.per_partition_stats.clone(),
+            )
+        } else {
+            (None, None)
+        };
         let properties =
-            Self::build_properties(&self.scan_plan, &input, self.pushed_sort_order.as_ref());
+            Self::build_properties(&self.scan_plan, &input, pushed_sort_order.as_ref());
         Arc::new(Self {
             input,
             properties,
+            pushed_sort_order,
+            per_partition_stats,
             ..self.clone()
         })
     }
