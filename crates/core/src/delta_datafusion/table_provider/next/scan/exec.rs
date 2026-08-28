@@ -31,9 +31,9 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, SortOrderPushdownResult, Statistics,
 };
-use datafusion::scalar::ScalarValue;
 use datafusion_datasource::{
-    compute_all_files_statistics,
+    PartitionedFile, compute_all_files_statistics,
+    file_groups::FileGroup,
     file_scan_config::{FileScanConfig, FileScanConfigBuilder},
     source::DataSourceExec,
 };
@@ -189,21 +189,26 @@ pub struct DeltaScanExec {
     /// Resolved per-file sort order over the parquet read schema, when the table
     /// declares one (`DeltaScanConfig::file_sort_order`). Consulted by
     /// [`ExecutionPlan::try_pushdown_sort`].
+    ///
+    /// Not derivable from the child's declared output ordering: `get_read_plan`
+    /// may narrow that to a null-free prefix, or drop it entirely.
     file_sort_order: Option<LexOrdering>,
-    /// Logical partition column names, in table order.
-    partition_column_names: Arc<Vec<String>>,
-    /// Exact partition-column values per data file, keyed by file URL and
-    /// aligned to `partition_column_names`. Empty for unpartitioned tables.
-    partition_values_by_file: Arc<HashMap<String, Vec<ScalarValue>>>,
-    /// Output ordering this exec guarantees after a successful sort pushdown
-    /// (`[partition prefix…, file sort order prefix…]`), or `None` before any
-    /// pushdown. When set, the file groups are mutually non-overlapping and
-    /// range-ordered on this ordering.
-    pushed_sort_order: Option<LexOrdering>,
-    /// Per-execution-partition statistics for the leading partition columns of
-    /// `pushed_sort_order`, keyed by logical column name. Indexed by execution
-    /// partition. `None` before any pushdown.
-    per_partition_stats: Option<Arc<Vec<HashMap<String, ColumnStatistics>>>>,
+    /// Result of a successful sort pushdown, or `None` before one. Valid only
+    /// for the file grouping it was computed against.
+    pushed: Option<Arc<PushedSort>>,
+}
+
+/// What [`DeltaScanExec::try_pushdown_sort`] regrouped the child's files to
+/// achieve: the ordering the scan now guarantees, and the exact per-execution
+/// partition statistics that let downstream rules prove the partitions disjoint.
+#[derive(Debug)]
+struct PushedSort {
+    /// `[partition prefix…, file sort order prefix…]`. The file groups are
+    /// mutually non-overlapping and range-ordered on it.
+    ordering: LexOrdering,
+    /// Statistics for the ordering's leading partition columns, keyed by logical
+    /// column name and indexed by execution partition.
+    per_partition_stats: Vec<HashMap<String, ColumnStatistics>>,
 }
 
 impl DisplayAs for DeltaScanExec {
@@ -252,25 +257,15 @@ impl DeltaScanExec {
             file_id_column,
             properties,
             file_sort_order: None,
-            partition_column_names: Arc::new(Vec::new()),
-            partition_values_by_file: Arc::new(HashMap::new()),
-            pushed_sort_order: None,
-            per_partition_stats: None,
+            pushed: None,
         }
     }
 
-    /// Attach the scan metadata needed for sort pushdown: the resolved per-file
-    /// sort order (over the parquet read schema), the logical partition column
-    /// names, and the exact partition-column values for every data file.
-    pub(crate) fn with_scan_metadata(
-        mut self,
-        file_sort_order: Option<LexOrdering>,
-        partition_column_names: Vec<String>,
-        partition_values_by_file: HashMap<String, Vec<ScalarValue>>,
-    ) -> Self {
+    /// Declare the resolved per-file sort order (over the parquet read schema),
+    /// which [`ExecutionPlan::try_pushdown_sort`] matches requested orderings
+    /// against.
+    pub(crate) fn with_file_sort_order(mut self, file_sort_order: Option<LexOrdering>) -> Self {
         self.file_sort_order = file_sort_order;
-        self.partition_column_names = Arc::new(partition_column_names);
-        self.partition_values_by_file = Arc::new(partition_values_by_file);
         self
     }
 
@@ -279,11 +274,11 @@ impl DeltaScanExec {
     fn build_properties(
         scan_plan: &KernelScanPlan,
         input: &Arc<dyn ExecutionPlan>,
-        pushed_sort_order: Option<&LexOrdering>,
+        pushed: Option<&PushedSort>,
     ) -> Arc<PlanProperties> {
         let mut orderings = Vec::new();
-        if let Some(pushed) = pushed_sort_order {
-            orderings.push(pushed.clone());
+        if let Some(pushed) = pushed {
+            orderings.push(pushed.ordering.clone());
         }
         orderings.extend(derive_output_orderings(scan_plan, input));
         Arc::new(PlanProperties::new(
@@ -299,29 +294,20 @@ impl DeltaScanExec {
 
     /// Rebuild this exec around a new input plan, recomputing plan properties.
     ///
-    /// Sort-pushdown state describes one specific regrouping of the child's file
-    /// groups, and `per_partition_stats` is indexed by execution partition. A
-    /// replacement child with a different partition count invalidates both, so
-    /// drop them rather than advertise an ordering that no longer holds — there
-    /// is no `SortExec` left above us to correct it.
+    /// A [`PushedSort`] describes one specific regrouping of the child's file
+    /// groups, and its statistics are indexed by execution partition. A
+    /// replacement child with a different partition count invalidates it, so
+    /// drop it rather than advertise an ordering that no longer holds — there is
+    /// no `SortExec` left above us to correct it.
     fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         let same_partitioning = input.properties().partitioning.partition_count()
             == self.input.properties().partitioning.partition_count();
-        let (pushed_sort_order, per_partition_stats) = if same_partitioning {
-            (
-                self.pushed_sort_order.clone(),
-                self.per_partition_stats.clone(),
-            )
-        } else {
-            (None, None)
-        };
-        let properties =
-            Self::build_properties(&self.scan_plan, &input, pushed_sort_order.as_ref());
+        let pushed = same_partitioning.then(|| self.pushed.clone()).flatten();
+        let properties = Self::build_properties(&self.scan_plan, &input, pushed.as_deref());
         Arc::new(Self {
             input,
             properties,
-            pushed_sort_order,
-            per_partition_stats,
+            pushed,
             ..self.clone()
         })
     }
@@ -352,8 +338,8 @@ impl DeltaScanExec {
         // After a sort pushdown, prefer the exact per-execution-partition
         // partition-column statistics computed while regrouping the files.
         let per_partition = partition
-            .zip(self.per_partition_stats.as_ref())
-            .and_then(|(idx, per)| per.get(idx));
+            .zip(self.pushed.as_ref())
+            .and_then(|(idx, pushed)| pushed.per_partition_stats.get(idx));
         let partition_stat = |name: &str| -> Option<ColumnStatistics> {
             if let Some(stat) = per_partition.and_then(|map| map.get(name)) {
                 return Some(stat.clone());
@@ -482,7 +468,7 @@ impl ExecutionPlan for DeltaScanExec {
             return Ok(None);
         }
 
-        if self.pushed_sort_order.is_some() {
+        if self.pushed.is_some() {
             // The file groups were formed to be non-overlapping and range-ordered
             // for a pushed-down sort; re-splitting them would break that.
             return Ok(None);
@@ -573,19 +559,37 @@ impl ExecutionPlan for DeltaScanExec {
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         let unsupported = || Ok(SortOrderPushdownResult::Unsupported);
 
-        // Retained row indexes require a single input partition; there is no
+        // Retained row indexes require a single input partition, so there is no
         // regrouping to do. Column mapping would need physical/logical name
-        // translation for the file-sort-order columns, which is not handled yet.
+        // translation for the file-sort-order columns, which is not handled yet;
+        // for both, `get_data_scan_plan` also skips collecting partition values.
         if self.scan_plan.contract.retained_row_index_field().is_some()
             || self
                 .scan_plan
                 .table_configuration()
                 .is_feature_enabled(&TableFeature::ColumnMapping)
-            || self.partition_column_names.is_empty()
-            || self.partition_values_by_file.is_empty()
         {
             return unsupported();
         }
+        let Some(ordering) = LexOrdering::new(order.to_vec()) else {
+            return unsupported();
+        };
+
+        // Classify the requested ordering before touching the file list: the
+        // common case — an ordering that does not lead with partition columns —
+        // is rejected here, without cloning every file.
+        let Some(shape) = super::sort_pushdown::analyze_order(
+            &ordering,
+            &self.scan_plan.contract.output_schema,
+            &self.scan_plan.parquet_read_schema,
+            self.scan_plan
+                .table_configuration()
+                .metadata()
+                .partition_columns(),
+            self.file_sort_order.as_ref(),
+        ) else {
+            return unsupported();
+        };
 
         // Only a single-store parquet scan is handled; multi-store unions and
         // any repartition wrappers are left alone.
@@ -600,16 +604,18 @@ impl ExecutionPlan for DeltaScanExec {
             return unsupported();
         };
 
+        // One clone of the child config serves both as the source of the file
+        // list and as the base for the rebuilt config.
+        let mut file_scan = file_scan.clone();
+        let files: Vec<PartitionedFile> = std::mem::take(&mut file_scan.file_groups)
+            .into_iter()
+            .flat_map(FileGroup::into_inner)
+            .collect();
         let parquet_table_schema = file_scan
             .file_source()
             .table_schema()
             .table_schema()
             .clone();
-        let files: Vec<_> = file_scan
-            .file_groups
-            .iter()
-            .flat_map(|group| group.iter().cloned())
-            .collect();
         let target_groups = self
             .input
             .properties()
@@ -618,12 +624,8 @@ impl ExecutionPlan for DeltaScanExec {
             .max(1);
 
         let Some(plan) = super::sort_pushdown::plan_sort_pushdown(
-            order,
-            &self.scan_plan.contract.output_schema,
+            &shape,
             &self.scan_plan.parquet_read_schema,
-            &self.partition_column_names,
-            self.file_sort_order.as_ref(),
-            &self.partition_values_by_file,
             &parquet_table_schema,
             files,
             target_groups,
@@ -634,7 +636,7 @@ impl ExecutionPlan for DeltaScanExec {
 
         let (file_groups, statistics) =
             compute_all_files_statistics(plan.file_groups, parquet_table_schema, true, false)?;
-        let new_file_scan = FileScanConfigBuilder::from(file_scan.clone())
+        let new_file_scan = FileScanConfigBuilder::from(file_scan)
             .with_file_groups(file_groups)
             .with_statistics(statistics)
             // The groups are ordered on `[partition prefix…, file sort order…]`,
@@ -644,19 +646,18 @@ impl ExecutionPlan for DeltaScanExec {
             .build();
         let new_input = DataSourceExec::from_data_source(new_file_scan) as Arc<dyn ExecutionPlan>;
 
-        let Some(pushed) = LexOrdering::new(order.to_vec()) else {
-            return unsupported();
-        };
+        let pushed = Arc::new(PushedSort {
+            ordering,
+            per_partition_stats: plan.per_partition_stats,
+        });
         let properties = Self::build_properties(&self.scan_plan, &new_input, Some(&pushed));
-        let new_exec = Self {
-            input: new_input,
-            properties,
-            pushed_sort_order: Some(pushed),
-            per_partition_stats: Some(Arc::new(plan.per_partition_stats)),
-            ..self.clone()
-        };
         Ok(SortOrderPushdownResult::Exact {
-            inner: Arc::new(new_exec),
+            inner: Arc::new(Self {
+                input: new_input,
+                properties,
+                pushed: Some(pushed),
+                ..self.clone()
+            }),
         })
     }
 

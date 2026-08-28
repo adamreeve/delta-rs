@@ -72,6 +72,7 @@ use crate::{
         file_id::wrap_file_id_value,
         table_provider::next::DeletionVectorSelection,
     },
+    kernel::StructDataExt as _,
 };
 
 mod exec;
@@ -217,6 +218,25 @@ fn null_free_ordering_prefix(
     LexOrdering::new(sort_exprs)
 }
 
+/// Order `files` on `ordering` if — and only if — they are mutually
+/// non-overlapping on it.
+///
+/// [`FileScanConfig::split_groups_by_statistics`] is first-fit bin packing over
+/// per-file min/max statistics, so it returns exactly one group precisely when
+/// no two files overlap; that single group is the files in sort order. Any other
+/// outcome (several groups, or unusable statistics) means the ordering cannot be
+/// guaranteed by reordering alone, and yields `None`.
+pub(super) fn order_files_if_non_overlapping(
+    files: &[FileGroup],
+    ordering: &LexOrdering,
+    table_schema: &SchemaRef,
+) -> Option<Vec<PartitionedFile>> {
+    match FileScanConfig::split_groups_by_statistics(table_schema, files, ordering) {
+        Ok(mut groups) if groups.len() == 1 => Some(groups.remove(0).into_inner()),
+        _ => None,
+    }
+}
+
 /// Cut a globally ordered, mutually non-overlapping file list into contiguous
 /// groups. Group boundaries follow the ordering, so the groups themselves are
 /// non-overlapping and range-ordered.
@@ -273,22 +293,14 @@ fn split_file_groups_for_ordering(
     let max_groups = usize::max(64, target_partitions.saturating_mul(2));
     let flat = vec![FileGroup::new(files.clone())];
 
-    // First-fit bin packing yields a single group exactly when all files are
-    // mutually non-overlapping on the sort order. On the overlapping path this
-    // duplicates the statistics analysis of the grouping below, which is fine:
-    // it is a cheap planning-time pass over per-file min/max values.
-    match FileScanConfig::split_groups_by_statistics(table_schema, &flat, ordering) {
-        Ok(mut groups) if groups.len() == 1 => {
-            let ordered_files = groups.remove(0).into_inner();
-            let groups = chunk_ordered_files(ordered_files, target_partitions);
-            return groups;
-        }
-        // Overlapping files: fall through to the balanced target-partitions
-        // grouping below.
-        Ok(_) => {}
-        // Missing/unusable statistics: the grouping below fails the same way
-        // and takes its default-grouping fallback.
-        Err(_) => {}
+    // On the overlapping path this duplicates the statistics analysis of the
+    // grouping below, which is fine: it is a cheap planning-time pass over
+    // per-file min/max values.
+    //
+    // Missing/unusable statistics fall through too: the grouping below fails the
+    // same way and takes its default-grouping fallback.
+    if let Some(ordered_files) = order_files_if_non_overlapping(&flat, ordering, table_schema) {
+        return chunk_ordered_files(ordered_files, target_partitions);
     }
 
     match FileScanConfig::split_groups_by_statistics_with_target_partitions(
@@ -500,14 +512,14 @@ async fn get_data_scan_plan(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut partition_stats = HashMap::new();
 
-    // Exact partition-column values per data file, keyed by file URL. Consumed by
-    // `DeltaScanExec::try_pushdown_sort` to regroup files for a pushed-down sort.
-    let partition_column_names: Vec<String> = scan_plan
-        .table_configuration()
-        .metadata()
-        .partition_columns()
-        .into();
-    let mut partition_values_by_file: HashMap<String, Vec<ScalarValue>> = HashMap::new();
+    // `DeltaScanExec::try_pushdown_sort` regroups files by their partition-column
+    // values. Attach them to each file so they survive the regrouping; skip the
+    // work entirely for the table shapes that can never take that path.
+    let table_config = scan_plan.table_configuration();
+    let partition_column_names = table_config.metadata().partition_columns();
+    let collect_partition_values = !partition_column_names.is_empty()
+        && scan_plan.contract.retained_row_index_field().is_none()
+        && !table_config.is_feature_enabled(&TableFeature::ColumnMapping);
 
     // Convert the files into datafusions `PartitionedFile`s grouped by the object store they are stored in
     // this is used to create a DataSourceExec plan for each store
@@ -516,12 +528,6 @@ async fn get_data_scan_plan(
     let to_partitioned_file = |f: ScanFileContext| {
         if let Some(part_stata) = &f.partitions {
             update_partition_stats(part_stata, &f.stats, &mut partition_stats)?;
-        }
-        if !partition_column_names.is_empty() {
-            partition_values_by_file.insert(
-                f.file_url.as_str().to_string(),
-                extract_partition_values(f.partitions.as_ref(), &partition_column_names)?,
-            );
         }
         // We create a PartitionedFile from the ObjectMeta to avoid any surprises in path encoding
         // that may arise from using the 'new' method directly. i.e. the 'new' method encodes paths
@@ -539,6 +545,14 @@ async fn get_data_scan_plan(
         // on `partition_values`, so partition values must be set first.
         partitioned_file.partition_values = vec![file_value.clone()];
         partitioned_file = partitioned_file.with_statistics(Arc::new(f.stats));
+        if collect_partition_values {
+            partitioned_file
+                .extensions
+                .insert(DeltaPartitionValues(extract_partition_values(
+                    f.partitions.as_ref(),
+                    partition_column_names,
+                )?));
+        }
         Ok::<_, DataFusionError>((
             f.file_url.as_object_store_url(),
             (partitioned_file, None::<Vec<bool>>),
@@ -585,14 +599,17 @@ async fn get_data_scan_plan(
         partition_stats,
         metrics,
     )
-    .with_scan_metadata(
-        file_sort_order,
-        partition_column_names,
-        partition_values_by_file,
-    );
+    .with_file_sort_order(file_sort_order);
 
     Ok(Arc::new(exec))
 }
+
+/// Exact partition-column values for one data file, aligned to the table's
+/// partition columns. Attached to each [`PartitionedFile`] so that
+/// [`DeltaScanExec::try_pushdown_sort`] can bucket files by partition value
+/// without a side table keyed on file paths.
+#[derive(Debug)]
+pub(super) struct DeltaPartitionValues(pub(super) Vec<ScalarValue>);
 
 /// Extract the exact partition-column values for one file from its kernel
 /// partition struct, aligned to `partition_column_names` (missing columns become
@@ -601,19 +618,18 @@ fn extract_partition_values(
     partitions: Option<&StructData>,
     partition_column_names: &[String],
 ) -> Result<Vec<ScalarValue>> {
-    let mut values = vec![ScalarValue::Null; partition_column_names.len()];
     let Some(data) = partitions else {
-        return Ok(values);
+        return Ok(vec![ScalarValue::Null; partition_column_names.len()]);
     };
-    for (field, scalar) in data.fields().iter().zip(data.values().iter()) {
-        if let Some(pos) = partition_column_names
-            .iter()
-            .position(|name| name == field.name())
-        {
-            values[pos] = to_datafusion_scalar(scalar)?;
-        }
-    }
-    Ok(values)
+    partition_column_names
+        .iter()
+        .map(
+            |name| match data.index_of(name).and_then(|i| data.value(i)) {
+                Some(scalar) => to_datafusion_scalar(scalar),
+                None => Ok(ScalarValue::Null),
+            },
+        )
+        .try_collect()
 }
 
 fn update_partition_stats(

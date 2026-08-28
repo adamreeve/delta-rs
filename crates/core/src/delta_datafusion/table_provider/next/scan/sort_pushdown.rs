@@ -31,10 +31,13 @@ use datafusion::common::{ColumnStatistics, HashMap, Result, stats::Precision};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::scalar::ScalarValue;
+use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
-use datafusion_datasource::{PartitionedFile, file_scan_config::FileScanConfig};
 
-use super::{MAX_PARTITION_DICT_CARDINALITY, chunk_ordered_files};
+use super::{
+    DeltaPartitionValues, MAX_PARTITION_DICT_CARDINALITY, chunk_ordered_files,
+    null_free_ordering_prefix, order_files_if_non_overlapping,
+};
 
 /// Outcome of planning a sort pushdown: the regrouped, range-ordered file groups
 /// plus the per-execution-partition partition-column statistics that
@@ -54,29 +57,24 @@ pub(super) struct SortPushdownPlan {
 struct PrefixColumn {
     /// Logical (output-schema) column name.
     name: String,
+    /// Index of this column in the table's partition columns, i.e. into the
+    /// [`DeltaPartitionValues`] attached to each file.
+    position: usize,
     options: SortOptions,
 }
 
-/// A file paired with its exact leading-partition-column values (aligned with
-/// the requested ordering's partition prefix).
-struct FileEntry {
-    file: PartitionedFile,
-    prefix_values: Vec<ScalarValue>,
-}
-
-/// Recover the source file URL that [`super::get_data_scan_plan`] stashed as the
-/// synthetic file-id partition value on each [`PartitionedFile`].
-fn file_url_of(file: &PartitionedFile) -> Option<String> {
-    match file.partition_values.first()? {
-        ScalarValue::Dictionary(_, inner) => match inner.as_ref() {
-            ScalarValue::Utf8(Some(s))
-            | ScalarValue::LargeUtf8(Some(s))
-            | ScalarValue::Utf8View(Some(s)) => Some(s.clone()),
-            _ => None,
-        },
-        ScalarValue::Utf8(Some(s)) => Some(s.clone()),
-        _ => None,
-    }
+/// A requested ordering this scan can satisfy by regrouping its files: a
+/// non-empty prefix of partition columns, followed by a (possibly empty) prefix
+/// of the declared file sort order.
+///
+/// Produced by [`analyze_order`], which needs only schemas and column names —
+/// no file data — so the common "not a partition-prefixed ordering" case is
+/// rejected before the caller does any per-file work.
+pub(super) struct OrderShape {
+    prefix: Vec<PrefixColumn>,
+    /// The suffix, expressed over the parquet read schema, or `None` when the
+    /// requested ordering is partition columns only.
+    suffix: Option<LexOrdering>,
 }
 
 /// Compare two partition-prefix value tuples under the prefix column options.
@@ -99,288 +97,217 @@ fn cmp_prefix(a: &[ScalarValue], b: &[ScalarValue], prefix: &[PrefixColumn]) -> 
     Some(Ordering::Equal)
 }
 
-/// Plan a sort pushdown for the requested `order`, or return `None` when it
-/// cannot be satisfied exactly (the caller then reports `Unsupported`).
+/// Classify `order` as a partition-column prefix plus a file-sort-order suffix,
+/// or `None` when this scan cannot satisfy it by regrouping.
 ///
 /// * `output_schema` – the scan's logical output schema (`order` is bound to it).
-/// * `parquet_read_schema` – physical file columns (`file_sort_order` is bound to
-///   it); also the prefix of the file scan's table schema, so column indices
-///   match `PartitionedFile` statistics.
+/// * `parquet_read_schema` – physical file columns, which `file_sort_order` is
+///   bound to; also the prefix of the file scan's table schema, so its column
+///   indices address `PartitionedFile` statistics directly.
 /// * `partition_column_names` – logical partition columns, in table order.
 /// * `file_sort_order` – resolved per-file ordering over `parquet_read_schema`.
-/// * `partition_values_by_file` – exact partition-column values per file URL,
-///   aligned with `partition_column_names`.
-/// * `files` – the flattened file list from the inner file scan.
-/// * `target_groups` – desired execution-partition count (the inner scan's
-///   current partition count).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn plan_sort_pushdown(
-    order: &[PhysicalSortExpr],
+pub(super) fn analyze_order(
+    order: &LexOrdering,
     output_schema: &SchemaRef,
     parquet_read_schema: &SchemaRef,
     partition_column_names: &[String],
     file_sort_order: Option<&LexOrdering>,
-    partition_values_by_file: &HashMap<String, Vec<ScalarValue>>,
+) -> Option<OrderShape> {
+    if partition_column_names.is_empty() {
+        return None;
+    }
+    let column_name = |schema: &SchemaRef, sort_expr: &PhysicalSortExpr| -> Option<String> {
+        let col = sort_expr.expr.downcast_ref::<Column>()?;
+        Some(schema.fields().get(col.index())?.name().clone())
+    };
+
+    // Split the ordering at the first non-partition column.
+    let mut prefix = Vec::new();
+    for sort_expr in order.iter() {
+        let name = column_name(output_schema, sort_expr)?;
+        let Some(position) = partition_column_names.iter().position(|p| *p == name) else {
+            break;
+        };
+        prefix.push(PrefixColumn {
+            name,
+            position,
+            options: sort_expr.options,
+        });
+    }
+    if prefix.is_empty() {
+        // The pure-data-column case is already handled when the scan is planned;
+        // there is nothing for a regrouping to add.
+        return None;
+    }
+    let suffix_exprs = &order[prefix.len()..];
+    if suffix_exprs.is_empty() {
+        return Some(OrderShape {
+            prefix,
+            suffix: None,
+        });
+    }
+
+    // The suffix must match a prefix of the declared file sort order, column for
+    // column and direction for direction, re-expressed over the read schema.
+    let file_sort_order = file_sort_order?;
+    if suffix_exprs.len() > file_sort_order.len() {
+        return None;
+    }
+    let mut suffix = Vec::with_capacity(suffix_exprs.len());
+    for (suffix_expr, file_sort_expr) in suffix_exprs.iter().zip(file_sort_order.iter()) {
+        let suffix_name = column_name(output_schema, suffix_expr)?;
+        // A partition column after the prefix cannot be honored by regrouping:
+        // the files are not ordered on it.
+        if partition_column_names.contains(&suffix_name) {
+            return None;
+        }
+        let index = file_sort_expr.expr.downcast_ref::<Column>()?.index();
+        let file_sort_name = parquet_read_schema.fields().get(index)?.name();
+        if *file_sort_name != suffix_name || suffix_expr.options != file_sort_expr.options {
+            return None;
+        }
+        suffix.push(PhysicalSortExpr::new(
+            Arc::new(Column::new(file_sort_name, index)),
+            suffix_expr.options,
+        ));
+    }
+
+    Some(OrderShape {
+        prefix,
+        suffix: LexOrdering::new(suffix),
+    })
+}
+
+/// A contiguous run of whole buckets (or one slice of a single bucket) that
+/// becomes one execution partition, tagged with the partition-value range it
+/// spans.
+struct BucketGroup {
+    files: Vec<PartitionedFile>,
+    /// Prefix key of the first bucket in the run.
+    min_key: Vec<ScalarValue>,
+    /// Prefix key of the last bucket in the run.
+    max_key: Vec<ScalarValue>,
+}
+
+/// Files sharing one partition-prefix key, ordered on the suffix.
+struct Bucket {
+    key: Vec<ScalarValue>,
+    files: Vec<PartitionedFile>,
+}
+
+/// Regroup `files` so that reading each group in order yields the ordering
+/// described by `shape`, or return `None` when that cannot be guaranteed (the
+/// caller then reports `Unsupported`).
+///
+/// * `parquet_read_schema` – physical file columns; its indices address
+///   `PartitionedFile` statistics directly.
+/// * `parquet_table_schema` – the file scan's full table schema, for
+///   DataFusion's statistics-based non-overlap check.
+/// * `target_groups` – desired execution-partition count.
+pub(super) fn plan_sort_pushdown(
+    shape: &OrderShape,
+    parquet_read_schema: &SchemaRef,
     parquet_table_schema: &SchemaRef,
     files: Vec<PartitionedFile>,
     target_groups: usize,
 ) -> Result<Option<SortPushdownPlan>> {
-    if order.is_empty() || files.is_empty() || partition_column_names.is_empty() {
+    if files.is_empty() {
         return Ok(None);
     }
+    let prefix = &shape.prefix;
 
-    let column_name = |schema: &SchemaRef, sort_expr: &PhysicalSortExpr| -> Option<String> {
-        let col = sort_expr.expr.downcast_ref::<Column>()?;
-        let field = schema.fields().get(col.index())?;
-        Some(field.name().clone())
-    };
-
-    // --- Split the requested ordering into a partition-column prefix and a
-    // data-column suffix. ---
-    let mut prefix_len = 0;
-    for sort_expr in order {
-        let Some(name) = column_name(output_schema, sort_expr) else {
+    // --- Pair every file with its exact partition-prefix key. ---
+    // Sort a lightweight (key, index) permutation rather than the files, which
+    // are large enough that moving them during the sort dominates.
+    let mut keyed: Vec<(Vec<ScalarValue>, usize)> = Vec::with_capacity(files.len());
+    for (index, file) in files.iter().enumerate() {
+        let Some(values) = file.extensions.get::<DeltaPartitionValues>() else {
             return Ok(None);
         };
-        if partition_column_names.contains(&name) {
-            prefix_len += 1;
-        } else {
-            break;
-        }
-    }
-    if prefix_len == 0 {
-        // No partition prefix: the plain per-file path (handled at scan planning
-        // time) already covers this; nothing to add here.
-        return Ok(None);
-    }
-    let (prefix_exprs, suffix_exprs) = order.split_at(prefix_len);
-
-    let prefix: Vec<PrefixColumn> = prefix_exprs
-        .iter()
-        .map(|sort_expr| PrefixColumn {
-            name: column_name(output_schema, sort_expr).expect("checked above"),
-            options: sort_expr.options,
-        })
-        .collect();
-
-    // The suffix must reference only data columns and match a prefix of the
-    // declared file sort order (same columns, same direction).
-    let mut suffix_indices: Vec<usize> = Vec::with_capacity(suffix_exprs.len());
-    if !suffix_exprs.is_empty() {
-        let Some(file_sort_order) = file_sort_order else {
-            return Ok(None);
-        };
-        if suffix_exprs.len() > file_sort_order.len() {
-            return Ok(None);
-        }
-        for (suffix_expr, file_sort_expr) in suffix_exprs.iter().zip(file_sort_order.iter()) {
-            let Some(suffix_name) = column_name(output_schema, suffix_expr) else {
-                return Ok(None);
-            };
-            if partition_column_names.contains(&suffix_name) {
-                // A partition column after the prefix cannot be honored by
-                // regrouping: the data files are not ordered on it.
-                return Ok(None);
-            }
-            let Some(file_sort_col) = file_sort_expr.expr.downcast_ref::<Column>() else {
-                return Ok(None);
-            };
-            let Some(file_sort_name) = parquet_read_schema
-                .fields()
-                .get(file_sort_col.index())
-                .map(|f| f.name())
-            else {
-                return Ok(None);
-            };
-            if *file_sort_name != suffix_name || suffix_expr.options != file_sort_expr.options {
-                return Ok(None);
-            }
-            suffix_indices.push(file_sort_col.index());
-        }
-    }
-
-    // --- Pair every file with its exact leading-partition-column values. ---
-    let prefix_positions: Vec<usize> = prefix
-        .iter()
-        .map(|col| {
-            partition_column_names
-                .iter()
-                .position(|name| *name == col.name)
-                .expect("prefix column is a partition column")
-        })
-        .collect();
-
-    let mut entries: Vec<FileEntry> = Vec::with_capacity(files.len());
-    for file in files {
-        let Some(url) = file_url_of(&file) else {
-            return Ok(None);
-        };
-        let Some(values) = partition_values_by_file.get(&url) else {
-            return Ok(None);
-        };
-        let mut prefix_values = Vec::with_capacity(prefix_positions.len());
-        for &pos in &prefix_positions {
-            match values.get(pos) {
-                Some(value) if !value.is_null() => prefix_values.push(value.clone()),
-                // A null partition value cannot be ordered against non-null
-                // values via min/max statistics; bail rather than risk a wrong
-                // ordering claim.
+        let mut key = Vec::with_capacity(prefix.len());
+        for col in prefix {
+            match values.0.get(col.position) {
+                // A null partition value cannot be ordered against non-null ones
+                // via min/max statistics.
+                Some(value) if !value.is_null() => key.push(value.clone()),
                 _ => return Ok(None),
             }
         }
-        entries.push(FileEntry {
-            file,
-            prefix_values,
-        });
+        keyed.push((key, index));
     }
+    // Best-effort: incomparable keys fall back to `Equal` here and are rejected
+    // by the strict step check below.
+    keyed.sort_by(|a, b| cmp_prefix(&a.0, &b.0, prefix).unwrap_or(Ordering::Equal));
 
-    // --- Bucket files by partition-prefix tuple, ordered by the prefix. ---
-    // The sort is best-effort: it needs a total order, so incomparable values
-    // fall back to `Equal` and may land anywhere. The strict boundary check
-    // below is what makes the resulting bucket order sound.
-    entries.sort_by(|a, b| {
-        cmp_prefix(&a.prefix_values, &b.prefix_values, &prefix).unwrap_or(Ordering::Equal)
-    });
-
-    let mut buckets: Vec<(Vec<ScalarValue>, Vec<PartitionedFile>)> = Vec::new();
-    for entry in entries {
+    // --- Cut the sorted files into buckets of equal prefix key. ---
+    // One comparator decides both the bucket boundary and its validity: equal
+    // keys extend the current bucket, a strict step opens a new one, and
+    // anything else (incomparable, or out of order because the sort could not
+    // order them) means concatenating the buckets would not be ordered.
+    let mut slots: Vec<Option<PartitionedFile>> = files.into_iter().map(Some).collect();
+    let mut buckets: Vec<Bucket> = Vec::new();
+    for (key, index) in keyed {
+        let file = slots[index].take().expect("each file is claimed once");
         match buckets.last_mut() {
-            Some((key, files)) if *key == entry.prefix_values => files.push(entry.file),
-            _ => buckets.push((entry.prefix_values, vec![entry.file])),
+            None => buckets.push(Bucket {
+                key,
+                files: vec![file],
+            }),
+            Some(last) => match cmp_prefix(&last.key, &key, prefix) {
+                Some(Ordering::Equal) => last.files.push(file),
+                Some(Ordering::Less) => buckets.push(Bucket {
+                    key,
+                    files: vec![file],
+                }),
+                _ => return Ok(None),
+            },
         }
     }
 
-    // Every bucket must be strictly ordered against its predecessor: the groups
-    // are concatenated in this order and the scan advertises the result as an
-    // output ordering. Bucket boundaries are cut on `PartialEq` while the sort
-    // above uses `cmp_prefix`, so the two can disagree — an incomparable pair,
-    // or one that compares equal without being equal, must reject the pushdown
-    // rather than emit an out-of-order concatenation.
-    if !buckets
-        .windows(2)
-        .all(|pair| cmp_prefix(&pair[0].0, &pair[1].0, &prefix) == Some(Ordering::Less))
-    {
-        return Ok(None);
-    }
-
-    // Guard against pathological partition cardinality producing an unbounded
-    // number of scan partitions.
-    let max_buckets = usize::max(64, target_groups.saturating_mul(2));
-    if buckets.len() > max_buckets {
-        return Ok(None);
-    }
-
-    // --- Order each bucket on the suffix and verify mutual non-overlap. ---
-    let suffix_ordering = if suffix_exprs.is_empty() {
-        None
-    } else {
-        let exprs: Vec<_> = suffix_exprs
-            .iter()
-            .zip(&suffix_indices)
-            .map(|(sort_expr, &index)| {
-                let name = parquet_read_schema.field(index).name();
-                PhysicalSortExpr::new(Arc::new(Column::new(name, index)), sort_expr.options)
-            })
-            .collect();
-        match LexOrdering::new(exprs) {
-            Some(ordering) => Some(ordering),
-            // Non-empty by construction; bail rather than silently claim an
-            // ordering we did not enforce.
-            None => return Ok(None),
-        }
-    };
-
-    let mut ordered_buckets: Vec<Vec<PartitionedFile>> = Vec::with_capacity(buckets.len());
-    for (_, bucket) in buckets {
-        let Some(suffix_ordering) = suffix_ordering.as_ref().filter(|_| bucket.len() > 1) else {
-            ordered_buckets.push(bucket);
-            continue;
-        };
-
-        // Concatenating multiple files into one group interleaves each file's
-        // nulls into the middle of the group; min/max cannot detect that, so a
-        // suffix column that may be null disqualifies a multi-file bucket.
-        for file in &bucket {
-            for &index in &suffix_indices {
-                let non_nullable = !parquet_read_schema.field(index).is_nullable();
-                let null_free = file
-                    .statistics
-                    .as_ref()
-                    .and_then(|stats| stats.column_statistics.get(index))
-                    .is_some_and(|col| col.null_count == Precision::Exact(0));
-                if !non_nullable && !null_free {
-                    return Ok(None);
-                }
+    // --- Order each bucket on the suffix, and require mutual non-overlap. ---
+    if let Some(suffix) = shape.suffix.as_ref() {
+        for bucket in &mut buckets {
+            if bucket.files.len() < 2 {
+                continue;
+            }
+            // Concatenating several files into one group interleaves each file's
+            // nulls into the middle of the group's stream, which min/max cannot
+            // detect, so every suffix column must be provably null-free.
+            let null_free = null_free_ordering_prefix(suffix, parquet_read_schema, &bucket.files);
+            if null_free.is_none_or(|p| p.len() < suffix.len()) {
+                return Ok(None);
+            }
+            let flat = vec![FileGroup::new(std::mem::take(&mut bucket.files))];
+            match order_files_if_non_overlapping(&flat, suffix, parquet_table_schema) {
+                Some(ordered) => bucket.files = ordered,
+                None => return Ok(None),
             }
         }
-
-        let flat = vec![FileGroup::new(bucket)];
-        match FileScanConfig::split_groups_by_statistics(
-            parquet_table_schema,
-            &flat,
-            suffix_ordering,
-        ) {
-            // Exactly one group back means the bucket's files are mutually
-            // non-overlapping on the suffix and now correctly ordered.
-            Ok(mut groups) if groups.len() == 1 => {
-                ordered_buckets.push(groups.remove(0).into_inner());
-            }
-            // Overlapping files within one partition value: not handled here.
-            _ => return Ok(None),
-        }
     }
 
-    // --- Split buckets into contiguous groups without ever spanning a bucket
-    // boundary, so every group boundary is either suffix-ordered (within a
-    // bucket) or a strict partition-column step (between buckets). ---
-    let file_groups = chunk_buckets(&ordered_buckets, target_groups);
-    if file_groups
-        .iter()
-        .any(|group| group.len() > MAX_PARTITION_DICT_CARDINALITY)
-    {
-        return Ok(None);
-    }
-
-    // --- Per-group exact statistics for the prefix partition columns. ---
-    let mut per_partition_stats: Vec<HashMap<String, ColumnStatistics>> =
-        Vec::with_capacity(file_groups.len());
-    for group in &file_groups {
-        let mut group_stats: HashMap<String, ColumnStatistics> = HashMap::new();
-        for (col, &pos) in prefix.iter().zip(&prefix_positions) {
-            let mut min_value: Option<ScalarValue> = None;
-            let mut max_value: Option<ScalarValue> = None;
-            for file in group.iter() {
-                let url = file_url_of(file).expect("validated above");
-                let value = partition_values_by_file
-                    .get(&url)
-                    .and_then(|values| values.get(pos))
-                    .cloned()
-                    .expect("validated above");
-                min_value = Some(match min_value {
-                    Some(current) if current.partial_cmp(&value) == Some(Ordering::Less) => current,
-                    _ => value.clone(),
-                });
-                max_value = Some(match max_value {
-                    Some(current) if current.partial_cmp(&value) == Some(Ordering::Greater) => {
-                        current
-                    }
-                    _ => value,
-                });
-            }
-            group_stats.insert(
-                col.name.clone(),
-                ColumnStatistics {
-                    null_count: Precision::Exact(0),
-                    min_value: Precision::Exact(min_value.expect("group is non-empty")),
-                    max_value: Precision::Exact(max_value.expect("group is non-empty")),
-                    distinct_count: Precision::Absent,
-                    sum_value: Precision::Absent,
-                    byte_size: Precision::Absent,
-                },
-            );
-        }
-        per_partition_stats.push(group_stats);
-    }
+    // --- Cut the buckets into groups and read the statistics off their keys. ---
+    let groups = chunk_buckets(buckets, target_groups);
+    let (file_groups, per_partition_stats) = groups
+        .into_iter()
+        .map(|group| {
+            let stats = prefix
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    (
+                        col.name.clone(),
+                        ColumnStatistics {
+                            null_count: Precision::Exact(0),
+                            min_value: Precision::Exact(group.min_key[i].clone()),
+                            max_value: Precision::Exact(group.max_key[i].clone()),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            (FileGroup::from(group.files), stats)
+        })
+        .unzip();
 
     Ok(Some(SortPushdownPlan {
         file_groups,
@@ -388,30 +315,108 @@ pub(super) fn plan_sort_pushdown(
     }))
 }
 
-/// Split each bucket's ordered file list into contiguous groups, allocating the
-/// `target` group budget across buckets in proportion to their file counts. A
-/// group never spans two buckets.
-fn chunk_buckets(buckets: &[Vec<PartitionedFile>], target: usize) -> Vec<FileGroup> {
-    let total_files: usize = buckets.iter().map(|bucket| bucket.len()).sum();
+/// Cut ordered, mutually non-overlapping buckets into roughly `target` groups.
+///
+/// Group boundaries always fall on bucket boundaries, so each group spans a
+/// contiguous run of whole buckets and consecutive groups take a strict step on
+/// the partition prefix — which is what lets `ProgressiveEvalRule` prove the
+/// execution partitions disjoint. When there are more buckets than groups they
+/// are packed together; when there are fewer, the largest are split.
+///
+/// The one exception is a single bucket holding more files than the file-id
+/// partition dictionary can key, which is split further; every resulting group
+/// still carries that bucket's key, so its statistics stay exact.
+fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Vec<BucketGroup> {
+    let target = target.max(1);
+    let total_files: usize = buckets.iter().map(|bucket| bucket.files.len()).sum();
     if total_files == 0 {
         return Vec::new();
     }
-    let mut remaining_target = target.max(1);
-    let mut remaining_files = total_files;
-    let mut out = Vec::new();
-    for bucket in buckets {
-        let bucket_files = bucket.len();
-        // Ceil-divide the remaining budget by remaining files, then scale by
-        // this bucket, so small buckets still get at least one group and the
-        // budget is not exhausted early.
-        let want = remaining_target
-            .saturating_mul(bucket_files)
-            .div_ceil(remaining_files.max(1));
-        let groups = want.clamp(1, bucket_files);
-        out.extend(chunk_ordered_files(bucket.clone(), groups));
-        remaining_target = remaining_target.saturating_sub(groups).max(1);
-        remaining_files -= bucket_files;
+
+    if buckets.len() >= target {
+        return pack_buckets(buckets, target, total_files);
     }
+
+    // Fewer buckets than groups: split each bucket, giving it a share of the
+    // group budget proportional to its file count and at least one group.
+    let mut out = Vec::with_capacity(target);
+    let mut groups_left = target;
+    let mut files_left = total_files;
+    for bucket in buckets {
+        let files = bucket.files.len();
+        let share = (groups_left * files).div_ceil(files_left).clamp(1, files);
+        out.extend(
+            chunk_ordered_files(bucket.files, share)
+                .into_iter()
+                .map(|group| BucketGroup {
+                    files: group.into_inner(),
+                    min_key: bucket.key.clone(),
+                    max_key: bucket.key.clone(),
+                }),
+        );
+        groups_left = groups_left.saturating_sub(share).max(1);
+        files_left -= files;
+    }
+    out
+}
+
+/// Pack contiguous runs of whole buckets into `target` groups, balanced by file
+/// count. A run is also cut when it would outgrow the file-id dictionary.
+fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<BucketGroup> {
+    let mut out: Vec<BucketGroup> = Vec::with_capacity(target);
+    let mut groups_left = target;
+    let mut files_left = total_files;
+    let mut run: Option<BucketGroup> = None;
+    let mut buckets_left = buckets.len();
+
+    for bucket in buckets {
+        buckets_left -= 1;
+        let files = bucket.files.len();
+
+        // A bucket too large for the dictionary key space is split on its own;
+        // every piece keeps the bucket's key, so its statistics stay exact.
+        if files > MAX_PARTITION_DICT_CARDINALITY {
+            out.extend(run.take());
+            out.extend(
+                chunk_ordered_files(bucket.files, files.div_ceil(MAX_PARTITION_DICT_CARDINALITY))
+                    .into_iter()
+                    .map(|group| BucketGroup {
+                        files: group.into_inner(),
+                        min_key: bucket.key.clone(),
+                        max_key: bucket.key.clone(),
+                    }),
+            );
+            groups_left = groups_left.saturating_sub(1).max(1);
+            files_left -= files;
+            continue;
+        }
+
+        match run.as_mut() {
+            Some(open) if open.files.len() + files <= MAX_PARTITION_DICT_CARDINALITY => {
+                open.files.extend(bucket.files);
+                open.max_key = bucket.key;
+            }
+            _ => {
+                out.extend(run.take());
+                run = Some(BucketGroup {
+                    files: bucket.files,
+                    min_key: bucket.key.clone(),
+                    max_key: bucket.key,
+                });
+            }
+        }
+
+        // Close the run once it has its share of the files, or once every
+        // remaining bucket is needed to fill a remaining group.
+        let open = run.as_ref().expect("a run is open");
+        let share = files_left.div_ceil(groups_left);
+        if open.files.len() >= share || buckets_left < groups_left {
+            files_left -= open.files.len();
+            groups_left = groups_left.saturating_sub(1).max(1);
+            out.extend(run.take());
+        }
+    }
+    out.extend(run);
     out
 }
 
@@ -464,9 +469,16 @@ mod tests {
         LexOrdering::new(vec![asc(0, "timestamp")]).unwrap()
     }
 
-    /// A file carrying its synthetic file-id partition value and exact
-    /// timestamp min/max statistics (index 0 of the parquet table schema).
-    fn file(url: &str, ts_min: i64, ts_max: i64, ts_nulls: usize) -> PartitionedFile {
+    /// A file carrying its synthetic file-id partition value, its Delta
+    /// partition values, and exact timestamp min/max statistics (index 0 of the
+    /// parquet table schema).
+    fn file(
+        url: &str,
+        part: ScalarValue,
+        ts_min: i64,
+        ts_max: i64,
+        ts_nulls: usize,
+    ) -> PartitionedFile {
         let mut file = PartitionedFile::new(url.to_string(), 100);
         file.partition_values = vec![wrap_file_id_value(url)];
         file.statistics = Some(Arc::new(Statistics {
@@ -483,30 +495,26 @@ mod tests {
                 ColumnStatistics::default(),
             ],
         }));
+        file.extensions.insert(DeltaPartitionValues(vec![part]));
         file
     }
 
-    fn values(part: &str) -> Vec<ScalarValue> {
-        vec![ScalarValue::Utf8(Some(part.to_string()))]
+    fn utf8(part: &str) -> ScalarValue {
+        ScalarValue::Utf8(Some(part.to_string()))
     }
 
     struct Fixture {
         files: Vec<PartitionedFile>,
-        partition_values_by_file: HashMap<String, Vec<ScalarValue>>,
     }
 
     impl Fixture {
         /// `specs` is `(url, part, ts_min, ts_max)`.
-        fn new(specs: &[(&str, &str, i64, i64)]) -> Self {
-            let mut files = Vec::new();
-            let mut partition_values_by_file = HashMap::new();
-            for (url, part, ts_min, ts_max) in specs {
-                files.push(file(url, *ts_min, *ts_max, 0));
-                partition_values_by_file.insert((*url).to_string(), values(part));
-            }
+        fn new(specs: &[(&str, ScalarValue, i64, i64)]) -> Self {
             Self {
-                files,
-                partition_values_by_file,
+                files: specs
+                    .iter()
+                    .map(|(url, part, ts_min, ts_max)| file(url, part.clone(), *ts_min, *ts_max, 0))
+                    .collect(),
             }
         }
 
@@ -516,13 +524,17 @@ mod tests {
             file_sort_order: Option<&LexOrdering>,
             target_groups: usize,
         ) -> Option<SortPushdownPlan> {
-            plan_sort_pushdown(
-                order,
+            let order = LexOrdering::new(order.to_vec()).unwrap();
+            let shape = analyze_order(
+                &order,
                 &output_schema(),
                 &parquet_read_schema(),
                 &["part".to_string()],
                 file_sort_order,
-                &self.partition_values_by_file,
+            )?;
+            plan_sort_pushdown(
+                &shape,
+                &parquet_read_schema(),
                 &parquet_table_schema(),
                 self.files.clone(),
                 target_groups,
@@ -541,10 +553,10 @@ mod tests {
     #[test]
     fn non_overlapping_within_partition_forms_one_group_per_file() {
         let fixture = Fixture::new(&[
-            ("a2", "A", 200, 299),
-            ("a0", "A", 0, 99),
-            ("b0", "B", 50, 149),
-            ("a1", "A", 100, 199),
+            ("a2", utf8("A"), 200, 299),
+            ("a0", utf8("A"), 0, 99),
+            ("b0", utf8("B"), 50, 149),
+            ("a1", utf8("A"), 100, 199),
         ]);
         let order = vec![asc(0, "part"), asc(1, "timestamp")];
 
@@ -571,10 +583,10 @@ mod tests {
     #[test]
     fn groups_never_span_a_partition_boundary() {
         let fixture = Fixture::new(&[
-            ("a0", "A", 0, 99),
-            ("a1", "A", 100, 199),
-            ("a2", "A", 200, 299),
-            ("b0", "B", 50, 149),
+            ("a0", utf8("A"), 0, 99),
+            ("a1", utf8("A"), 100, 199),
+            ("a2", utf8("A"), 200, 299),
+            ("b0", utf8("B"), 50, 149),
         ]);
         let order = vec![asc(0, "part"), asc(1, "timestamp")];
 
@@ -584,24 +596,24 @@ mod tests {
             .plan(&order, Some(&file_sort_order()), 2)
             .expect("expected a pushdown plan");
 
-        for group in &plan.file_groups {
+        for (group, stats) in plan.file_groups.iter().zip(&plan.per_partition_stats) {
             let parts: std::collections::HashSet<_> = group
                 .iter()
-                .map(|f| {
-                    let url = f.object_meta.location.to_string();
-                    fixture.partition_values_by_file[&url][0].clone()
-                })
+                .map(|f| f.extensions.get::<DeltaPartitionValues>().unwrap().0[0].clone())
                 .collect();
             assert_eq!(parts.len(), 1, "a group spans two partition values");
+            // A single-partition group reports that value as an exact point range.
+            let stat = &stats["part"];
+            assert_eq!(stat.min_value, stat.max_value);
         }
     }
 
     #[test]
     fn overlapping_files_within_a_partition_are_not_supported() {
         let fixture = Fixture::new(&[
-            ("a0", "A", 0, 150),
-            ("a1", "A", 100, 199),
-            ("b0", "B", 0, 99),
+            ("a0", utf8("A"), 0, 150),
+            ("a1", utf8("A"), 100, 199),
+            ("b0", utf8("B"), 0, 99),
         ]);
         let order = vec![asc(0, "part"), asc(1, "timestamp")];
 
@@ -611,37 +623,24 @@ mod tests {
     #[test]
     fn incomparable_partition_values_are_not_supported() {
         // Mismatched `ScalarValue` variants for one partition column are
-        // incomparable. The best-effort sort cannot order them, and bucket
-        // boundaries are cut on `PartialEq`, so without the strict boundary
-        // check the buckets would be concatenated in an arbitrary order while
-        // the scan advertises `[part, timestamp]` as an output ordering.
-        let files = vec![file("a0", 0, 99, 0), file("b0", 100, 199, 0)];
-        let mut partition_values_by_file = HashMap::new();
-        partition_values_by_file.insert("a0".to_string(), values("A"));
-        partition_values_by_file.insert("b0".to_string(), vec![ScalarValue::Int64(Some(1))]);
+        // incomparable, so the best-effort sort cannot order them. Without the
+        // strict step check when cutting buckets they would be concatenated in
+        // an arbitrary order while the scan advertises `[part, timestamp]` as an
+        // output ordering.
+        let fixture = Fixture::new(&[
+            ("a0", utf8("A"), 0, 99),
+            ("b0", ScalarValue::Int64(Some(1)), 100, 199),
+        ]);
         let order = vec![asc(0, "part"), asc(1, "timestamp")];
 
-        let plan = plan_sort_pushdown(
-            &order,
-            &output_schema(),
-            &parquet_read_schema(),
-            &["part".to_string()],
-            Some(&file_sort_order()),
-            &partition_values_by_file,
-            &parquet_table_schema(),
-            files,
-            4,
-        )
-        .unwrap();
-
-        assert!(plan.is_none());
+        assert!(fixture.plan(&order, Some(&file_sort_order()), 4).is_none());
     }
 
     #[test]
     fn nulls_in_a_multi_file_bucket_suffix_are_not_supported() {
-        let mut fixture = Fixture::new(&[("a0", "A", 0, 99), ("a1", "A", 100, 199)]);
+        let mut fixture = Fixture::new(&[("a0", utf8("A"), 0, 99), ("a1", utf8("A"), 100, 199)]);
         // Give the second file a nullable-looking timestamp column with nulls.
-        fixture.files[1] = file("a1", 100, 199, 3);
+        fixture.files[1] = file("a1", utf8("A"), 100, 199, 3);
         let order = vec![asc(0, "part"), asc(1, "timestamp")];
 
         assert!(fixture.plan(&order, Some(&file_sort_order()), 4).is_none());
@@ -649,7 +648,7 @@ mod tests {
 
     #[test]
     fn leading_data_column_is_not_supported() {
-        let fixture = Fixture::new(&[("a0", "A", 0, 99), ("b0", "B", 0, 99)]);
+        let fixture = Fixture::new(&[("a0", utf8("A"), 0, 99), ("b0", utf8("B"), 0, 99)]);
         let order = vec![asc(1, "timestamp"), asc(0, "part")];
 
         assert!(fixture.plan(&order, Some(&file_sort_order()), 4).is_none());
@@ -657,7 +656,7 @@ mod tests {
 
     #[test]
     fn suffix_must_match_the_declared_file_sort_order() {
-        let fixture = Fixture::new(&[("a0", "A", 0, 99), ("b0", "B", 0, 99)]);
+        let fixture = Fixture::new(&[("a0", utf8("A"), 0, 99), ("b0", utf8("B"), 0, 99)]);
         // `value` is not the declared file sort column.
         let order = vec![asc(0, "part"), asc(2, "value")];
 
@@ -666,7 +665,11 @@ mod tests {
 
     #[test]
     fn partition_only_ordering_needs_no_file_sort_order() {
-        let fixture = Fixture::new(&[("b1", "B", 0, 99), ("a0", "A", 0, 99), ("b0", "B", 0, 99)]);
+        let fixture = Fixture::new(&[
+            ("b1", utf8("B"), 0, 99),
+            ("a0", utf8("A"), 0, 99),
+            ("b0", utf8("B"), 0, 99),
+        ]);
         let order = vec![asc(0, "part")];
 
         let plan = fixture
@@ -680,7 +683,7 @@ mod tests {
 
     #[test]
     fn descending_partition_prefix_orders_buckets_in_reverse() {
-        let fixture = Fixture::new(&[("a0", "A", 0, 99), ("b0", "B", 0, 99)]);
+        let fixture = Fixture::new(&[("a0", utf8("A"), 0, 99), ("b0", utf8("B"), 0, 99)]);
         let order = vec![
             PhysicalSortExpr::new(
                 Arc::new(Column::new("part", 0)),
@@ -823,74 +826,56 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn e2e_partition_prefix_sort_avoids_sort_and_uses_progressive_eval() {
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::TimestampMicrosecondType;
-
-        use crate::delta_datafusion::{FileSortColumn, create_session};
-
-        let table = partitioned_sorted_table().await;
-        let ctx = create_session().into_inner();
-        let provider = table
-            .table_provider()
-            .with_file_sort_order([FileSortColumn::asc("timestamp")])
-            .await
-            .unwrap();
-        ctx.register_table("t", provider).unwrap();
-
-        let df = ctx
-            .sql("SELECT part, \"timestamp\", value FROM t ORDER BY part, \"timestamp\"")
-            .await
-            .unwrap();
-        let plan = df.create_physical_plan().await.unwrap();
-        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
-            .indent(true)
-            .to_string();
-        assert!(
-            !rendered.contains("SortExec"),
-            "expected no SortExec:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("ProgressiveEvalExec"),
-            "expected ProgressiveEvalExec:\n{rendered}"
-        );
-
-        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
-            .await
-            .unwrap();
-        let mut keys: Vec<(String, i64)> = Vec::new();
-        for batch in &batches {
-            let parts = arrow_cast::cast(batch.column(0), &arrow_schema::DataType::Utf8).unwrap();
-            let parts = parts.as_string::<i32>();
-            let timestamps = batch
-                .column(1)
-                .as_primitive::<TimestampMicrosecondType>()
-                .values();
-            for (part, ts) in parts.iter().zip(timestamps.iter()) {
-                keys.push((part.unwrap().to_string(), *ts));
-            }
-        }
-        assert_eq!(keys.len(), 400);
-        assert!(
-            keys.windows(2).all(|pair| pair[0] <= pair[1]),
-            "results are not ordered by (part, timestamp)"
-        );
-    }
-
     #[test]
-    fn chunk_buckets_allocates_without_spanning() {
-        let a: Vec<_> = (0..6).map(|i| file(&format!("a{i}"), i, i, 0)).collect();
-        let b: Vec<_> = (0..2).map(|i| file(&format!("b{i}"), i, i, 0)).collect();
-        let groups = chunk_buckets(&[a, b], 4);
-        // Every group's files come from a single bucket prefix.
+    fn chunk_buckets_splits_when_there_are_fewer_buckets_than_groups() {
+        let bucket = |name: char, n: i64| Bucket {
+            key: vec![utf8(&name.to_string())],
+            files: (0..n)
+                .map(|i| file(&format!("{name}{i}"), utf8(&name.to_string()), i, i, 0))
+                .collect(),
+        };
+        let groups = chunk_buckets(vec![bucket('a', 6), bucket('b', 2)], 4);
+
+        // Every group's files come from a single bucket.
         for group in &groups {
             let prefixes: std::collections::HashSet<char> = group
+                .files
                 .iter()
                 .map(|f| f.object_meta.location.to_string().chars().next().unwrap())
                 .collect();
             assert_eq!(prefixes.len(), 1);
+            assert_eq!(group.min_key, group.max_key);
         }
-        assert_eq!(groups.iter().map(FileGroup::len).sum::<usize>(), 8);
+        assert_eq!(groups.iter().map(|g| g.files.len()).sum::<usize>(), 8);
+        assert!(groups.len() >= 2, "each bucket gets at least one group");
+    }
+
+    /// With more buckets than groups, whole buckets are packed together so a
+    /// query selecting many partitions does not explode the scan's partition
+    /// count. Groups stay bucket-aligned, so consecutive groups still take a
+    /// strict step on the partition prefix.
+    #[test]
+    fn chunk_buckets_packs_whole_buckets_when_they_outnumber_groups() {
+        let buckets: Vec<Bucket> = (0..20)
+            .map(|i| {
+                let key = ScalarValue::Int64(Some(i));
+                Bucket {
+                    key: vec![key.clone()],
+                    files: vec![file(&format!("f{i}"), key, i, i, 0)],
+                }
+            })
+            .collect();
+
+        let groups = chunk_buckets(buckets, 4);
+
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups.iter().map(|g| g.files.len()).sum::<usize>(), 20);
+        // Each group's key range is strictly after the previous group's.
+        for pair in groups.windows(2) {
+            assert!(
+                pair[0].max_key[0] < pair[1].min_key[0],
+                "group key ranges must take a strict step"
+            );
+        }
     }
 }
