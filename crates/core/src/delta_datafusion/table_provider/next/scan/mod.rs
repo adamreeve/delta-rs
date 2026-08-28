@@ -24,7 +24,8 @@ use dashmap::DashMap;
 use datafusion::{
     catalog::Session,
     common::{
-        ColumnStatistics, HashMap, Result, Statistics, ToDFSchema, plan_err, stats::Precision,
+        ColumnStatistics, HashMap, Result, ScalarValue, Statistics, ToDFSchema, plan_err,
+        stats::Precision,
     },
     config::TableParquetOptions,
     datasource::physical_plan::{ParquetSource, parquet::CachedParquetFileReaderFactory},
@@ -77,6 +78,7 @@ mod exec;
 mod exec_meta;
 mod plan;
 mod replay;
+mod sort_pushdown;
 
 type ScanMetadataStream = Pin<Box<dyn Stream<Item = Result<ScanMetadata, DeltaTableError>> + Send>>;
 
@@ -498,6 +500,15 @@ async fn get_data_scan_plan(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut partition_stats = HashMap::new();
 
+    // Exact partition-column values per data file, keyed by file URL. Consumed by
+    // `DeltaScanExec::try_pushdown_sort` to regroup files for a pushed-down sort.
+    let partition_column_names: Vec<String> = scan_plan
+        .table_configuration()
+        .metadata()
+        .partition_columns()
+        .into();
+    let mut partition_values_by_file: HashMap<String, Vec<ScalarValue>> = HashMap::new();
+
     // Convert the files into datafusions `PartitionedFile`s grouped by the object store they are stored in
     // this is used to create a DataSourceExec plan for each store
     // To correlate the data with the original file, we add the file url as a partition value
@@ -505,6 +516,12 @@ async fn get_data_scan_plan(
     let to_partitioned_file = |f: ScanFileContext| {
         if let Some(part_stata) = &f.partitions {
             update_partition_stats(part_stata, &f.stats, &mut partition_stats)?;
+        }
+        if !partition_column_names.is_empty() {
+            partition_values_by_file.insert(
+                f.file_url.as_str().to_string(),
+                extract_partition_values(f.partitions.as_ref(), &partition_column_names)?,
+            );
         }
         // We create a PartitionedFile from the ObjectMeta to avoid any surprises in path encoding
         // that may arise from using the 'new' method directly. i.e. the 'new' method encodes paths
@@ -556,7 +573,7 @@ async fn get_data_scan_plan(
         &file_id_field,
         predicate,
         config.table_parquet_options.as_ref(),
-        file_sort_order,
+        file_sort_order.clone(),
     )
     .await?;
 
@@ -567,9 +584,36 @@ async fn get_data_scan_plan(
         Arc::new(dvs),
         partition_stats,
         metrics,
+    )
+    .with_scan_metadata(
+        file_sort_order,
+        partition_column_names,
+        partition_values_by_file,
     );
 
     Ok(Arc::new(exec))
+}
+
+/// Extract the exact partition-column values for one file from its kernel
+/// partition struct, aligned to `partition_column_names` (missing columns become
+/// [`ScalarValue::Null`]).
+fn extract_partition_values(
+    partitions: Option<&StructData>,
+    partition_column_names: &[String],
+) -> Result<Vec<ScalarValue>> {
+    let mut values = vec![ScalarValue::Null; partition_column_names.len()];
+    let Some(data) = partitions else {
+        return Ok(values);
+    };
+    for (field, scalar) in data.fields().iter().zip(data.values().iter()) {
+        if let Some(pos) = partition_column_names
+            .iter()
+            .position(|name| name == field.name())
+        {
+            values[pos] = to_datafusion_scalar(scalar)?;
+        }
+    }
+    Ok(values)
 }
 
 fn update_partition_stats(
@@ -705,8 +749,7 @@ async fn get_read_plan(
 
         // Set encryption factory if configured
         if let Some(factory_id) = &pq_options.crypto.factory_id {
-            let encryption_factory =
-                state.runtime_env().parquet_encryption_factory(factory_id)?;
+            let encryption_factory = state.runtime_env().parquet_encryption_factory(factory_id)?;
             file_source = file_source.with_encryption_factory(encryption_factory);
         }
 

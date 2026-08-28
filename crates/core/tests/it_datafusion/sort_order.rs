@@ -276,12 +276,14 @@ async fn delta_table_sort_order_validation() -> TestResult<()> {
     Ok(())
 }
 
-/// Ordering by the partition key and then the file sort order requires a
-/// `SortExec`: partition columns cannot participate in the file sort order
-/// (they are injected above the parquet scan), so the scan only exposes the
-/// `timestamp` ordering and file groups may interleave partition values.
+/// Ordering by `[partition key, file sort order]` is satisfied without a
+/// `SortExec`: `DeltaScanExec::try_pushdown_sort` regroups the files so each
+/// group holds a single partition value (or a contiguous, non-overlapping run of
+/// them) ordered by `timestamp`, and the groups are non-overlapping on
+/// `[part, timestamp]` — so the `SortPreservingMergeExec` is rewritten to a
+/// `ProgressiveEvalExec`.
 #[tokio::test]
-async fn delta_table_sort_order_degrades_for_partition_key_prefix() -> TestResult<()> {
+async fn delta_table_sort_order_partition_key_prefix_avoids_sort() -> TestResult<()> {
     let table = sorted_delta_table().await?;
 
     let ctx = create_session().into_inner();
@@ -299,8 +301,12 @@ async fn delta_table_sort_order_degrades_for_partition_key_prefix() -> TestResul
     let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
 
     assert!(
-        rendered.contains("SortExec"),
-        "expected SortExec in plan:\n{rendered}"
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
     );
 
     let mut keys: Vec<(String, i64)> = Vec::new();
