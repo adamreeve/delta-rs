@@ -1,27 +1,22 @@
-//! Sort-order pushdown for [`DeltaScanExec`](super::exec::DeltaScanExec).
+//! Sort pushdown implementation for [`DeltaScanExec`](super::exec::DeltaScanExec).
 //!
-//! DataFusion's `PushdownSort` physical optimizer rule calls
-//! [`ExecutionPlan::try_pushdown_sort`] on the input of a `SortExec`. When a
-//! Delta table declares a per-file sort order (`DeltaScanConfig::file_sort_order`)
-//! *and* the query orders by `[<partition columns…>, <file sort order prefix…>]`,
-//! the scan can satisfy that ordering without a `SortExec`:
+//! DataFusion's `PushdownSort` physical optimizer rule allows regrouping files to
+//! satisfy a query order and remove the need for a sort. This module handles this
+//! regrouping for queries where the sort order starts with partition columns, and
+//! any remaining sort expressions are a prefix of the declared file sort order.
 //!
 //! * Every data file belongs to exactly one partition, so within a file every
 //!   partition column is constant. A file sorted by the declared file sort order
 //!   is therefore also sorted by `[<any partition columns…>, <file sort order…>]`.
 //! * Partition-column values are known exactly per file, so files can be
-//!   bucketed by partition-column tuple, ordered within each bucket on the file
-//!   sort order (reusing DataFusion's statistics-based non-overlap check), and
-//!   the buckets concatenated in partition-column order.
+//!   bucketed by partition-column and ordered based on the file sort order, when
+//!   the files are non-overlapping with respect to the sort order.
 //!
 //! The resulting file groups are mutually non-overlapping and range-ordered on
 //! the combined ordering, so [`DeltaScanExec`](super::exec::DeltaScanExec)
 //! advertises it as an output ordering; the `SortExec` is removed and the
 //! `SortPreservingMergeExec` above it is later rewritten to a
 //! `ProgressiveEvalExec` by [`ProgressiveEvalRule`](super::super::ProgressiveEvalRule).
-//!
-//! This module holds the pure planning algorithm; the `ExecutionPlan` wiring and
-//! plan (de)construction live in [`super::exec`].
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -66,10 +61,6 @@ struct PrefixColumn {
 /// A requested ordering this scan can satisfy by regrouping its files: a
 /// non-empty prefix of partition columns, followed by a (possibly empty) prefix
 /// of the declared file sort order.
-///
-/// Produced by [`analyze_order`], which needs only schemas and column names —
-/// no file data — so the common "not a partition-prefixed ordering" case is
-/// rejected before the caller does any per-file work.
 pub(super) struct OrderShape {
     prefix: Vec<PrefixColumn>,
     /// The suffix, expressed over the parquet read schema, or `None` when the
@@ -79,9 +70,7 @@ pub(super) struct OrderShape {
 
 /// Compare two partition-prefix value tuples under the prefix column options.
 ///
-/// Returns `None` when a pair of values is incomparable (e.g. mismatched
-/// [`ScalarValue`] variants), so callers can reject the pushdown rather than
-/// silently treat them as equal.
+/// Returns `None` when a pair of values is incomparable.
 fn cmp_prefix(a: &[ScalarValue], b: &[ScalarValue], prefix: &[PrefixColumn]) -> Option<Ordering> {
     for ((lhs, rhs), col) in a.iter().zip(b.iter()).zip(prefix.iter()) {
         let ord = lhs.partial_cmp(rhs)?;
@@ -135,8 +124,8 @@ pub(super) fn analyze_order(
         });
     }
     if prefix.is_empty() {
-        // The pure-data-column case is already handled when the scan is planned;
-        // there is nothing for a regrouping to add.
+        // Sort order does not start with partition columns, this can't
+        // be handled by a file regrouping.
         return None;
     }
     let suffix_exprs = &order[prefix.len()..];
@@ -201,8 +190,7 @@ struct Bucket {
 ///
 /// * `parquet_read_schema` – physical file columns; its indices address
 ///   `PartitionedFile` statistics directly.
-/// * `parquet_table_schema` – the file scan's full table schema, for
-///   DataFusion's statistics-based non-overlap check.
+/// * `parquet_table_schema` – the file scan's full table schema.
 /// * `target_groups` – desired execution-partition count.
 pub(super) fn plan_sort_pushdown(
     shape: &OrderShape,
@@ -217,8 +205,7 @@ pub(super) fn plan_sort_pushdown(
     let prefix = &shape.prefix;
 
     // --- Pair every file with its exact partition-prefix key. ---
-    // Sort a lightweight (key, index) permutation rather than the files, which
-    // are large enough that moving them during the sort dominates.
+    // Sort a lightweight (key, index) permutation rather than the large file objects.
     let mut keyed: Vec<(Vec<ScalarValue>, usize)> = Vec::with_capacity(files.len());
     for (index, file) in files.iter().enumerate() {
         let Some(values) = file.extensions.get::<DeltaPartitionValues>() else {

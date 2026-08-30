@@ -187,20 +187,15 @@ pub struct DeltaScanExec {
     /// Aggregated partition column statistics
     partition_stats: HashMap<String, ColumnStatistics>,
     /// Resolved per-file sort order over the parquet read schema, when the table
-    /// declares one (`DeltaScanConfig::file_sort_order`). Consulted by
-    /// [`ExecutionPlan::try_pushdown_sort`].
-    ///
-    /// Not derivable from the child's declared output ordering: `get_read_plan`
-    /// may narrow that to a null-free prefix, or drop it entirely.
+    /// declares one (`DeltaScanConfig::file_sort_order`).
     file_sort_order: Option<LexOrdering>,
-    /// Result of a successful sort pushdown, or `None` before one. Valid only
+    /// Result of a successful sort pushdown, or `None` without one. Valid only
     /// for the file grouping it was computed against.
     pushed: Option<Arc<PushedSort>>,
 }
 
-/// What [`DeltaScanExec::try_pushdown_sort`] regrouped the child's files to
-/// achieve: the ordering the scan now guarantees, and the exact per-execution
-/// partition statistics that let downstream rules prove the partitions disjoint.
+/// Result of a successful sort pushdown, which regroups files to achieve
+/// an ordered output.
 #[derive(Debug)]
 struct PushedSort {
     /// `[partition prefix…, file sort order prefix…]`. The file groups are
@@ -261,9 +256,7 @@ impl DeltaScanExec {
         }
     }
 
-    /// Declare the resolved per-file sort order (over the parquet read schema),
-    /// which [`ExecutionPlan::try_pushdown_sort`] matches requested orderings
-    /// against.
+    /// Declare the resolved per-file sort order (over the parquet read schema).
     pub(crate) fn with_file_sort_order(mut self, file_sort_order: Option<LexOrdering>) -> Self {
         self.file_sort_order = file_sort_order;
         self
@@ -568,9 +561,8 @@ impl ExecutionPlan for DeltaScanExec {
             return unsupported();
         };
 
-        // Classify the requested ordering before touching the file list: the
-        // common case — an ordering that does not lead with partition columns —
-        // is rejected here, without cloning every file.
+        // Check whether the requested ordering starts with partition columns
+        // and can be handled by a regrouping.
         let Some(shape) = super::sort_pushdown::analyze_order(
             &ordering,
             &self.scan_plan.contract.output_schema,
@@ -597,8 +589,6 @@ impl ExecutionPlan for DeltaScanExec {
             return unsupported();
         };
 
-        // One clone of the child config serves both as the source of the file
-        // list and as the base for the rebuilt config.
         let mut file_scan = file_scan.clone();
         let files: Vec<PartitionedFile> = std::mem::take(&mut file_scan.file_groups)
             .into_iter()
@@ -616,6 +606,8 @@ impl ExecutionPlan for DeltaScanExec {
             .partition_count()
             .max(1);
 
+        // Take list of flattened files and try to form new groups ordered by
+        // the partition columns.
         let Some(plan) = super::sort_pushdown::plan_sort_pushdown(
             &shape,
             &self.scan_plan.parquet_read_schema,
@@ -632,9 +624,8 @@ impl ExecutionPlan for DeltaScanExec {
         let new_file_scan = FileScanConfigBuilder::from(file_scan)
             .with_file_groups(file_groups)
             .with_statistics(statistics)
-            // The groups are ordered on `[partition prefix…, file sort order…]`,
-            // not on the file sort order alone, so any previously declared
-            // file-schema ordering no longer holds per group.
+            // Drop the existing output ordering as groups are now ordered by the partition prefix
+            // first, and this is not needed. The order is declared in the pushdown result.
             .with_output_ordering(vec![])
             .build();
         let new_input = DataSourceExec::from_data_source(new_file_scan) as Arc<dyn ExecutionPlan>;

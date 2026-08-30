@@ -220,17 +220,13 @@ fn null_free_ordering_prefix(
 
 /// Order `files` on `ordering` if — and only if — they are mutually
 /// non-overlapping on it.
-///
-/// [`FileScanConfig::split_groups_by_statistics`] is first-fit bin packing over
-/// per-file min/max statistics, so it returns exactly one group precisely when
-/// no two files overlap; that single group is the files in sort order. Any other
-/// outcome (several groups, or unusable statistics) means the ordering cannot be
-/// guaranteed by reordering alone, and yields `None`.
 pub(super) fn order_files_if_non_overlapping(
     files: &[FileGroup],
     ordering: &LexOrdering,
     table_schema: &SchemaRef,
 ) -> Option<Vec<PartitionedFile>> {
+    // `split_groups_by_statistics` will return a single group, in sort order,
+    // when no files overlap:
     match FileScanConfig::split_groups_by_statistics(table_schema, files, ordering) {
         Ok(mut groups) if groups.len() == 1 => Some(groups.remove(0).into_inner()),
         _ => None,
@@ -513,8 +509,8 @@ async fn get_data_scan_plan(
     let mut partition_stats = HashMap::new();
 
     // `DeltaScanExec::try_pushdown_sort` regroups files by their partition-column
-    // values. Attach them to each file so they survive the regrouping; skip the
-    // work entirely for the table shapes that can never take that path.
+    // values. Attach them to each file so they survive the regrouping. Skip the
+    // work for cases that never take that path.
     let table_config = scan_plan.table_configuration();
     let partition_column_names = table_config.metadata().partition_columns();
     let collect_partition_values = !partition_column_names.is_empty()
@@ -604,14 +600,12 @@ async fn get_data_scan_plan(
     Ok(Arc::new(exec))
 }
 
-/// Exact partition-column values for one data file, aligned to the table's
-/// partition columns. Attached to each [`PartitionedFile`] so that
-/// [`DeltaScanExec::try_pushdown_sort`] can bucket files by partition value
-/// without a side table keyed on file paths.
+/// Partition-column values for one data file, aligned to the table's
+/// partition columns. Attached to each [`PartitionedFile`] via an extension.
 #[derive(Debug)]
 pub(super) struct DeltaPartitionValues(pub(super) Vec<ScalarValue>);
 
-/// Extract the exact partition-column values for one file from its kernel
+/// Extract the partition-column values for one file from its kernel
 /// partition struct, aligned to `partition_column_names` (missing columns become
 /// [`ScalarValue::Null`]).
 fn extract_partition_values(
