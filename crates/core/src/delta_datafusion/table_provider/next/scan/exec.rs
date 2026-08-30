@@ -293,21 +293,14 @@ impl DeltaScanExec {
     }
 
     /// Rebuild this exec around a new input plan, recomputing plan properties.
-    ///
-    /// A [`PushedSort`] describes one specific regrouping of the child's file
-    /// groups, and its statistics are indexed by execution partition. A
-    /// replacement child with a different partition count invalidates it, so
-    /// drop it rather than advertise an ordering that no longer holds — there is
-    /// no `SortExec` left above us to correct it.
     fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        let same_partitioning = input.properties().partitioning.partition_count()
-            == self.input.properties().partitioning.partition_count();
-        let pushed = same_partitioning.then(|| self.pushed.clone()).flatten();
-        let properties = Self::build_properties(&self.scan_plan, &input, pushed.as_deref());
+        // Ignore existing pushed sort result,
+        // we can't guarantee it is valid for the new input.
+        let properties = Self::build_properties(&self.scan_plan, &input, None);
         Arc::new(Self {
             input,
             properties,
-            pushed,
+            pushed: None,
             ..self.clone()
         })
     }

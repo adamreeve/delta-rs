@@ -754,10 +754,9 @@ mod tests {
 
     /// Sort-pushdown state is only valid for the file grouping it was computed
     /// for, and `per_partition_stats` is indexed by execution partition.
-    /// Swapping in a child with a different partition count must drop the
-    /// advertised ordering — no `SortExec` remains above to correct it.
+    /// Swapping in a child must drop the advertised ordering.
     #[tokio::test]
-    async fn with_new_children_drops_pushdown_state_when_partition_count_changes() {
+    async fn with_new_children_drops_pushdown_state() {
         use datafusion::physical_expr::Partitioning;
         use datafusion::physical_plan::repartition::RepartitionExec;
         use datafusion::physical_plan::{
@@ -822,7 +821,7 @@ mod tests {
 
         assert!(
             !leads_with_part(&swapped),
-            "stale `part`-leading ordering survived a partition-count change"
+            "stale `part`-leading ordering survived a child change"
         );
     }
 
