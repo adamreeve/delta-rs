@@ -619,6 +619,16 @@ impl ExecutionPlan for DeltaScanExec {
             return unsupported();
         };
 
+        // `PushdownSort` deletes the `SortExec` on `Exact` without re-checking the
+        // resulting partitioning, and `pack_buckets` must cut a run at every change
+        // in a leading prefix column regardless of the target. If regrouping ends up
+        // with more groups than the input had partitions, a global single-partition
+        // sort would be replaced by a multi-partition scan with no merge above it,
+        // and the coalesced output would interleave the groups.
+        if plan.file_groups.len() > target_groups {
+            return unsupported();
+        }
+
         let (file_groups, statistics) =
             compute_all_files_statistics(plan.file_groups, parquet_table_schema, true, false)?;
         let new_file_scan = FileScanConfigBuilder::from(file_scan)

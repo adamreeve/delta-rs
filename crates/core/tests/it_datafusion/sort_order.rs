@@ -334,6 +334,138 @@ async fn delta_table_sort_order_partition_key_prefix_avoids_sort() -> TestResult
     Ok(())
 }
 
+/// Create a Delta table partitioned by ("part", "sub") with one file per
+/// partition, so regrouping for `ORDER BY part, sub` must cut a file group at
+/// every change of "part".
+async fn two_partition_column_delta_table() -> TestResult<DeltaTable> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new("part", DataType::Utf8, false),
+        Field::new("sub", DataType::Int64, false),
+    ]));
+    let mut table = DeltaTable::new_in_memory()
+        .create()
+        .with_columns(vec![
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+            StructField::new(
+                "part".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::String),
+                false,
+            ),
+            StructField::new(
+                "sub".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Long),
+                false,
+            ),
+        ])
+        .with_partition_columns(vec!["part", "sub"])
+        .await?;
+    for (index, (part, sub)) in [("A", 1), ("B", 0), ("B", 1)].into_iter().enumerate() {
+        let start = index as i64 * 10;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(start..start + 5)),
+                Arc::new(StringArray::from(vec![part; 5])),
+                Arc::new(Int64Array::from(vec![sub; 5])),
+            ],
+        )?;
+        table = table
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 3);
+    Ok(table)
+}
+
+/// Run `ORDER BY part, sub` on the two-partition-column table with the given
+/// target partition count and return the rendered plan and the collected
+/// (part, sub) keys.
+async fn query_two_partition_prefix(
+    table: &DeltaTable,
+    target_partitions: usize,
+) -> TestResult<(String, Vec<(String, i64)>)> {
+    let ctx = create_session().into_inner();
+    ctx.sql(&format!(
+        "SET datafusion.execution.target_partitions = {target_partitions}"
+    ))
+    .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("value")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT part, sub, value FROM test_table ORDER BY part, sub, value")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    let mut keys = Vec::new();
+    for batch in &batches {
+        // Partition columns are produced by the kernel transform and may be
+        // dictionary-encoded; cast to plain arrays to read them.
+        let parts = arrow_cast::cast(batch.column(0), &DataType::Utf8)?;
+        let parts = parts.as_string::<i32>();
+        let subs = arrow_cast::cast(batch.column(1), &DataType::Int64)?;
+        let subs = subs.as_primitive::<Int64Type>();
+        keys.extend(
+            parts
+                .iter()
+                .map(|part| part.unwrap().to_string())
+                .zip(subs.values().iter().copied()),
+        );
+    }
+    Ok((rendered, keys))
+}
+
+/// `pack_buckets` cuts a file group at every change of a leading partition
+/// column, so `ORDER BY part, sub` with `target_partitions = 1` would regroup
+/// into more partitions than the plan has room for: the single-partition
+/// `SortExec` would be removed with no merge operator above the scan,
+/// interleaving the groups. The pushdown must refuse and keep the `SortExec`.
+#[tokio::test]
+async fn delta_table_partition_prefix_more_groups_than_target_keeps_sort() -> TestResult<()> {
+    let table = two_partition_column_delta_table().await?;
+    let (rendered, keys) = query_two_partition_prefix(&table, 1).await?;
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+    assert_eq!(keys.len(), 15);
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by (part, sub)"
+    );
+    Ok(())
+}
+
+/// With a declared file sort order the scan starts with one ordered group per
+/// target partition, so the regrouping fits and the same query is answered
+/// without a `SortExec`.
+#[tokio::test]
+async fn delta_table_partition_prefix_within_target_avoids_sort() -> TestResult<()> {
+    let table = two_partition_column_delta_table().await?;
+    let (rendered, keys) = query_two_partition_prefix(&table, 2).await?;
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert_eq!(keys.len(), 15);
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by (part, sub)"
+    );
+    Ok(())
+}
+
 // --- Multi-column sort order ---
 
 /// Each timestamp appears once per object id, so ties on the leading sort
