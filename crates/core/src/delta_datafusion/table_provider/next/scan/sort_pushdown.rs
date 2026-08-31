@@ -170,12 +170,18 @@ pub(super) fn analyze_order(
 /// A contiguous run of whole buckets (or one slice of a single bucket) that
 /// becomes one execution partition, tagged with the partition-value range it
 /// spans.
+///
+/// The keys are the range endpoints under the requested ordering, not
+/// per-column minima and maxima: for a descending column the start key holds
+/// the larger value. A run only ever spans several keys in the last prefix
+/// column (see [`pack_buckets`]), so per-column extrema are recoverable by
+/// swapping the two for a descending column.
 struct BucketGroup {
     files: Vec<PartitionedFile>,
     /// Prefix key of the first bucket in the run.
-    min_key: Vec<ScalarValue>,
+    start_key: Vec<ScalarValue>,
     /// Prefix key of the last bucket in the run.
-    max_key: Vec<ScalarValue>,
+    end_key: Vec<ScalarValue>,
 }
 
 /// Files sharing one partition-prefix key, ordered on the suffix.
@@ -281,12 +287,20 @@ pub(super) fn plan_sort_pushdown(
                 .iter()
                 .enumerate()
                 .map(|(i, col)| {
+                    // The keys are the group's range endpoints under the
+                    // requested ordering, so for a descending column the start
+                    // key is the larger value.
+                    let (min, max) = if col.options.descending {
+                        (&group.end_key[i], &group.start_key[i])
+                    } else {
+                        (&group.start_key[i], &group.end_key[i])
+                    };
                     (
                         col.name.clone(),
                         ColumnStatistics {
                             null_count: Precision::Exact(0),
-                            min_value: Precision::Exact(group.min_key[i].clone()),
-                            max_value: Precision::Exact(group.max_key[i].clone()),
+                            min_value: Precision::Exact(min.clone()),
+                            max_value: Precision::Exact(max.clone()),
                             ..Default::default()
                         },
                     )
@@ -337,8 +351,8 @@ fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Vec<BucketGroup> {
                 .into_iter()
                 .map(|group| BucketGroup {
                     files: group.into_inner(),
-                    min_key: bucket.key.clone(),
-                    max_key: bucket.key.clone(),
+                    start_key: bucket.key.clone(),
+                    end_key: bucket.key.clone(),
                 }),
         );
         groups_left = groups_left.saturating_sub(share).max(1);
@@ -348,13 +362,32 @@ fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Vec<BucketGroup> {
 }
 
 /// Pack contiguous runs of whole buckets into `target` groups, balanced by file
-/// count. A run is also cut when it would outgrow the file-id dictionary.
+/// count. A run is also cut when it would outgrow the file-id dictionary, or
+/// when the next bucket differs in a prefix column other than the last.
+///
+/// Always cutting runs on changes in prefix columns other than the last is
+/// required so that the min and max statistics can be determined exactly
+/// from the start and end key values of the BucketGroup.
 fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<BucketGroup> {
     let mut out: Vec<BucketGroup> = Vec::with_capacity(target);
     let mut groups_left = target;
     let mut files_left = total_files;
     let mut run: Option<BucketGroup> = None;
     let mut buckets_left = buckets.len();
+
+    /// Emit the open run, if any, and charge it against the remaining budget.
+    fn close(
+        run: &mut Option<BucketGroup>,
+        out: &mut Vec<BucketGroup>,
+        files_left: &mut usize,
+        groups_left: &mut usize,
+    ) {
+        if let Some(closed) = run.take() {
+            *files_left -= closed.files.len();
+            *groups_left = groups_left.saturating_sub(1).max(1);
+            out.push(closed);
+        }
+    }
 
     for bucket in buckets {
         buckets_left -= 1;
@@ -363,14 +396,14 @@ fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<
         // A bucket too large for the dictionary key space is split on its own;
         // every piece keeps the bucket's key, so its statistics stay exact.
         if files > MAX_PARTITION_DICT_CARDINALITY {
-            out.extend(run.take());
+            close(&mut run, &mut out, &mut files_left, &mut groups_left);
             out.extend(
                 chunk_ordered_files(bucket.files, files.div_ceil(MAX_PARTITION_DICT_CARDINALITY))
                     .into_iter()
                     .map(|group| BucketGroup {
                         files: group.into_inner(),
-                        min_key: bucket.key.clone(),
-                        max_key: bucket.key.clone(),
+                        start_key: bucket.key.clone(),
+                        end_key: bucket.key.clone(),
                     }),
             );
             groups_left = groups_left.saturating_sub(1).max(1);
@@ -378,17 +411,22 @@ fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<
             continue;
         }
 
+        // Only the last prefix column is allowed to change within a group.
+        let leading = bucket.key.len() - 1;
         match run.as_mut() {
-            Some(open) if open.files.len() + files <= MAX_PARTITION_DICT_CARDINALITY => {
+            Some(open)
+                if open.files.len() + files <= MAX_PARTITION_DICT_CARDINALITY
+                    && open.end_key[..leading] == bucket.key[..leading] =>
+            {
                 open.files.extend(bucket.files);
-                open.max_key = bucket.key;
+                open.end_key = bucket.key;
             }
             _ => {
-                out.extend(run.take());
+                close(&mut run, &mut out, &mut files_left, &mut groups_left);
                 run = Some(BucketGroup {
                     files: bucket.files,
-                    min_key: bucket.key.clone(),
-                    max_key: bucket.key,
+                    start_key: bucket.key.clone(),
+                    end_key: bucket.key,
                 });
             }
         }
@@ -398,9 +436,7 @@ fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<
         let open = run.as_ref().expect("a run is open");
         let share = files_left.div_ceil(groups_left);
         if open.files.len() >= share || buckets_left < groups_left {
-            files_left -= open.files.len();
-            groups_left = groups_left.saturating_sub(1).max(1);
-            out.extend(run.take());
+            close(&mut run, &mut out, &mut files_left, &mut groups_left);
         }
     }
     out.extend(run);
@@ -424,6 +460,16 @@ mod tests {
             SortOptions {
                 descending: false,
                 nulls_first: false,
+            },
+        )
+    }
+
+    fn desc(index: usize, name: &str) -> PhysicalSortExpr {
+        PhysicalSortExpr::new(
+            Arc::new(Column::new(name, index)),
+            SortOptions {
+                descending: true,
+                nulls_first: true,
             },
         )
     }
@@ -671,22 +717,138 @@ mod tests {
     #[test]
     fn descending_partition_prefix_orders_buckets_in_reverse() {
         let fixture = Fixture::new(&[("a0", utf8("A"), 0, 99), ("b0", utf8("B"), 0, 99)]);
-        let order = vec![
-            PhysicalSortExpr::new(
-                Arc::new(Column::new("part", 0)),
-                SortOptions {
-                    descending: true,
-                    nulls_first: true,
-                },
-            ),
-            asc(1, "timestamp"),
-        ];
+        let order = vec![desc(0, "part"), asc(1, "timestamp")];
 
         let plan = fixture
             .plan(&order, Some(&file_sort_order()), 4)
             .expect("expected a pushdown plan");
         let flat: Vec<_> = plan.file_groups.iter().flat_map(group_urls).collect();
         assert_eq!(flat, vec!["b0", "a0"]);
+    }
+
+    /// Natural minimum and maximum of one partition column over the files a
+    /// group actually holds.
+    fn actual_range(group: &FileGroup, position: usize) -> (ScalarValue, ScalarValue) {
+        let mut values: Vec<ScalarValue> = group
+            .iter()
+            .map(|f| f.extensions.get::<DeltaPartitionValues>().unwrap().0[position].clone())
+            .collect();
+        values.sort_by(|a, b| a.partial_cmp(b).expect("comparable partition values"));
+        (
+            values.first().unwrap().clone(),
+            values.last().unwrap().clone(),
+        )
+    }
+
+    /// Assert every prefix column's published statistics are the natural
+    /// extrema of the partition values the group actually holds.
+    fn assert_stats_match_files(plan: &SortPushdownPlan, columns: &[&str]) {
+        for (group, stats) in plan.file_groups.iter().zip(&plan.per_partition_stats) {
+            for (position, name) in columns.iter().enumerate() {
+                let (min, max) = actual_range(group, position);
+                let stat = &stats[*name];
+                assert_eq!(stat.min_value, Precision::Exact(min), "{name} min_value");
+                assert_eq!(stat.max_value, Precision::Exact(max), "{name} max_value");
+            }
+        }
+    }
+
+    /// A group's keys are its range endpoints under the requested ordering, so
+    /// for a descending column the first key is the group's *maximum*. Copying
+    /// them into `min_value`/`max_value` as-is publishes an inverted range as
+    /// `Precision::Exact` — `ProgressiveEvalRule` reads it back as
+    /// `(start, end) = (max_value, min_value)` and gets the group's endpoints
+    /// the wrong way round, and any other consumer sees `min > max`.
+    #[test]
+    fn descending_partition_prefix_statistics_are_not_inverted() {
+        let fixture = Fixture::new(&[
+            ("a0", utf8("A"), 0, 99),
+            ("b0", utf8("B"), 0, 99),
+            ("c0", utf8("C"), 0, 99),
+        ]);
+        let order = vec![desc(0, "part")];
+
+        // More buckets than groups, so the leading two are packed into one run
+        // that spans `C` … `B`.
+        let plan = fixture
+            .plan(&order, None, 2)
+            .expect("expected a pushdown plan");
+
+        assert_eq!(
+            plan.file_groups.iter().map(group_urls).collect::<Vec<_>>(),
+            vec![vec!["c0", "b0"], vec!["a0"]],
+        );
+        assert_stats_match_files(&plan, &["part"]);
+
+        // How `ProgressiveEvalRule` decodes a descending column: the endpoints
+        // must come back in the order the group's files are read.
+        let stat = &plan.per_partition_stats[0]["part"];
+        assert_eq!(stat.max_value, Precision::Exact(utf8("C")), "range start");
+        assert_eq!(stat.min_value, Precision::Exact(utf8("B")), "range end");
+    }
+
+    fn two_column_output_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("part", DataType::Utf8, false),
+            Field::new("sub", DataType::Int64, false),
+            Field::new("timestamp", DataType::Int64, true),
+            Field::new("value", DataType::Int64, true),
+        ]))
+    }
+
+    fn two_column_file(url: &str, part: &str, sub: i64) -> PartitionedFile {
+        let mut file = file(url, utf8(part), 0, 99, 0);
+        file.extensions.insert(DeltaPartitionValues(vec![
+            utf8(part),
+            ScalarValue::Int64(Some(sub)),
+        ]));
+        file
+    }
+
+    fn plan_two_column(
+        files: Vec<PartitionedFile>,
+        order: &[PhysicalSortExpr],
+        target_groups: usize,
+    ) -> Option<SortPushdownPlan> {
+        let order = LexOrdering::new(order.to_vec()).unwrap();
+        let shape = analyze_order(
+            &order,
+            &two_column_output_schema(),
+            &parquet_read_schema(),
+            &["part".to_string(), "sub".to_string()],
+            None,
+        )?;
+        plan_sort_pushdown(
+            &shape,
+            &parquet_read_schema(),
+            &parquet_table_schema(),
+            files,
+            target_groups,
+        )
+        .unwrap()
+    }
+
+    /// A run may only span several keys in the *last* prefix column. A run from
+    /// `[A, 2]` to `[B, 0]` is properly ordered, but its endpoints are not the
+    /// extrema of anything: `sub` really covers `0..2` there, so no
+    /// `ColumnStatistics` can describe both the range and where it starts.
+    #[test]
+    fn packed_runs_do_not_span_a_change_in_a_leading_prefix_column() {
+        let files = vec![
+            two_column_file("a1", "A", 1),
+            two_column_file("a2", "A", 2),
+            two_column_file("b0", "B", 0),
+        ];
+        let order = vec![asc(0, "part"), asc(1, "sub")];
+
+        // One target group would otherwise pack all three buckets into one run.
+        let plan = plan_two_column(files, &order, 1).expect("expected a pushdown plan");
+
+        assert_eq!(
+            plan.file_groups.iter().map(group_urls).collect::<Vec<_>>(),
+            vec![vec!["a1", "a2"], vec!["b0"]],
+        );
+        assert_stats_match_files(&plan, &["part", "sub"]);
     }
 
     /// One record batch per (partition, day range), each sorted by timestamp.
@@ -830,7 +992,7 @@ mod tests {
                 .map(|f| f.object_meta.location.to_string().chars().next().unwrap())
                 .collect();
             assert_eq!(prefixes.len(), 1);
-            assert_eq!(group.min_key, group.max_key);
+            assert_eq!(group.start_key, group.end_key);
         }
         assert_eq!(groups.iter().map(|g| g.files.len()).sum::<usize>(), 8);
         assert!(groups.len() >= 2, "each bucket gets at least one group");
@@ -859,7 +1021,7 @@ mod tests {
         // Each group's key range is strictly after the previous group's.
         for pair in groups.windows(2) {
             assert!(
-                pair[0].max_key[0] < pair[1].min_key[0],
+                pair[0].end_key[0] < pair[1].start_key[0],
                 "group key ranges must take a strict step"
             );
         }
