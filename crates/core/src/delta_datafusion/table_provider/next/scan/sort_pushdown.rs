@@ -1086,6 +1086,59 @@ mod tests {
         );
     }
 
+    /// Without pushed-down per-partition statistics, a request for one
+    /// execution partition's statistics falls back to the table-wide
+    /// aggregated partition-column stats. Those are valid bounds for the
+    /// partition but must not claim exactness.
+    #[tokio::test]
+    async fn per_partition_statistics_fall_back_to_inexact_aggregates() {
+        use datafusion::config::ConfigOptions;
+        use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+
+        use crate::delta_datafusion::create_session;
+
+        let table = partitioned_sorted_table().await;
+        let ctx = create_session().into_inner();
+        let provider = table.table_provider().await.unwrap();
+        let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let mut config = ConfigOptions::new();
+        config.optimizer.repartition_file_min_size = 1;
+        let scan = scan
+            .repartitioned(4, &config)
+            .unwrap()
+            .expect("expected the scan to accept a repartition");
+        assert!(scan.output_partitioning().partition_count() > 1);
+        let part_index = scan.schema().index_of("part").unwrap();
+
+        let whole_scan = scan.partition_statistics(None).unwrap();
+        assert!(
+            matches!(
+                whole_scan.column_statistics[part_index].min_value,
+                Precision::Exact(_)
+            ),
+            "table-wide partition-column statistics should stay exact"
+        );
+
+        let one_partition = scan.partition_statistics(Some(0)).unwrap();
+        for stat in [
+            &one_partition.column_statistics[part_index].min_value,
+            &one_partition.column_statistics[part_index].max_value,
+        ] {
+            assert!(
+                !matches!(stat, Precision::Exact(_)),
+                "table-wide aggregate published as exact for one partition: {stat:?}"
+            );
+        }
+        assert!(
+            !matches!(
+                one_partition.column_statistics[part_index].null_count,
+                Precision::Exact(_)
+            ),
+            "table-wide null count published as exact for one partition"
+        );
+    }
+
     #[test]
     fn chunk_buckets_splits_when_there_are_fewer_buckets_than_groups() {
         let bucket = |name: char, n: i64| Bucket {

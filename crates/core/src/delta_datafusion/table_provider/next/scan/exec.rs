@@ -326,11 +326,20 @@ impl DeltaScanExec {
         let per_partition = partition
             .zip(self.pushed.as_ref())
             .and_then(|(idx, pushed)| pushed.per_partition_stats.get(idx));
+        // The aggregated stats span every scanned file: valid bounds for a
+        // single execution partition, but exact only when there is just one.
+        let aggregate_is_exact =
+            partition.is_none() || self.properties.partitioning.partition_count() == 1;
         let partition_stat = |name: &str| -> Option<ColumnStatistics> {
             if let Some(stat) = per_partition.and_then(|map| map.get(name)) {
                 return Some(stat.clone());
             }
-            self.partition_stats.get(name).cloned()
+            let stat = self.partition_stats.get(name).cloned()?;
+            Some(if aggregate_is_exact {
+                stat
+            } else {
+                stat.to_inexact()
+            })
         };
 
         if config.is_feature_enabled(&TableFeature::ColumnMapping) {
