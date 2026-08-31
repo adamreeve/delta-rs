@@ -461,10 +461,9 @@ impl ExecutionPlan for DeltaScanExec {
         }
 
         if let Some(input) = self.input.repartitioned(target_partitions, config)? {
-            Ok(Some(Arc::new(Self {
-                input,
-                ..self.clone()
-            })))
+            // Rebuild the cached properties: the new input's partitioning can
+            // differ from the one this exec was built around.
+            Ok(Some(self.with_new_input(input)))
         } else {
             Ok(None)
         }

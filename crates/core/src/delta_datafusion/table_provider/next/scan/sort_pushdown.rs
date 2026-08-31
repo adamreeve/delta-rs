@@ -1046,6 +1046,46 @@ mod tests {
         );
     }
 
+    /// `repartitioned` swaps in a re-split input; the cached plan properties
+    /// were computed from the old input and must be rebuilt, or the exec
+    /// advertises a stale partition count and parents execute too few
+    /// partitions.
+    #[tokio::test]
+    async fn repartitioned_recomputes_partitioning() {
+        use datafusion::config::ConfigOptions;
+        use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+
+        use crate::delta_datafusion::create_session;
+
+        let table = partitioned_sorted_table().await;
+        let ctx = create_session().into_inner();
+        // No declared file sort order: an ordered scan refuses re-splitting.
+        let provider = table.table_provider().await.unwrap();
+        let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let before = scan.output_partitioning().partition_count();
+
+        let mut config = ConfigOptions::new();
+        // The test files are tiny; split on any size.
+        config.optimizer.repartition_file_min_size = 1;
+        let repartitioned = scan
+            .repartitioned(before + 4, &config)
+            .unwrap()
+            .expect("expected the scan to accept a repartition");
+
+        let child_partitions = repartitioned.children()[0]
+            .output_partitioning()
+            .partition_count();
+        assert_ne!(
+            before, child_partitions,
+            "the input did not change its partitioning; the test is inert"
+        );
+        assert_eq!(
+            repartitioned.output_partitioning().partition_count(),
+            child_partitions,
+            "stale cached partitioning survived a repartition"
+        );
+    }
+
     #[test]
     fn chunk_buckets_splits_when_there_are_fewer_buckets_than_groups() {
         let bucket = |name: char, n: i64| Bucket {
