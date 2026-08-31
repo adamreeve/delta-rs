@@ -21,7 +21,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use arrow_schema::{SchemaRef, SortOptions};
+use arrow_schema::{DataType, SchemaRef, SortOptions};
 use datafusion::common::{ColumnStatistics, HashMap, Result, stats::Precision};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
@@ -213,6 +213,7 @@ pub(super) fn plan_sort_pushdown(
     // --- Pair every file with its exact partition-prefix key. ---
     // Sort a lightweight (key, index) permutation rather than the large file objects.
     let mut keyed: Vec<(Vec<ScalarValue>, usize)> = Vec::with_capacity(files.len());
+    let mut key_types: Option<Vec<DataType>> = None;
     for (index, file) in files.iter().enumerate() {
         let Some(values) = file.extensions.get::<DeltaPartitionValues>() else {
             return Ok(None);
@@ -226,17 +227,39 @@ pub(super) fn plan_sort_pushdown(
                 _ => return Ok(None),
             }
         }
+        // `ScalarValue::partial_cmp` is total within one non-nested type but
+        // fails across variants, and `sort_by` panics on a comparator that is
+        // not a total order. Require every key to share the first key's
+        // per-column types so the sort below cannot see an incomparable pair.
+        match &key_types {
+            None => {
+                let types: Vec<DataType> = key.iter().map(ScalarValue::data_type).collect();
+                if types.iter().any(DataType::is_nested) {
+                    return Ok(None);
+                }
+                key_types = Some(types);
+            }
+            Some(types) => {
+                if !key
+                    .iter()
+                    .map(ScalarValue::data_type)
+                    .eq(types.iter().cloned())
+                {
+                    return Ok(None);
+                }
+            }
+        }
         keyed.push((key, index));
     }
-    // Best-effort: incomparable keys fall back to `Equal` here and are rejected
-    // by the strict step check below.
-    keyed.sort_by(|a, b| cmp_prefix(&a.0, &b.0, prefix).unwrap_or(Ordering::Equal));
+    keyed.sort_by(|a, b| {
+        cmp_prefix(&a.0, &b.0, prefix).expect("keys share a non-nested type per column")
+    });
 
     // --- Cut the sorted files into buckets of equal prefix key. ---
     // One comparator decides both the bucket boundary and its validity: equal
-    // keys extend the current bucket, a strict step opens a new one, and
-    // anything else (incomparable, or out of order because the sort could not
-    // order them) means concatenating the buckets would not be ordered.
+    // keys extend the current bucket and a strict step opens a new one; the
+    // keys were sorted with the same comparator, so any other outcome is a
+    // backstop, not an expected path.
     let mut slots: Vec<Option<PartitionedFile>> = files.into_iter().map(Some).collect();
     let mut buckets: Vec<Bucket> = Vec::new();
     for (key, index) in keyed {
@@ -664,6 +687,55 @@ mod tests {
             ("a0", utf8("A"), 0, 99),
             ("b0", ScalarValue::Int64(Some(1)), 100, 199),
         ]);
+        let order = vec![asc(0, "part"), asc(1, "timestamp")];
+
+        assert!(fixture.plan(&order, Some(&file_sort_order()), 4).is_none());
+    }
+
+    #[test]
+    fn many_incomparable_partition_values_do_not_panic_the_sort() {
+        // Sorting mixed-variant keys with a comparator that collapses
+        // incomparable pairs to `Equal` is not a total order, which rustc's
+        // sort implementation detects and panics on for inputs large enough to
+        // leave the insertion-sort path (this exact sequence did). The type
+        // check while building keys must reject the pushdown before the sort
+        // runs.
+        let parts = [
+            utf8("p034774"),
+            ScalarValue::Int64(Some(44153)),
+            ScalarValue::Int64(Some(41196)),
+            ScalarValue::Int64(Some(92870)),
+            utf8("p011034"),
+            utf8("p039795"),
+            utf8("p067130"),
+            ScalarValue::Int64(Some(86902)),
+            utf8("p098089"),
+            utf8("p046746"),
+            ScalarValue::Int64(Some(20123)),
+            ScalarValue::Int64(Some(30802)),
+            ScalarValue::Int64(Some(47452)),
+            ScalarValue::Int64(Some(58400)),
+            utf8("p087034"),
+            ScalarValue::Int64(Some(44812)),
+            utf8("p084890"),
+            utf8("p070495"),
+            utf8("p093332"),
+            ScalarValue::Int64(Some(29365)),
+            ScalarValue::Int64(Some(67627)),
+        ];
+        let specs: Vec<(String, ScalarValue, i64, i64)> = parts
+            .into_iter()
+            .enumerate()
+            .map(|(i, part)| {
+                let i = i as i64;
+                (format!("f{i:02}"), part, i * 100, i * 100 + 99)
+            })
+            .collect();
+        let specs: Vec<(&str, ScalarValue, i64, i64)> = specs
+            .iter()
+            .map(|(url, part, lo, hi)| (url.as_str(), part.clone(), *lo, *hi))
+            .collect();
+        let fixture = Fixture::new(&specs);
         let order = vec![asc(0, "part"), asc(1, "timestamp")];
 
         assert!(fixture.plan(&order, Some(&file_sort_order()), 4).is_none());
