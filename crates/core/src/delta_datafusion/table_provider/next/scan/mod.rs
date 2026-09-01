@@ -514,6 +514,7 @@ async fn get_data_scan_plan(
     let table_config = scan_plan.table_configuration();
     let partition_column_names = table_config.metadata().partition_columns();
     let collect_partition_values = !partition_column_names.is_empty()
+        && session.config().options().optimizer.enable_sort_pushdown
         && scan_plan.contract.retained_row_index_field().is_none()
         && !table_config.is_feature_enabled(&TableFeature::ColumnMapping);
 
@@ -522,8 +523,20 @@ async fn get_data_scan_plan(
     // To correlate the data with the original file, we add the file url as a partition value
     // This is required to apply the correct transform to the data in downstream processing.
     let to_partitioned_file = |f: ScanFileContext| {
-        if let Some(part_stata) = &f.partitions {
-            update_partition_stats(part_stata, &f.stats, &mut partition_stats)?;
+        // Convert each file's kernel partition values once; the aggregated
+        // statistics and the per-file extension must agree.
+        let partition_values = f
+            .partitions
+            .as_ref()
+            .map(|data| extract_partition_values(data, partition_column_names))
+            .transpose()?;
+        if let Some(values) = &partition_values {
+            update_partition_stats(
+                partition_column_names,
+                values,
+                &f.stats,
+                &mut partition_stats,
+            );
         }
         // We create a PartitionedFile from the ObjectMeta to avoid any surprises in path encoding
         // that may arise from using the 'new' method directly. i.e. the 'new' method encodes paths
@@ -541,13 +554,10 @@ async fn get_data_scan_plan(
         // on `partition_values`, so partition values must be set first.
         partitioned_file.partition_values = vec![file_value.clone()];
         partitioned_file = partitioned_file.with_statistics(Arc::new(f.stats));
-        if collect_partition_values {
+        if let Some(values) = partition_values.filter(|_| collect_partition_values) {
             partitioned_file
                 .extensions
-                .insert(DeltaPartitionValues(extract_partition_values(
-                    f.partitions.as_ref(),
-                    partition_column_names,
-                )?));
+                .insert(DeltaPartitionValues(values));
         }
         Ok::<_, DataFusionError>((
             f.file_url.as_object_store_url(),
@@ -609,12 +619,9 @@ pub(super) struct DeltaPartitionValues(pub(super) Vec<ScalarValue>);
 /// partition struct, aligned to `partition_column_names` (missing columns become
 /// [`ScalarValue::Null`]).
 fn extract_partition_values(
-    partitions: Option<&StructData>,
+    data: &StructData,
     partition_column_names: &[String],
 ) -> Result<Vec<ScalarValue>> {
-    let Some(data) = partitions else {
-        return Ok(vec![ScalarValue::Null; partition_column_names.len()]);
-    };
     partition_column_names
         .iter()
         .map(
@@ -626,27 +633,27 @@ fn extract_partition_values(
         .try_collect()
 }
 
+/// Fold one file's converted partition values into the table-wide per-column
+/// statistics. `values` is aligned to `partition_column_names`.
 fn update_partition_stats(
-    data: &StructData,
+    partition_column_names: &[String],
+    values: &[ScalarValue],
     stats: &Statistics,
     part_stats: &mut HashMap<String, ColumnStatistics>,
-) -> Result<()> {
-    for (field, stat) in data.fields().iter().zip(data.values().iter()) {
-        let (null_count, value) = if stat.is_null() {
+) {
+    for (name, converted) in partition_column_names.iter().zip(values.iter()) {
+        let (null_count, value) = if converted.is_null() {
             (stats.num_rows, Precision::Absent)
         } else {
-            (
-                Precision::Exact(0),
-                Precision::Exact(to_datafusion_scalar(stat)?),
-            )
+            (Precision::Exact(0), Precision::Exact(converted.clone()))
         };
-        if let Some(part_stat) = part_stats.get_mut(field.name()) {
+        if let Some(part_stat) = part_stats.get_mut(name) {
             part_stat.null_count = part_stat.null_count.add(&null_count);
             part_stat.min_value = part_stat.min_value.min(&value);
             part_stat.max_value = part_stat.max_value.max(&value);
         } else {
             part_stats.insert(
-                field.name().clone(),
+                name.clone(),
                 ColumnStatistics {
                     null_count,
                     min_value: value.clone(),
@@ -658,8 +665,6 @@ fn update_partition_stats(
             );
         }
     }
-
-    Ok(())
 }
 
 type FilesByStore = (ObjectStoreUrl, Vec<(PartitionedFile, Option<Vec<bool>>)>);

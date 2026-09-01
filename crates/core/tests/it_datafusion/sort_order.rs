@@ -334,6 +334,38 @@ async fn delta_table_sort_order_partition_key_prefix_avoids_sort() -> TestResult
     Ok(())
 }
 
+/// With the DataFusion sort-pushdown optimizer disabled the scan skips
+/// attaching per-file partition values, and the query is answered through a
+/// plain `SortExec`.
+#[tokio::test]
+async fn delta_table_partition_prefix_with_sort_pushdown_disabled_keeps_sort() -> TestResult<()> {
+    let table = sorted_delta_table().await?;
+
+    let ctx = create_session().into_inner();
+    ctx.sql("SET datafusion.optimizer.enable_sort_pushdown = false")
+        .await?;
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+    let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(rows, 400);
+    Ok(())
+}
+
 /// When files overlap on the sort column *within* a partition, no regrouping
 /// yields the requested `[part, timestamp]` ordering, so the pushdown must
 /// refuse through the real optimizer pipeline and the `SortExec` must stay.
