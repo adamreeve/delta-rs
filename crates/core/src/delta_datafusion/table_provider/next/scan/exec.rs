@@ -642,9 +642,14 @@ impl ExecutionPlan for DeltaScanExec {
         let new_file_scan = FileScanConfigBuilder::from(file_scan)
             .with_file_groups(file_groups)
             .with_statistics(statistics)
-            // Drop the existing output ordering as groups are now ordered by the partition prefix
-            // first, and this is not needed. The order is declared in the pushdown result.
-            .with_output_ordering(vec![])
+            // The regrouped files are ordered by the partition prefix first, which the
+            // parquet child cannot express (partition columns are not in its schema);
+            // that combined order is declared in the pushdown result instead. When every
+            // group holds a single prefix key the file-sort-order suffix still holds per
+            // group and is re-declared, restoring DataFusion's statistics-based
+            // validation of the child's ordering and keeping any child-level
+            // repartitioning order-preserving.
+            .with_output_ordering(plan.output_ordering.into_iter().collect())
             .build();
         let new_input = DataSourceExec::from_data_source(new_file_scan) as Arc<dyn ExecutionPlan>;
 
