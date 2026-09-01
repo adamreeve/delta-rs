@@ -286,7 +286,7 @@ fn split_file_groups_for_ordering(
     table_schema: &SchemaRef,
     target_partitions: usize,
 ) -> Vec<FileGroup> {
-    let max_groups = usize::max(64, target_partitions.saturating_mul(2));
+    let max_groups = max_num_groups(target_partitions);
     let flat = vec![FileGroup::new(files.clone())];
 
     // On the overlapping path this duplicates the statistics analysis of the
@@ -672,6 +672,13 @@ type FilesByStore = (ObjectStoreUrl, Vec<(PartitionedFile, Option<Vec<bool>>)>);
 /// Maximum number of distinct values representable by DataFusion's default partition dictionary
 /// encoding (`Dictionary<UInt16, _>`).
 const MAX_PARTITION_DICT_CARDINALITY: usize = (u16::MAX as usize) + 1;
+
+/// Maximum number of file groups to create for a given target partition count.
+/// This allows the number of partitions to exceed the target, but prevents a
+/// very large number of partitions that could be detrimental to performance.
+pub(crate) fn max_num_groups(target_partitions: usize) -> usize {
+    usize::max(64, target_partitions.saturating_mul(2))
+}
 
 fn partitioned_files_to_file_groups(
     files: impl IntoIterator<Item = PartitionedFile>,

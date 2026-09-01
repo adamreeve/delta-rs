@@ -629,11 +629,17 @@ impl ExecutionPlan for DeltaScanExec {
 
         // `PushdownSort` deletes the `SortExec` on `Exact` without re-checking the
         // resulting partitioning, and `pack_buckets` must cut a run at every change
-        // in a leading prefix column regardless of the target. If regrouping ends up
-        // with more groups than the input had partitions, a global single-partition
-        // sort would be replaced by a multi-partition scan with no merge above it,
-        // and the coalesced output would interleave the groups.
-        if plan.file_groups.len() > target_groups {
+        // in a leading prefix column regardless of the target. A single-partition
+        // input means the deleted sort was the global one, with no merge operator
+        // above it (`PushdownSort` only probes the sort's direct child, and by the
+        // time it runs a global sort over a multi-partition child would have a
+        // coalesce in between), so extra partitions would be coalesced without
+        // order. A multi-partition input implies a per-partition sort whose
+        // consumers - `SortPreservingMergeExec`, or operators reading partitions
+        // independently - do not care how many sorted partitions they get, so the
+        // overshoot is sound there; `plan_sort_pushdown` bounds it via
+        // `max_num_groups`.
+        if target_groups == 1 && plan.file_groups.len() > 1 {
             return unsupported();
         }
 

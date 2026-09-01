@@ -448,7 +448,10 @@ async fn two_partition_column_delta_table() -> TestResult<DeltaTable> {
         ])
         .with_partition_columns(vec!["part", "sub"])
         .await?;
-    for (index, (part, sub)) in [("A", 1), ("B", 0), ("B", 1)].into_iter().enumerate() {
+    for (index, (part, sub)) in [("A", 1), ("B", 0), ("B", 1), ("C", 0)]
+        .into_iter()
+        .enumerate()
+    {
         let start = index as i64 * 10;
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -463,7 +466,7 @@ async fn two_partition_column_delta_table() -> TestResult<DeltaTable> {
             .with_save_mode(SaveMode::Append)
             .await?;
     }
-    assert_eq!(table.snapshot()?.log_data().num_files(), 3);
+    assert_eq!(table.snapshot()?.log_data().num_files(), 4);
     Ok(table)
 }
 
@@ -496,10 +499,10 @@ async fn query_two_partition_prefix(
 }
 
 /// `pack_buckets` cuts a file group at every change of a leading partition
-/// column, so `ORDER BY part, sub` with `target_partitions = 1` would regroup
-/// into more partitions than the plan has room for: the single-partition
-/// `SortExec` would be removed with no merge operator above the scan,
-/// interleaving the groups. The pushdown must refuse and keep the `SortExec`.
+/// column, so `ORDER BY part, sub` with `target_partitions = 1` regroups into
+/// several partitions. A single-partition plan sorts with a global `SortExec`
+/// and has no merge operator, so removing it would interleave the groups: the
+/// pushdown must refuse and keep the `SortExec`.
 #[tokio::test]
 async fn delta_table_partition_prefix_more_groups_than_target_keeps_sort() -> TestResult<()> {
     let table = two_partition_column_delta_table().await?;
@@ -508,7 +511,7 @@ async fn delta_table_partition_prefix_more_groups_than_target_keeps_sort() -> Te
         rendered.contains("SortExec"),
         "expected SortExec in plan:\n{rendered}"
     );
-    assert_eq!(keys.len(), 15);
+    assert_eq!(keys.len(), 20);
     assert!(
         keys.windows(2).all(|pair| pair[0] <= pair[1]),
         "results are not sorted by (part, sub)"
@@ -516,18 +519,21 @@ async fn delta_table_partition_prefix_more_groups_than_target_keeps_sort() -> Te
     Ok(())
 }
 
-/// With a declared file sort order the scan starts with one ordered group per
-/// target partition, so the regrouping fits and the same query is answered
-/// without a `SortExec`.
+/// With a multi-partition input the sort above the scan is a per-partition
+/// sort under a `SortPreservingMergeExec`, which merges however many sorted
+/// partitions it is given - so regrouping into *more* groups than the target
+/// (three leading-key runs against a target of two) is sound, and the query
+/// is still answered without a `SortExec`.
 #[tokio::test]
-async fn delta_table_partition_prefix_within_target_avoids_sort() -> TestResult<()> {
+async fn delta_table_partition_prefix_exceeding_multi_partition_target_avoids_sort()
+-> TestResult<()> {
     let table = two_partition_column_delta_table().await?;
     let (rendered, keys) = query_two_partition_prefix(&table, 2).await?;
     assert!(
         !rendered.contains("SortExec"),
         "expected no SortExec in plan:\n{rendered}"
     );
-    assert_eq!(keys.len(), 15);
+    assert_eq!(keys.len(), 20);
     assert!(
         keys.windows(2).all(|pair| pair[0] <= pair[1]),
         "results are not sorted by (part, sub)"

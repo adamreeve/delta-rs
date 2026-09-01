@@ -30,7 +30,7 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
 
 use super::{
-    DeltaPartitionValues, MAX_PARTITION_DICT_CARDINALITY, chunk_ordered_files,
+    DeltaPartitionValues, MAX_PARTITION_DICT_CARDINALITY, chunk_ordered_files, max_num_groups,
     null_free_ordering_prefix, order_files_if_non_overlapping,
 };
 
@@ -317,6 +317,12 @@ pub(super) fn plan_sort_pushdown(
 
     // --- Cut the buckets into groups and read the statistics off their keys. ---
     let groups = chunk_buckets(buckets, target_groups);
+    // Leading-prefix cuts can force more groups than requested. The caller
+    // decides whether its plan can absorb the overshoot, but bound it here so
+    // a high-cardinality leading column cannot explode the partition count.
+    if groups.len() > max_num_groups(target_groups) {
+        return Ok(None);
+    }
     // A group packed from several buckets interleaves suffix ranges, so the
     // suffix ordering only holds per group when no group spans a key change.
     let output_ordering = shape
@@ -1215,6 +1221,27 @@ mod tests {
             .and_then(|sort_expr| sort_expr.expr.downcast_ref::<Column>())
             .expect("a column-leading ordering");
         assert_eq!(leading.name(), "timestamp");
+    }
+
+    /// Leading-prefix cuts may exceed the target group count, but only up to
+    /// `max_num_groups`; past that the pushdown is refused so a
+    /// high-cardinality leading column cannot explode the partition count.
+    #[test]
+    fn group_overshoot_is_capped_by_max_num_groups() {
+        let files = |parts: usize| -> Vec<PartitionedFile> {
+            (0..parts)
+                .map(|i| two_column_file(&format!("f{i:03}"), &format!("p{i:03}"), 0))
+                .collect()
+        };
+        let order = vec![asc(0, "part"), asc(1, "sub")];
+
+        // 60 distinct leading values overshoot a target of 1 but stay within
+        // max_num_groups(1) = 64.
+        let plan = plan_two_column(files(60), &order, 1).expect("expected a pushdown plan");
+        assert_eq!(plan.file_groups.len(), 60);
+
+        // 65 distinct leading values exceed the cap.
+        assert!(plan_two_column(files(65), &order, 1).is_none());
     }
 
     /// A bucket larger than the file-id dictionary splits into several
