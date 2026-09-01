@@ -362,12 +362,15 @@ fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Vec<BucketGroup> {
     }
 
     // Fewer buckets than groups: split each bucket, giving it a share of the
-    // group budget proportional to its file count and at least one group.
+    // group budget proportional to its file count and at least one group. The
+    // remaining budget is derived from the emitted group count because
+    // `chunk_ordered_files` can emit more groups than asked for (the file-id
+    // dictionary cap).
     let mut out = Vec::with_capacity(target);
-    let mut groups_left = target;
     let mut files_left = total_files;
     for bucket in buckets {
         let files = bucket.files.len();
+        let groups_left = target.saturating_sub(out.len()).max(1);
         let share = (groups_left * files).div_ceil(files_left).clamp(1, files);
         out.extend(
             chunk_ordered_files(bucket.files, share)
@@ -378,7 +381,6 @@ fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Vec<BucketGroup> {
                     end_key: bucket.key.clone(),
                 }),
         );
-        groups_left = groups_left.saturating_sub(share).max(1);
         files_left -= files;
     }
     out
@@ -393,21 +395,14 @@ fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Vec<BucketGroup> {
 /// from the start and end key values of the BucketGroup.
 fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<BucketGroup> {
     let mut out: Vec<BucketGroup> = Vec::with_capacity(target);
-    let mut groups_left = target;
     let mut files_left = total_files;
     let mut run: Option<BucketGroup> = None;
     let mut buckets_left = buckets.len();
 
-    /// Emit the open run, if any, and charge it against the remaining budget.
-    fn close(
-        run: &mut Option<BucketGroup>,
-        out: &mut Vec<BucketGroup>,
-        files_left: &mut usize,
-        groups_left: &mut usize,
-    ) {
+    /// Emit the open run, if any, and charge it against the remaining files.
+    fn close(run: &mut Option<BucketGroup>, out: &mut Vec<BucketGroup>, files_left: &mut usize) {
         if let Some(closed) = run.take() {
             *files_left -= closed.files.len();
-            *groups_left = groups_left.saturating_sub(1).max(1);
             out.push(closed);
         }
     }
@@ -419,7 +414,7 @@ fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<
         // A bucket too large for the dictionary key space is split on its own;
         // every piece keeps the bucket's key, so its statistics stay exact.
         if files > MAX_PARTITION_DICT_CARDINALITY {
-            close(&mut run, &mut out, &mut files_left, &mut groups_left);
+            close(&mut run, &mut out, &mut files_left);
             out.extend(
                 chunk_ordered_files(bucket.files, files.div_ceil(MAX_PARTITION_DICT_CARDINALITY))
                     .into_iter()
@@ -429,7 +424,6 @@ fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<
                         end_key: bucket.key.clone(),
                     }),
             );
-            groups_left = groups_left.saturating_sub(1).max(1);
             files_left -= files;
             continue;
         }
@@ -445,7 +439,7 @@ fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<
                 open.end_key = bucket.key;
             }
             _ => {
-                close(&mut run, &mut out, &mut files_left, &mut groups_left);
+                close(&mut run, &mut out, &mut files_left);
                 run = Some(BucketGroup {
                     files: bucket.files,
                     start_key: bucket.key.clone(),
@@ -455,11 +449,14 @@ fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<
         }
 
         // Close the run once it has its share of the files, or once every
-        // remaining bucket is needed to fill a remaining group.
+        // remaining bucket is needed to fill a remaining group. The remaining
+        // group budget is derived from the emitted group count so that a
+        // multi-group dictionary split above charges for every group it emits.
         let open = run.as_ref().expect("a run is open");
+        let groups_left = target.saturating_sub(out.len()).max(1);
         let share = files_left.div_ceil(groups_left);
         if open.files.len() >= share || buckets_left < groups_left {
-            close(&mut run, &mut out, &mut files_left, &mut groups_left);
+            close(&mut run, &mut out, &mut files_left);
         }
     }
     out.extend(run);
@@ -1136,6 +1133,38 @@ mod tests {
                 Precision::Exact(_)
             ),
             "table-wide null count published as exact for one partition"
+        );
+    }
+
+    /// A bucket larger than the file-id dictionary splits into several
+    /// groups; each one must count against the group budget, or the remaining
+    /// buckets are packed as if the budget were still free and the scan ends
+    /// up with more partitions than requested.
+    #[test]
+    fn dictionary_split_charges_the_group_budget_per_emitted_group() {
+        let light_file = |url: String| PartitionedFile::new(url, 1);
+        let mut buckets = vec![Bucket {
+            key: vec![utf8("A")],
+            files: (0..2 * MAX_PARTITION_DICT_CARDINALITY + 1)
+                .map(|i| light_file(format!("a{i}")))
+                .collect(),
+        }];
+        for i in 0..10 {
+            buckets.push(Bucket {
+                key: vec![utf8(&format!("b{i}"))],
+                files: (0..100).map(|j| light_file(format!("b{i}-{j}"))).collect(),
+            });
+        }
+
+        let groups = chunk_buckets(buckets, 4);
+
+        // The oversized bucket takes three groups on its own, leaving one
+        // group for everything else.
+        assert_eq!(
+            groups.len(),
+            4,
+            "sizes: {:?}",
+            groups.iter().map(|g| g.files.len()).collect::<Vec<_>>()
         );
     }
 
