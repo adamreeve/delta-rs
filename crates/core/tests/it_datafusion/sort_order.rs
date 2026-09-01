@@ -34,6 +34,27 @@ fn assert_sorted_result(batches: &[RecordBatch]) {
     );
 }
 
+/// Collect `(column 0 as string, column 1 as i64)` sort keys from the result
+/// batches. The partition column may be dictionary-encoded or a view array,
+/// and a timestamp column casts to its microsecond value, so both are read
+/// through a cast.
+fn collect_string_i64_keys(batches: &[RecordBatch]) -> TestResult<Vec<(String, i64)>> {
+    let mut keys = Vec::new();
+    for batch in batches {
+        let firsts = arrow_cast::cast(batch.column(0), &DataType::Utf8)?;
+        let firsts = firsts.as_string::<i32>();
+        let seconds = arrow_cast::cast(batch.column(1), &DataType::Int64)?;
+        let seconds = seconds.as_primitive::<Int64Type>();
+        keys.extend(
+            firsts
+                .iter()
+                .map(|value| value.unwrap().to_string())
+                .zip(seconds.values().iter().copied()),
+        );
+    }
+    Ok(keys)
+}
+
 fn delta_write_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new(
@@ -309,23 +330,7 @@ async fn delta_table_sort_order_partition_key_prefix_avoids_sort() -> TestResult
         "expected ProgressiveEvalExec in plan:\n{rendered}"
     );
 
-    let mut keys: Vec<(String, i64)> = Vec::new();
-    for batch in &batches {
-        // The partition column is produced by the kernel transform and may be
-        // dictionary-encoded or a view array; cast to plain Utf8 to read it.
-        let parts = arrow_cast::cast(batch.column(0), &DataType::Utf8)?;
-        let parts = parts.as_string::<i32>();
-        let timestamps = batch
-            .column(1)
-            .as_primitive::<TimestampMicrosecondType>()
-            .values();
-        keys.extend(
-            parts
-                .iter()
-                .map(|part| part.unwrap().to_string())
-                .zip(timestamps.iter().copied()),
-        );
-    }
+    let keys = collect_string_i64_keys(&batches)?;
     assert_eq!(keys.len(), 400);
     assert!(
         keys.windows(2).all(|pair| pair[0] <= pair[1]),
@@ -404,21 +409,7 @@ async fn delta_table_partition_prefix_overlapping_files_keep_sort() -> TestResul
         "expected SortExec in plan:\n{rendered}"
     );
 
-    let mut keys: Vec<(String, i64)> = Vec::new();
-    for batch in &batches {
-        let parts = arrow_cast::cast(batch.column(0), &DataType::Utf8)?;
-        let parts = parts.as_string::<i32>();
-        let timestamps = batch
-            .column(1)
-            .as_primitive::<TimestampMicrosecondType>()
-            .values();
-        keys.extend(
-            parts
-                .iter()
-                .map(|part| part.unwrap().to_string())
-                .zip(timestamps.iter().copied()),
-        );
-    }
+    let keys = collect_string_i64_keys(&batches)?;
     assert_eq!(keys.len(), 300);
     assert!(
         keys.windows(2).all(|pair| pair[0] <= pair[1]),
@@ -501,22 +492,7 @@ async fn query_two_partition_prefix(
     let rendered = displayable(plan.as_ref()).indent(true).to_string();
     let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
 
-    let mut keys = Vec::new();
-    for batch in &batches {
-        // Partition columns are produced by the kernel transform and may be
-        // dictionary-encoded; cast to plain arrays to read them.
-        let parts = arrow_cast::cast(batch.column(0), &DataType::Utf8)?;
-        let parts = parts.as_string::<i32>();
-        let subs = arrow_cast::cast(batch.column(1), &DataType::Int64)?;
-        let subs = subs.as_primitive::<Int64Type>();
-        keys.extend(
-            parts
-                .iter()
-                .map(|part| part.unwrap().to_string())
-                .zip(subs.values().iter().copied()),
-        );
-    }
-    Ok((rendered, keys))
+    Ok((rendered, collect_string_i64_keys(&batches)?))
 }
 
 /// `pack_buckets` cuts a file group at every change of a leading partition

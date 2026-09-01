@@ -696,29 +696,14 @@ mod tests {
     }
 
     #[test]
-    fn incomparable_partition_values_are_not_supported() {
+    fn incomparable_partition_values_are_rejected_without_panicking() {
         // Mismatched `ScalarValue` variants for one partition column are
-        // incomparable, so the best-effort sort cannot order them. Without the
-        // strict step check when cutting buckets they would be concatenated in
-        // an arbitrary order while the scan advertises `[part, timestamp]` as an
-        // output ordering.
-        let fixture = Fixture::new(&[
-            ("a0", utf8("A"), 0, 99),
-            ("b0", ScalarValue::Int64(Some(1)), 100, 199),
-        ]);
-        let order = vec![asc(0, "part"), asc(1, "timestamp")];
-
-        assert!(fixture.plan(&order, Some(&file_sort_order()), 4).is_none());
-    }
-
-    #[test]
-    fn many_incomparable_partition_values_do_not_panic_the_sort() {
-        // Sorting mixed-variant keys with a comparator that collapses
-        // incomparable pairs to `Equal` is not a total order, which rustc's
-        // sort implementation detects and panics on for inputs large enough to
-        // leave the insertion-sort path (this exact sequence did). The type
-        // check while building keys must reject the pushdown before the sort
-        // runs.
+        // incomparable: no regrouping can order them, so the pushdown must be
+        // refused - and refused *before* the sort. Sorting mixed-variant keys
+        // with a comparator that collapses incomparable pairs to `Equal` is
+        // not a total order, which rustc's sort implementation detects and
+        // panics on for inputs large enough to leave the insertion-sort path
+        // (this exact sequence did).
         let parts = [
             utf8("p034774"),
             ScalarValue::Int64(Some(44153)),
@@ -805,18 +790,6 @@ mod tests {
         assert!(flat[1..].iter().all(|url| url.starts_with('b')));
     }
 
-    #[test]
-    fn descending_partition_prefix_orders_buckets_in_reverse() {
-        let fixture = Fixture::new(&[("a0", utf8("A"), 0, 99), ("b0", utf8("B"), 0, 99)]);
-        let order = vec![desc(0, "part"), asc(1, "timestamp")];
-
-        let plan = fixture
-            .plan(&order, Some(&file_sort_order()), 4)
-            .expect("expected a pushdown plan");
-        let flat: Vec<_> = plan.file_groups.iter().flat_map(group_urls).collect();
-        assert_eq!(flat, vec!["b0", "a0"]);
-    }
-
     /// Natural minimum and maximum of one partition column over the files a
     /// group actually holds.
     fn actual_range(group: &FileGroup, position: usize) -> (ScalarValue, ScalarValue) {
@@ -857,12 +830,14 @@ mod tests {
             ("b0", utf8("B"), 0, 99),
             ("c0", utf8("C"), 0, 99),
         ]);
-        let order = vec![desc(0, "part")];
+        // A descending prefix with an ascending suffix also pins that buckets
+        // are emitted in reverse and that mixed sort directions are accepted.
+        let order = vec![desc(0, "part"), asc(1, "timestamp")];
 
         // More buckets than groups, so the leading two are packed into one run
         // that spans `C` … `B`.
         let plan = fixture
-            .plan(&order, None, 2)
+            .plan(&order, Some(&file_sort_order()), 2)
             .expect("expected a pushdown plan");
 
         assert_eq!(
