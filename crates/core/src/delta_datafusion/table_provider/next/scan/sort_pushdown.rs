@@ -200,6 +200,10 @@ struct Bucket {
 /// described by `shape`, or return `None` when that cannot be guaranteed (the
 /// caller then reports `Unsupported`).
 ///
+/// Files are borrowed and cloned as late as possible so that a refusal - the
+/// common outcome probed on every ORDER BY over this scan - copies little or
+/// nothing.
+///
 /// * `parquet_read_schema` – physical file columns; its indices address
 ///   `PartitionedFile` statistics directly.
 /// * `parquet_table_schema` – the file scan's full table schema.
@@ -208,7 +212,7 @@ pub(super) fn plan_sort_pushdown(
     shape: &OrderShape,
     parquet_read_schema: &SchemaRef,
     parquet_table_schema: &SchemaRef,
-    files: Vec<PartitionedFile>,
+    files: &[&PartitionedFile],
     target_groups: usize,
 ) -> Result<Option<SortPushdownPlan>> {
     if files.is_empty() {
@@ -265,46 +269,50 @@ pub(super) fn plan_sort_pushdown(
     // One comparator decides both the bucket boundary and its validity: equal
     // keys extend the current bucket and a strict step opens a new one; the
     // keys were sorted with the same comparator, so any other outcome is a
-    // backstop, not an expected path.
-    let mut slots: Vec<Option<PartitionedFile>> = files.into_iter().map(Some).collect();
-    let mut buckets: Vec<Bucket> = Vec::new();
+    // backstop, not an expected path. Buckets hold file indices: nothing has
+    // been cloned yet.
+    let mut index_buckets: Vec<(Vec<ScalarValue>, Vec<usize>)> = Vec::new();
     for (key, index) in keyed {
-        let file = slots[index].take().expect("each file is claimed once");
-        match buckets.last_mut() {
-            None => buckets.push(Bucket {
-                key,
-                files: vec![file],
-            }),
-            Some(last) => match cmp_prefix(&last.key, &key, prefix) {
-                Some(Ordering::Equal) => last.files.push(file),
-                Some(Ordering::Less) => buckets.push(Bucket {
-                    key,
-                    files: vec![file],
-                }),
+        match index_buckets.last_mut() {
+            None => index_buckets.push((key, vec![index])),
+            Some((last_key, indices)) => match cmp_prefix(last_key, &key, prefix) {
+                Some(Ordering::Equal) => indices.push(index),
+                Some(Ordering::Less) => index_buckets.push((key, vec![index])),
                 _ => return Ok(None),
             },
         }
     }
 
-    // --- Order each bucket on the suffix, and require mutual non-overlap. ---
-    if let Some(suffix) = shape.suffix.as_ref() {
-        for bucket in &mut buckets {
-            if bucket.files.len() < 2 {
-                continue;
+    // --- Materialize each bucket, ordered on the suffix and mutually
+    //     non-overlapping. Files are cloned bucket by bucket so a refusal
+    //     stops the copying early. ---
+    let mut buckets: Vec<Bucket> = Vec::with_capacity(index_buckets.len());
+    for (key, indices) in index_buckets {
+        let bucket_files: Vec<PartitionedFile> =
+            indices.iter().map(|&index| files[index].clone()).collect();
+        let bucket_files = match shape.suffix.as_ref() {
+            Some(suffix) if bucket_files.len() >= 2 => {
+                // Concatenating several files into one group interleaves each
+                // file's nulls into the middle of the group's stream, which
+                // min/max cannot detect, so every suffix column must be
+                // provably null-free.
+                let null_free =
+                    null_free_ordering_prefix(suffix, parquet_read_schema, &bucket_files);
+                if null_free.is_none_or(|p| p.len() < suffix.len()) {
+                    return Ok(None);
+                }
+                let flat = vec![FileGroup::new(bucket_files)];
+                match order_files_if_non_overlapping(&flat, suffix, parquet_table_schema) {
+                    Some(ordered) => ordered,
+                    None => return Ok(None),
+                }
             }
-            // Concatenating several files into one group interleaves each file's
-            // nulls into the middle of the group's stream, which min/max cannot
-            // detect, so every suffix column must be provably null-free.
-            let null_free = null_free_ordering_prefix(suffix, parquet_read_schema, &bucket.files);
-            if null_free.is_none_or(|p| p.len() < suffix.len()) {
-                return Ok(None);
-            }
-            let flat = vec![FileGroup::new(std::mem::take(&mut bucket.files))];
-            match order_files_if_non_overlapping(&flat, suffix, parquet_table_schema) {
-                Some(ordered) => bucket.files = ordered,
-                None => return Ok(None),
-            }
-        }
+            _ => bucket_files,
+        };
+        buckets.push(Bucket {
+            key,
+            files: bucket_files,
+        });
     }
 
     // --- Cut the buckets into groups and read the statistics off their keys. ---
@@ -598,11 +606,12 @@ mod tests {
                 &["part".to_string()],
                 file_sort_order,
             )?;
+            let files: Vec<&PartitionedFile> = self.files.iter().collect();
             plan_sort_pushdown(
                 &shape,
                 &parquet_read_schema(),
                 &parquet_table_schema(),
-                self.files.clone(),
+                &files,
                 target_groups,
             )
             .unwrap()
@@ -900,11 +909,12 @@ mod tests {
             &["part".to_string(), "sub".to_string()],
             None,
         )?;
+        let files: Vec<&PartitionedFile> = files.iter().collect();
         plan_sort_pushdown(
             &shape,
             &parquet_read_schema(),
             &parquet_table_schema(),
-            files,
+            &files,
             target_groups,
         )
         .unwrap()
@@ -1063,7 +1073,7 @@ mod tests {
     #[tokio::test]
     async fn repartitioned_recomputes_partitioning() {
         use datafusion::config::ConfigOptions;
-        use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+        use datafusion::physical_plan::ExecutionPlanProperties;
 
         use crate::delta_datafusion::create_session;
 
@@ -1103,7 +1113,7 @@ mod tests {
     #[tokio::test]
     async fn per_partition_statistics_fall_back_to_inexact_aggregates() {
         use datafusion::config::ConfigOptions;
-        use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+        use datafusion::physical_plan::ExecutionPlanProperties;
 
         use crate::delta_datafusion::create_session;
 
@@ -1186,9 +1196,7 @@ mod tests {
     /// statistics before advertising it).
     #[tokio::test]
     async fn pushed_scan_redeclares_suffix_ordering_on_the_child() {
-        use datafusion::physical_plan::{
-            ExecutionPlan, ExecutionPlanProperties, SortOrderPushdownResult,
-        };
+        use datafusion::physical_plan::{ExecutionPlanProperties, SortOrderPushdownResult};
 
         use crate::delta_datafusion::{FileSortColumn, create_session};
 

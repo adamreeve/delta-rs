@@ -33,7 +33,6 @@ use datafusion::physical_plan::{
 };
 use datafusion_datasource::{
     PartitionedFile, compute_all_files_statistics,
-    file_groups::FileGroup,
     file_scan_config::{FileScanConfig, FileScanConfigBuilder},
     source::DataSourceExec,
 };
@@ -597,10 +596,10 @@ impl ExecutionPlan for DeltaScanExec {
             return unsupported();
         };
 
-        let mut file_scan = file_scan.clone();
-        let files: Vec<PartitionedFile> = std::mem::take(&mut file_scan.file_groups)
-            .into_iter()
-            .flat_map(FileGroup::into_inner)
+        let files: Vec<&PartitionedFile> = file_scan
+            .file_groups
+            .iter()
+            .flat_map(|group| group.iter())
             .collect();
         let parquet_table_schema = file_scan
             .file_source()
@@ -614,13 +613,14 @@ impl ExecutionPlan for DeltaScanExec {
             .partition_count()
             .max(1);
 
-        // Take list of flattened files and try to form new groups ordered by
-        // the partition columns.
+        // Try to form new groups ordered by the partition columns; the config
+        // is only cloned once that has succeeded, so the Unsupported paths -
+        // probed on every ORDER BY over this scan - copy nothing.
         let Some(plan) = super::sort_pushdown::plan_sort_pushdown(
             &shape,
             &self.scan_plan.parquet_read_schema,
             &parquet_table_schema,
-            files,
+            &files,
             target_groups,
         )?
         else {
@@ -639,7 +639,7 @@ impl ExecutionPlan for DeltaScanExec {
 
         let (file_groups, statistics) =
             compute_all_files_statistics(plan.file_groups, parquet_table_schema, true, false)?;
-        let new_file_scan = FileScanConfigBuilder::from(file_scan)
+        let new_file_scan = FileScanConfigBuilder::from(file_scan.clone())
             .with_file_groups(file_groups)
             .with_statistics(statistics)
             // The regrouped files are ordered by the partition prefix first, which the
