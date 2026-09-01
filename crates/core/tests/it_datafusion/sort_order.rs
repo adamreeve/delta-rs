@@ -334,6 +334,67 @@ async fn delta_table_sort_order_partition_key_prefix_avoids_sort() -> TestResult
     Ok(())
 }
 
+/// When files overlap on the sort column *within* a partition, no regrouping
+/// yields the requested `[part, timestamp]` ordering, so the pushdown must
+/// refuse through the real optimizer pipeline and the `SortExec` must stay.
+#[tokio::test]
+async fn delta_table_partition_prefix_overlapping_files_keep_sort() -> TestResult<()> {
+    let mut table = DeltaTable::new_in_memory()
+        .write(vec![delta_write_batch("A", 0, 100)?])
+        .with_partition_columns(vec!["part"])
+        .with_save_mode(SaveMode::Append)
+        .await?;
+    // The second "A" file overlaps the first on timestamp.
+    for (part, start) in [("A", 50), ("B", 0)] {
+        table = table
+            .write(vec![delta_write_batch(part, start, 100)?])
+            .with_save_mode(SaveMode::Append)
+            .await?;
+    }
+    assert_eq!(table.snapshot()?.log_data().num_files(), 3);
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT part, \"timestamp\", value FROM test_table ORDER BY part, \"timestamp\"")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        rendered.contains("SortExec"),
+        "expected SortExec in plan:\n{rendered}"
+    );
+
+    let mut keys: Vec<(String, i64)> = Vec::new();
+    for batch in &batches {
+        let parts = arrow_cast::cast(batch.column(0), &DataType::Utf8)?;
+        let parts = parts.as_string::<i32>();
+        let timestamps = batch
+            .column(1)
+            .as_primitive::<TimestampMicrosecondType>()
+            .values();
+        keys.extend(
+            parts
+                .iter()
+                .map(|part| part.unwrap().to_string())
+                .zip(timestamps.iter().copied()),
+        );
+    }
+    assert_eq!(keys.len(), 300);
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by (part, timestamp)"
+    );
+    Ok(())
+}
+
 /// Create a Delta table partitioned by ("part", "sub") with one file per
 /// partition, so regrouping for `ORDER BY part, sub` must cut a file group at
 /// every change of "part".
