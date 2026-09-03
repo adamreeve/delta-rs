@@ -951,6 +951,42 @@ mod tests {
         RecordBatch::try_new(schema, vec![timestamps, values, parts]).unwrap()
     }
 
+    /// Like [`write_batch`], but with a nullable timestamp column that
+    /// optionally ends on a null.
+    fn nullable_write_batch(part: &str, start: i64, len: i64, trailing_null: bool) -> RecordBatch {
+        use arrow_array::{Int64Array, StringArray, TimestampMicrosecondArray};
+        use arrow_schema::TimeUnit;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("value", DataType::Int64, false),
+            Field::new("part", DataType::Utf8, false),
+        ]));
+        let mut timestamps: Vec<Option<i64>> =
+            (start..start + len).map(|s| Some(s * 1_000_000)).collect();
+        if trailing_null {
+            timestamps.push(None);
+        }
+        let rows = timestamps.len();
+        let values: ArrayRef = Arc::new(Int64Array::from(
+            (start..start + rows as i64).collect::<Vec<_>>(),
+        ));
+        let parts: ArrayRef = Arc::new(StringArray::from(vec![part; rows]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(timestamps)) as ArrayRef,
+                values,
+                parts,
+            ],
+        )
+        .unwrap()
+    }
+
     /// Four files across two partition values: every file sorted by timestamp,
     /// non-overlapping within a partition, overlapping across partitions — so
     /// `ORDER BY part, timestamp` is only answerable without a sort by
@@ -972,6 +1008,93 @@ mod tests {
                 .unwrap();
         }
         table
+    }
+
+    /// The regrouped scan must be marked order-sensitive.
+    ///
+    /// The file-to-partition assignment *is* the pushdown result, but the child
+    /// only advertises the file-sort-order suffix, and only when every group
+    /// holds a single partition key. Whenever it does not - here, four keys
+    /// packed into two groups - nothing is declared, and an order-insensitive
+    /// scan lets DataFusion pool every file into one queue for the sibling
+    /// streams to share and lets a pushed fetch prune earlier row groups.
+    #[tokio::test]
+    async fn pushdown_marks_the_regrouped_scan_order_sensitive() {
+        use datafusion::physical_plan::SortOrderPushdownResult;
+        use datafusion_datasource::file_scan_config::FileScanConfig;
+        use datafusion_datasource::source::DataSourceExec;
+
+        use crate::delta_datafusion::{FileSortColumn, create_session};
+        use crate::protocol::SaveMode;
+
+        // A null in the sort column stops `get_read_plan` declaring a
+        // store-level ordering across the multi-file groups it builds, so the
+        // scan the pushdown inherits from is order-insensitive.
+        let mut table = crate::DeltaTable::new_in_memory()
+            .write(vec![nullable_write_batch("A", 0, 10, false)])
+            .with_partition_columns(vec!["part"])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .unwrap();
+        for (part, start) in [("B", 100), ("C", 200), ("D", 300)] {
+            table = table
+                .write(vec![nullable_write_batch(part, start, 10, part == "D")])
+                .with_save_mode(SaveMode::Append)
+                .await
+                .unwrap();
+        }
+
+        let ctx = create_session().into_inner();
+        ctx.sql("SET datafusion.execution.target_partitions = 2")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let provider = table
+            .table_provider()
+            .with_file_sort_order([FileSortColumn::asc("timestamp")])
+            .await
+            .unwrap();
+
+        let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let schema = scan.schema();
+        let sort_col = |name: &str| {
+            PhysicalSortExpr::new(
+                Arc::new(Column::new(name, schema.index_of(name).unwrap())),
+                SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            )
+        };
+
+        let pushed = match scan
+            .try_pushdown_sort(&[sort_col("part"), sort_col("timestamp")])
+            .unwrap()
+        {
+            SortOrderPushdownResult::Exact { inner } => inner,
+            other => panic!("expected an exact pushdown, got {other:?}"),
+        };
+
+        let child = Arc::clone(pushed.children()[0]);
+        let file_scan = child
+            .downcast_ref::<DataSourceExec>()
+            .unwrap()
+            .data_source()
+            .as_ref()
+            .downcast_ref::<FileScanConfig>()
+            .unwrap();
+
+        assert_eq!(file_scan.file_groups.len(), 2);
+        assert!(
+            file_scan.output_ordering.is_empty(),
+            "this test only bites while the child declares no ordering of its own"
+        );
+        assert!(
+            file_scan.preserve_order,
+            "the regrouped scan must be order-sensitive"
+        );
     }
 
     /// Sort-pushdown state is only valid for the file grouping it was computed

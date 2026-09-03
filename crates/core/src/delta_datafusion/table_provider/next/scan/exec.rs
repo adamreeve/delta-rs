@@ -700,6 +700,9 @@ impl ExecutionPlan for DeltaScanExec {
             // validation of the child's ordering and keeping any child-level
             // repartitioning order-preserving.
             .with_output_ordering(plan.output_ordering.into_iter().collect())
+            // Configure the file scan to preserve order, otherwise files may be read out-of-order,
+            // or DataFusion might incorrectly drop row groups that are needed.
+            .with_preserve_order(true)
             .build();
         let new_input = DataSourceExec::from_data_source(new_file_scan) as Arc<dyn ExecutionPlan>;
 

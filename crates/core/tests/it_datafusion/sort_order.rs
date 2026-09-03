@@ -2089,10 +2089,10 @@ async fn delta_table_sort_pushdown_survives_dynamic_filter_rebuild() -> TestResu
 
     // Planning is the whole test: before the fix `create_physical_plan` itself
     // failed here, because `SanityCheckPlan` runs after the filter pushdown and
-    // saw a scan that had stopped advertising the ordering. The plan is not
-    // executed - a `ProgressiveEvalExec` reads its input one partition at a
-    // time, while a `CollectLeft` hash join's dynamic filter parks every probe
-    // partition until all of them have reported, so the two deadlock. That is a
-    // separate defect, unrelated to this one.
+    // saw a scan that had stopped advertising the ordering.
+    //
+    // The plan is deliberately not executed. A `ProgressiveEvalExec` over a
+    // `CollectLeft` hash join that carries a dynamic filter hangs, whether or
+    // not a sort was pushed down - so it is a separate defect, not this one.
     Ok(())
 }
