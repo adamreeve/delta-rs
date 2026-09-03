@@ -43,6 +43,7 @@ use delta_kernel::schema::DataType as KernelDataType;
 use delta_kernel::table_features::TableFeature;
 use delta_kernel::{EvaluationHandler, ExpressionRef};
 use futures::stream::{Stream, StreamExt};
+use object_store::path::Path as ObjectStorePath;
 
 use super::plan::KernelScanPlan;
 use crate::delta_datafusion::file_id::file_id_field;
@@ -148,6 +149,43 @@ fn derive_output_orderings(
         }
     }
     orderings
+}
+
+/// The ordered file paths of each of a parquet scan's file groups, or `None`
+/// when the plan is not a single parquet scan whose grouping can be read.
+fn file_group_paths(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<Vec<&ObjectStorePath>>> {
+    let file_scan = plan
+        .downcast_ref::<DataSourceExec>()?
+        .data_source()
+        .as_ref()
+        .downcast_ref::<FileScanConfig>()?;
+    Some(
+        file_scan
+            .file_groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|file| &file.object_meta.location)
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// Whether `new` reads exactly the file groups `old` did, in the same order.
+///
+/// This is the property a [`PushedSort`] depends on: it claims the input's
+/// partitions are range-ordered on an ordering that the arrangement of the
+/// files - not the node reading them - establishes. A rebuild that only
+/// attaches a filter, adjusts a projection or refreshes statistics keeps it;
+/// any regrouping or file splitting does not. An input whose grouping cannot be
+/// read is treated as changed, so the claim is dropped rather than assumed.
+fn grouping_is_unchanged(old: &Arc<dyn ExecutionPlan>, new: &Arc<dyn ExecutionPlan>) -> bool {
+    match (file_group_paths(old), file_group_paths(new)) {
+        (Some(old), Some(new)) => old == new,
+        _ => false,
+    }
 }
 
 /// Physical execution plan for scanning Delta tables.
@@ -286,13 +324,19 @@ impl DeltaScanExec {
 
     /// Rebuild this exec around a new input plan, recomputing plan properties.
     fn with_new_input(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        // Ignore existing pushed sort result,
-        // we can't guarantee it is valid for the new input.
-        let properties = Self::build_properties(&self.scan_plan, &input, None);
+        // A pushed-down sort describes the file grouping `try_pushdown_sort`
+        // built, so it survives a child that was rebuilt around the same groups.
+        let pushed = self
+            .pushed
+            .as_ref()
+            .filter(|_| grouping_is_unchanged(&self.input, &input));
+        let properties =
+            Self::build_properties(&self.scan_plan, &input, pushed.map(|p| p.as_ref()));
+        let pushed = pushed.cloned();
         Arc::new(Self {
             input,
             properties,
-            pushed: None,
+            pushed,
             ..self.clone()
         })
     }

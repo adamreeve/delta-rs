@@ -2031,3 +2031,68 @@ async fn delta_table_progressive_eval_matches_sort_baseline() -> TestResult<()> 
     assert_eq!(optimized_rows, baseline_rows);
     Ok(())
 }
+
+/// A join's dynamic filter is pushed into the parquet source by
+/// `FilterPushdown::new_post_optimization`, which runs *after* `PushdownSort`
+/// has already deleted the `SortExec`. That rebuilds the scan's child around
+/// the very file groups the pushdown formed, so the `[part, timestamp]`
+/// ordering still holds; dropping it there would leave the
+/// `SortPreservingMergeExec` above with an unsatisfied requirement and
+/// `SanityCheckPlan` would fail the query outright.
+///
+/// The shape matters: a small build side keeps the join in `CollectLeft` mode,
+/// whose right input order is maintained, and a semi join emits only probe-side
+/// columns - with no `ProjectionExec` in between, `EnforceSorting` pushes the
+/// ordering requirement through the join and down onto the scan.
+#[tokio::test]
+async fn delta_table_sort_pushdown_survives_dynamic_filter_rebuild() -> TestResult<()> {
+    let table = sorted_delta_table().await?;
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let wanted = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![1i64, 2, 3, 150, 250]))],
+    )?;
+    ctx.register_batch("wanted", wanted)?;
+
+    let df = ctx
+        .sql(
+            "SELECT \"timestamp\", value, part FROM test_table \
+             WHERE value IN (SELECT value FROM wanted) ORDER BY part, \"timestamp\"",
+        )
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+
+    assert!(
+        rendered.contains("DynamicFilter"),
+        "expected the join's dynamic filter on the parquet source:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+
+    // Planning is the whole test: before the fix `create_physical_plan` itself
+    // failed here, because `SanityCheckPlan` runs after the filter pushdown and
+    // saw a scan that had stopped advertising the ordering. The plan is not
+    // executed - a `ProgressiveEvalExec` reads its input one partition at a
+    // time, while a `CollectLeft` hash join's dynamic filter parks every probe
+    // partition until all of them have reported, so the two deadlock. That is a
+    // separate defect, unrelated to this one.
+    Ok(())
+}
