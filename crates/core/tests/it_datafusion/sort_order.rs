@@ -2096,3 +2096,65 @@ async fn delta_table_sort_pushdown_survives_dynamic_filter_rebuild() -> TestResu
     // not a sort was pushed down - so it is a separate defect, not this one.
     Ok(())
 }
+
+/// `EnforceDistribution` runs long before `PushdownSort`, so by the time a sort
+/// is offered an unordered scan has already had a round-robin `RepartitionExec`
+/// inserted beneath `DeltaScanExec` for parallelism. The pushdown looks through
+/// it - the regrouping supplies parallelism that carries an order instead.
+#[tokio::test]
+async fn delta_table_partition_prefix_pushes_through_round_robin_repartition() -> TestResult<()> {
+    let table = sorted_delta_table().await?;
+
+    let ctx = create_session().into_inner();
+    for (key, value) in [
+        ("datafusion.execution.target_partitions", "4"),
+        // Round-robin is only judged beneficial for a scan with more rows than
+        // one batch; this keeps the fixture small instead.
+        ("datafusion.execution.batch_size", "10"),
+    ] {
+        ctx.sql(&format!("SET {key} = {value}"))
+            .await?
+            .collect()
+            .await?;
+    }
+    // No declared file sort order: an ordered scan is left unpartitioned, so
+    // this path is reachable only without one.
+    ctx.register_table("test_table", table.table_provider().await?)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value, part FROM test_table ORDER BY part")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        !rendered.contains("RepartitionExec"),
+        "expected the round-robin repartition to be replaced:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+
+    let mut parts: Vec<String> = Vec::new();
+    for batch in &batches {
+        let column = arrow_cast::cast(batch.column(2), &DataType::Utf8)?;
+        parts.extend(
+            column
+                .as_string::<i32>()
+                .iter()
+                .map(|part| part.unwrap().to_string()),
+        );
+    }
+    assert_eq!(parts.len(), 400);
+    assert!(
+        parts.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by part"
+    );
+    Ok(())
+}

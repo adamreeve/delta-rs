@@ -23,11 +23,12 @@ use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskCo
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_expr::{
-    Distribution, EquivalenceProperties, LexOrdering, PhysicalSortExpr,
+    Distribution, EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
 };
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, PlanProperties};
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, SortOrderPushdownResult, Statistics,
 };
@@ -185,6 +186,22 @@ fn grouping_is_unchanged(old: &Arc<dyn ExecutionPlan>, new: &Arc<dyn ExecutionPl
     match (file_group_paths(old), file_group_paths(new)) {
         (Some(old), Some(new)) => old == new,
         _ => false,
+    }
+}
+
+/// See through a round-robin repartition to the plan that actually reads files.
+///
+/// `EnforceDistribution` runs long before `PushdownSort`, so by the time a sort
+/// is offered an unordered scan has usually already had a `RepartitionExec`
+/// inserted beneath this exec purely for parallelism - this exec requires no
+/// particular distribution of its input. A sort pushdown replaces that with
+/// parallelism that carries an order, so the repartition can be dropped. Any
+/// other partitioning was asked for on purpose and is left alone.
+fn file_reading_input(input: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
+    match input.downcast_ref::<RepartitionExec>() {
+        Some(repartition) => matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_))
+            .then(|| repartition.input()),
+        None => Some(input),
     }
 }
 
@@ -628,8 +645,10 @@ impl ExecutionPlan for DeltaScanExec {
         };
 
         // Only a single-store parquet scan is handled; multi-store unions and
-        // any repartition wrappers are left alone.
-        let Some(source) = self.input.downcast_ref::<DataSourceExec>() else {
+        // any other wrapper are left alone.
+        let Some(source) = file_reading_input(&self.input)
+            .and_then(|input| input.downcast_ref::<DataSourceExec>())
+        else {
             return unsupported();
         };
         let Some(file_scan) = source
