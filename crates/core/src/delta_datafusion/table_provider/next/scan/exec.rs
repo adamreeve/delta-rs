@@ -205,6 +205,51 @@ fn file_reading_input(input: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn Executi
     }
 }
 
+/// Put byte-range pieces of the same file back together, keeping first-appearance
+/// order. `None` when some file's pieces do not tile it exactly.
+///
+/// `EnforceDistribution` may also have split files into byte ranges for
+/// parallelism. Each piece carries a clone of the whole file's statistics, so
+/// treating pieces as distinct files makes two pieces of one file look like two
+/// files with identical min/max - an overlap that is not there, which refuses
+/// the pushdown - and counts that file's rows once per piece in the regrouped
+/// statistics. The regrouping supersedes the split, so undo it first. A range
+/// that does not tile its file was narrowed by someone else and is never
+/// widened here.
+fn coalesce_file_ranges(pieces: &[&PartitionedFile]) -> Option<Vec<PartitionedFile>> {
+    let mut order: Vec<&ObjectStorePath> = Vec::new();
+    let mut by_path: HashMap<&ObjectStorePath, Vec<&PartitionedFile>> = HashMap::new();
+    for piece in pieces {
+        let path = &piece.object_meta.location;
+        let entry = by_path.entry(path).or_default();
+        if entry.is_empty() {
+            order.push(path);
+        }
+        entry.push(piece);
+    }
+
+    let mut files = Vec::with_capacity(order.len());
+    for path in order {
+        let group = by_path.remove(path)?;
+        let mut ranges: Vec<(u64, u64)> = group.iter().map(|piece| piece.range()).collect();
+        ranges.sort_unstable();
+        let mut covered = 0;
+        for (start, end) in ranges {
+            if start != covered {
+                return None;
+            }
+            covered = end;
+        }
+        if covered != group[0].object_meta.size {
+            return None;
+        }
+        let mut file = group[0].clone();
+        file.range = None;
+        files.push(file);
+    }
+    Some(files)
+}
+
 /// Physical execution plan for scanning Delta tables.
 ///
 /// Wraps a Parquet reader execution plan and applies Delta Lake protocol transformations
@@ -659,11 +704,25 @@ impl ExecutionPlan for DeltaScanExec {
             return unsupported();
         };
 
-        let files: Vec<&PartitionedFile> = file_scan
+        let pieces: Vec<&PartitionedFile> = file_scan
             .file_groups
             .iter()
             .flat_map(|group| group.iter())
             .collect();
+        // Nothing is copied while the scan is unsplit, which is the common case
+        // and the one probed by every `ORDER BY` over this scan.
+        let whole_files = if pieces.iter().any(|piece| piece.range.is_some()) {
+            match coalesce_file_ranges(&pieces) {
+                Some(files) => Some(files),
+                None => return unsupported(),
+            }
+        } else {
+            None
+        };
+        let files: Vec<&PartitionedFile> = match &whole_files {
+            Some(files) => files.iter().collect(),
+            None => pieces,
+        };
         let parquet_table_schema = file_scan
             .file_source()
             .table_schema()
@@ -1901,6 +1960,57 @@ mod tests {
         scan_plan.parquet_read_schema = Arc::clone(&scan_plan.contract.result_schema);
 
         Ok((kernel_type, Arc::new(scan_plan)))
+    }
+
+    fn piece(path: &str, size: u64, range: Option<(i64, i64)>) -> PartitionedFile {
+        let mut file = PartitionedFile::new(path.to_string(), size);
+        file.range = range.map(|(start, end)| datafusion_datasource::FileRange { start, end });
+        file
+    }
+
+    fn coalesced_paths(pieces: &[PartitionedFile]) -> Option<Vec<(String, bool)>> {
+        let refs: Vec<&PartitionedFile> = pieces.iter().collect();
+        Some(
+            coalesce_file_ranges(&refs)?
+                .into_iter()
+                .map(|file| (file.object_meta.location.to_string(), file.range.is_none()))
+                .collect(),
+        )
+    }
+
+    /// Pieces that tile their file become one whole-file entry, keeping the
+    /// order the first piece of each file appeared in.
+    #[test]
+    fn test_coalesce_file_ranges_reassembles_tiling_pieces() {
+        let pieces = vec![
+            piece("a", 100, Some((0, 40))),
+            piece("b", 60, Some((0, 60))),
+            piece("a", 100, Some((40, 100))),
+        ];
+        assert_eq!(
+            coalesced_paths(&pieces),
+            Some(vec![("a".to_string(), true), ("b".to_string(), true)])
+        );
+    }
+
+    /// A range nobody split - one that leaves part of the file unread - is
+    /// never widened; the pushdown gives up instead.
+    #[test]
+    fn test_coalesce_file_ranges_refuses_a_partial_file() {
+        assert_eq!(coalesced_paths(&[piece("a", 100, Some((0, 40)))]), None);
+        assert_eq!(
+            coalesced_paths(&[
+                piece("a", 100, Some((0, 40))),
+                piece("a", 100, Some((60, 100))),
+            ]),
+            None
+        );
+        // A whole-file entry alongside pieces of the same file would be read
+        // twice over.
+        assert_eq!(
+            coalesced_paths(&[piece("a", 100, None), piece("a", 100, Some((0, 100)))]),
+            None
+        );
     }
 
     fn selection_vectors_f1_f2() -> Arc<DashMap<String, Vec<bool>>> {

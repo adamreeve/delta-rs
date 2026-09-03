@@ -2158,3 +2158,75 @@ async fn delta_table_partition_prefix_pushes_through_round_robin_repartition() -
     );
     Ok(())
 }
+
+/// With fewer files than target partitions the order-preserving file
+/// partitioner splits each file into byte ranges before `PushdownSort` runs.
+/// Every piece carries a clone of the whole file's statistics, which used to
+/// read as an overlap between two pieces of one file - refusing the pushdown -
+/// and to count that file's rows once per piece. The pushdown puts the pieces
+/// back together first.
+#[tokio::test]
+async fn delta_table_partition_prefix_pushes_down_over_split_files() -> TestResult<()> {
+    let table = sorted_delta_table().await?;
+
+    let ctx = create_session().into_inner();
+    for (key, value) in MANY_CORE_OPTIONS {
+        ctx.sql(&format!("SET {key} = {value}"))
+            .await?
+            .collect()
+            .await?;
+    }
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value, part FROM test_table ORDER BY part, \"timestamp\"")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref())
+        .set_show_statistics(true)
+        .indent(true)
+        .to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ProgressiveEvalExec"),
+        "expected ProgressiveEvalExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains(".parquet:"),
+        "expected the byte-range pieces to be reassembled:\n{rendered}"
+    );
+    // The table holds 400 rows; a file counted once per piece reported 800.
+    assert!(
+        rendered.contains("Rows=Exact(400)") && !rendered.contains("Rows=Exact(800)"),
+        "regrouped statistics should count each file once:\n{rendered}"
+    );
+
+    let mut keys: Vec<(String, i64)> = Vec::new();
+    for batch in &batches {
+        let parts = arrow_cast::cast(batch.column(2), &DataType::Utf8)?;
+        let parts = parts.as_string::<i32>();
+        let timestamps = arrow_cast::cast(batch.column(0), &DataType::Int64)?;
+        let timestamps = timestamps.as_primitive::<Int64Type>();
+        keys.extend(
+            parts
+                .iter()
+                .map(|part| part.unwrap().to_string())
+                .zip(timestamps.values().iter().copied()),
+        );
+    }
+    assert_eq!(keys.len(), 400);
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by (part, timestamp)"
+    );
+    Ok(())
+}
