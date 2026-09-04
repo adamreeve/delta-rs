@@ -545,6 +545,58 @@ async fn delta_table_partition_prefix_exceeding_multi_partition_target_avoids_so
     Ok(())
 }
 
+/// Cutting a group at every change of a leading partition column is only
+/// attempted while it fits the group budget. A table with more distinct
+/// leading values than the budget allows is packed by file count instead: the
+/// `SortExec` is still removed, but the packed groups publish no partition
+/// statistics, so the `SortPreservingMergeExec` above them has to stay.
+#[tokio::test]
+async fn delta_table_partition_prefix_beyond_group_budget_keeps_merge_only() -> TestResult<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new("part", DataType::Utf8, false),
+        Field::new("sub", DataType::Int64, false),
+    ]));
+    // 65 leading values exceed group_budget(2) = 64; one file per value.
+    let parts = 65;
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..parts)),
+            Arc::new(StringArray::from(
+                (0..parts).map(|i| format!("p{i:03}")).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(vec![0; parts as usize])),
+        ],
+    )?;
+    let table = DeltaTable::new_in_memory()
+        .write(vec![batch])
+        .with_partition_columns(vec!["part", "sub"])
+        .with_save_mode(SaveMode::Append)
+        .await?;
+    assert_eq!(table.snapshot()?.log_data().num_files(), parts as usize);
+
+    let (rendered, keys) = query_two_partition_prefix(&table, 2).await?;
+    assert!(
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("SortPreservingMergeExec"),
+        "expected the merge to stay over packed groups:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "packed groups cannot be proven disjoint:\n{rendered}"
+    );
+    assert_eq!(keys.len(), parts as usize);
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "results are not sorted by (part, sub)"
+    );
+    Ok(())
+}
+
 // --- Multi-column sort order ---
 
 /// Each timestamp appears once per object id, so ties on the leading sort

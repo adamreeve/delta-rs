@@ -812,7 +812,9 @@ impl ExecutionPlan for DeltaScanExec {
 
         // Try to form new groups ordered by the partition columns; the config
         // is only cloned once that has succeeded, so the Unsupported paths -
-        // probed on every ORDER BY over this scan - copy nothing.
+        // probed on every ORDER BY over this scan - copy nothing. The plan may
+        // hold more groups than the input has partitions, within the bounds
+        // `sort_pushdown::group_budget` explains.
         let Some(plan) = super::sort_pushdown::plan_sort_pushdown(
             &shape,
             &self.scan_plan.parquet_read_schema,
@@ -822,20 +824,6 @@ impl ExecutionPlan for DeltaScanExec {
         else {
             return unsupported();
         };
-
-        // Asked for one group, `pack_buckets` returns one - unless the files
-        // outrun the file-id dictionary and have to be split. That leftover case
-        // must be refused: `PushdownSort` deletes the `SortExec` on `Exact`
-        // without re-checking the partitioning, and a single-partition input
-        // means the deleted sort was the global one with no merge operator above
-        // it, so the extra partitions would be coalesced in arbitrary order. A
-        // multi-partition input implies a per-partition sort whose consumers do
-        // not care how many sorted partitions they get, so the overshoot
-        // `pack_buckets` can produce there is sound; `plan_sort_pushdown` bounds
-        // it via `max_num_groups`.
-        if target_groups == 1 && plan.file_groups.len() > 1 {
-            return unsupported();
-        }
 
         let (file_groups, statistics) =
             compute_all_files_statistics(plan.file_groups, parquet_table_schema, true, false)?;

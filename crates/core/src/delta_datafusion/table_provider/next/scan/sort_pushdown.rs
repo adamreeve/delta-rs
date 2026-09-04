@@ -44,7 +44,8 @@ pub(super) struct SortPushdownPlan {
     pub(super) file_groups: Vec<FileGroup>,
     /// Per-group exact statistics for the leading partition columns of the
     /// requested ordering, keyed by logical column name. Aligned with
-    /// `file_groups` by index.
+    /// `file_groups` by index; empty for a group whose endpoints cannot be
+    /// read as per-column extrema (see `group_prefix_stats`).
     pub(super) per_partition_stats: Vec<HashMap<String, ColumnStatistics>>,
     /// The file-sort-order suffix to re-declare on the regrouped scan, present
     /// when every group holds a single prefix key so each group's rows are
@@ -248,23 +249,6 @@ pub(super) fn analyze_order(
     })
 }
 
-/// A contiguous run of whole buckets (or one slice of a single bucket) that
-/// becomes one execution partition, tagged with the partition-value range it
-/// spans.
-///
-/// The keys are the range endpoints under the requested ordering, not
-/// per-column minima and maxima: for a descending column the start key holds
-/// the larger value. A run only ever spans several keys in the last prefix
-/// column (see [`pack_buckets`]), so per-column extrema are recoverable by
-/// swapping the two for a descending column.
-struct BucketGroup {
-    files: Vec<PartitionedFile>,
-    /// Prefix key of the first bucket in the run.
-    start_key: Vec<ScalarValue>,
-    /// Prefix key of the last bucket in the run.
-    end_key: Vec<ScalarValue>,
-}
-
 /// Files sharing one partition-prefix key, ordered on the suffix.
 struct Bucket {
     key: Vec<ScalarValue>,
@@ -281,7 +265,8 @@ struct Bucket {
 ///
 /// * `parquet_read_schema` – physical file columns; its indices address
 ///   `PartitionedFile` statistics directly.
-/// * `target_groups` – desired execution-partition count.
+/// * `target_groups` – desired execution-partition count; the result may hold
+///   more groups, up to [`group_budget`].
 pub(super) fn plan_sort_pushdown(
     shape: &OrderShape,
     parquet_read_schema: &SchemaRef,
@@ -388,55 +373,23 @@ pub(super) fn plan_sort_pushdown(
     }
 
     // --- Cut the buckets into groups and read the statistics off their keys. ---
-    let groups = chunk_buckets(buckets, target_groups);
-    // Leading-prefix cuts can force more groups than requested. The caller
-    // decides whether its plan can absorb the overshoot, but bound it here so
-    // a high-cardinality leading column cannot explode the partition count.
-    if groups.len() > max_num_groups(target_groups) {
+    let Some(groups) = chunk_buckets(buckets, target_groups) else {
         return Ok(None);
-    }
+    };
     // A group packed from several buckets interleaves suffix ranges, so the
     // suffix ordering only holds per group when no group spans a key change.
-    let output_ordering = shape
-        .suffix
-        .clone()
-        .filter(|_| groups.iter().all(|group| group.start_key == group.end_key));
+    let output_ordering = shape.suffix.clone().filter(|_| {
+        groups
+            .iter()
+            .all(|group| group[0].key == group[group.len() - 1].key)
+    });
     let (file_groups, per_partition_stats) = groups
         .into_iter()
         .map(|group| {
-            // A group that spans a change in a leading prefix column has no
-            // per-column extrema that also say where its range starts and ends
-            // (see `pack_buckets`). Only a lone group is packed that way, and
-            // `DeltaScanExec` describes a single execution partition from the
-            // exact table-wide aggregate instead, so publish nothing here.
-            let leading = group.start_key.len().saturating_sub(1);
-            if group.start_key[..leading] != group.end_key[..leading] {
-                return (FileGroup::from(group.files), HashMap::new());
-            }
-            let stats = prefix
-                .iter()
-                .enumerate()
-                .map(|(i, col)| {
-                    // The keys are the group's range endpoints under the
-                    // requested ordering, so for a descending column the start
-                    // key is the larger value.
-                    let (min, max) = if col.options.descending {
-                        (&group.end_key[i], &group.start_key[i])
-                    } else {
-                        (&group.start_key[i], &group.end_key[i])
-                    };
-                    (
-                        col.name.clone(),
-                        ColumnStatistics {
-                            null_count: Precision::Exact(0),
-                            min_value: Precision::Exact(min.clone()),
-                            max_value: Precision::Exact(max.clone()),
-                            ..Default::default()
-                        },
-                    )
-                })
-                .collect();
-            (FileGroup::from(group.files), stats)
+            let stats = group_prefix_stats(&group, prefix);
+            let files: Vec<PartitionedFile> =
+                group.into_iter().flat_map(|bucket| bucket.files).collect();
+            (FileGroup::from(files), stats)
         })
         .unzip();
 
@@ -447,46 +400,142 @@ pub(super) fn plan_sort_pushdown(
     }))
 }
 
-/// Cut ordered, mutually non-overlapping buckets into roughly `target` groups.
+/// Exact statistics for the prefix columns of one group, keyed by logical
+/// column name, read off the keys of its first and last buckets.
 ///
-/// Group boundaries always fall on bucket boundaries, so each group spans a
-/// contiguous run of whole buckets and consecutive groups take a strict step on
-/// the partition prefix — which is what lets `ProgressiveEvalRule` prove the
-/// execution partitions disjoint. When there are more buckets than groups they
-/// are packed together; when there are fewer, the largest are split.
+/// The keys are the group's range endpoints under the requested ordering, so
+/// for a descending column the first key holds the larger value. Per-column
+/// extrema can only be read off the endpoints while at most the last prefix
+/// column changes across the group: a run from `[A, 2]` to `[B, 0]` is
+/// ordered, but `sub` really covers `0..2` there, and no `ColumnStatistics`
+/// describes both that range and where the run begins. Such a group publishes
+/// nothing, and `DeltaScanExec` describes it from the table-wide aggregate
+/// instead - exact for a lone execution partition, inexact otherwise, which
+/// cannot prove neighbouring partitions disjoint, so the merge above the scan
+/// stays while the sort is still gone.
+fn group_prefix_stats(
+    group: &[Bucket],
+    prefix: &[PrefixColumn],
+) -> HashMap<String, ColumnStatistics> {
+    let (Some(first), Some(last)) = (group.first(), group.last()) else {
+        return HashMap::new();
+    };
+    let leading = prefix.len().saturating_sub(1);
+    if first.key[..leading] != last.key[..leading] {
+        return HashMap::new();
+    }
+    prefix
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            let (min, max) = if col.options.descending {
+                (&last.key[i], &first.key[i])
+            } else {
+                (&first.key[i], &last.key[i])
+            };
+            (
+                col.name.clone(),
+                ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    min_value: Precision::Exact(min.clone()),
+                    max_value: Precision::Exact(max.clone()),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
+/// Largest group count a pushdown may produce for `target_groups`.
 ///
-/// The one exception is a single bucket holding more files than the file-id
-/// partition dictionary can key, which is split further; every resulting group
-/// still carries that bucket's key, so its statistics stay exact.
-fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Vec<BucketGroup> {
+/// A single target group is the one case that cannot absorb any overshoot:
+/// `PushdownSort` deletes the `SortExec` on `Exact` without re-checking the
+/// partitioning, and a single-partition input means the deleted sort was the
+/// global one with no merge operator above it, so extra partitions would be
+/// coalesced in arbitrary order. A multi-partition input implies a
+/// per-partition sort whose consumers do not care how many sorted partitions
+/// they get, so a bounded overshoot is sound there.
+pub(super) fn group_budget(target_groups: usize) -> usize {
+    if target_groups <= 1 {
+        1
+    } else {
+        max_num_groups(target_groups)
+    }
+}
+
+/// Cut ordered, mutually non-overlapping buckets into roughly `target` groups
+/// of whole buckets (or slices of a single bucket), never more than
+/// [`group_budget`] allows. `None` only when even that is impossible: more
+/// files than the budget times the file-id dictionary can key.
+///
+/// Group boundaries fall on bucket boundaries, so consecutive groups take a
+/// strict step on the partition prefix. When there are more buckets than
+/// groups they are packed together; when there are fewer, the largest are
+/// split.
+///
+/// Packing first cuts a group wherever a prefix column other than the last
+/// changes, so that every group's statistics can be read exactly off its
+/// endpoints (see [`group_prefix_stats`]) and `ProgressiveEvalRule` can prove
+/// the groups disjoint. When those cuts alone overrun the budget - many
+/// distinct leading values, or a single target group - the buckets are packed
+/// by file count alone instead. That still removes the sort; only the merge
+/// above it has to stay.
+fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Option<Vec<Vec<Bucket>>> {
     let target = target.max(1);
-    let total_files: usize = buckets.iter().map(|bucket| bucket.files.len()).sum();
-    if total_files == 0 {
-        return Vec::new();
+    let max_groups = group_budget(target);
+
+    // Split any bucket the file-id dictionary cannot key; every piece keeps
+    // the bucket's key, so its statistics stay exact.
+    let buckets: Vec<Bucket> = buckets
+        .into_iter()
+        .flat_map(|bucket| {
+            let key = bucket.key;
+            chunk_ordered_files(bucket.files, 1)
+                .into_iter()
+                .map(move |piece| Bucket {
+                    key: key.clone(),
+                    files: piece.into_inner(),
+                })
+        })
+        .collect();
+    if buckets.is_empty() {
+        return Some(Vec::new());
     }
 
-    if buckets.len() >= target {
-        return pack_buckets(buckets, target, total_files);
-    }
+    let groups = if buckets.len() < target {
+        split_buckets(buckets, target)
+    } else {
+        let groups = pack_buckets(buckets, target, true);
+        if groups.len() <= max_groups {
+            groups
+        } else {
+            pack_buckets(groups.into_iter().flatten().collect(), target, false)
+        }
+    };
+    (groups.len() <= max_groups).then_some(groups)
+}
 
-    // Fewer buckets than groups: split each bucket, giving it a share of the
-    // group budget proportional to its file count and at least one group. The
-    // remaining budget is derived from the emitted group count because
-    // `chunk_ordered_files` can emit more groups than asked for (the file-id
-    // dictionary cap).
+/// Fewer buckets than groups: split each bucket, giving it a share of the
+/// group budget proportional to its file count and at least one group. The
+/// remaining budget is derived from the emitted group count because
+/// `chunk_ordered_files` can emit more groups than asked for (the file-id
+/// dictionary cap).
+fn split_buckets(buckets: Vec<Bucket>, target: usize) -> Vec<Vec<Bucket>> {
     let mut out = Vec::with_capacity(target);
-    let mut files_left = total_files;
+    let mut files_left: usize = buckets.iter().map(|bucket| bucket.files.len()).sum();
     for bucket in buckets {
         let files = bucket.files.len();
         let groups_left = target.saturating_sub(out.len()).max(1);
         let share = (groups_left * files).div_ceil(files_left).clamp(1, files);
+        let key = bucket.key;
         out.extend(
             chunk_ordered_files(bucket.files, share)
                 .into_iter()
-                .map(|group| BucketGroup {
-                    files: group.into_inner(),
-                    start_key: bucket.key.clone(),
-                    end_key: bucket.key.clone(),
+                .map(|piece| {
+                    vec![Bucket {
+                        key: key.clone(),
+                        files: piece.into_inner(),
+                    }]
                 }),
         );
         files_left -= files;
@@ -494,87 +543,60 @@ fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Vec<BucketGroup> {
     out
 }
 
-/// Pack contiguous runs of whole buckets into `target` groups, balanced by file
-/// count. A run is also cut when it would outgrow the file-id dictionary, or
-/// when the next bucket differs in a prefix column other than the last.
-///
-/// Cutting runs on changes in prefix columns other than the last is what lets
-/// the group's min and max statistics be read exactly off its start and end
-/// keys: a run from `[A, 2]` to `[B, 0]` is ordered, but `sub` really covers
-/// `0..2` there, and no `ColumnStatistics` describes both that range and where
-/// the run begins. Those statistics exist to prove neighbouring groups
-/// disjoint, so a single target group - which has no neighbour - is exempt and
-/// packs every bucket together. `plan_sort_pushdown` then leaves its prefix
-/// statistics to the exact table-wide aggregate, which describes a lone
-/// execution partition precisely.
-fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<BucketGroup> {
-    let one_group = target == 1;
-    let mut out: Vec<BucketGroup> = Vec::with_capacity(target);
-    let mut files_left = total_files;
-    let mut run: Option<BucketGroup> = None;
+/// Pack contiguous runs of whole buckets into `target` groups, balanced by
+/// file count. A run is also cut when it would outgrow the file-id dictionary
+/// and, with `cut_on_leading_change`, when the next bucket differs in a prefix
+/// column other than the last (see [`chunk_buckets`]).
+fn pack_buckets(
+    buckets: Vec<Bucket>,
+    target: usize,
+    cut_on_leading_change: bool,
+) -> Vec<Vec<Bucket>> {
+    let mut out: Vec<Vec<Bucket>> = Vec::with_capacity(target);
+    let mut files_left: usize = buckets.iter().map(|bucket| bucket.files.len()).sum();
     let mut buckets_left = buckets.len();
+    let mut run: Vec<Bucket> = Vec::new();
+    let mut run_files = 0;
 
-    /// Emit the open run, if any, and charge it against the remaining files.
-    fn close(run: &mut Option<BucketGroup>, out: &mut Vec<BucketGroup>, files_left: &mut usize) {
-        if let Some(closed) = run.take() {
-            *files_left -= closed.files.len();
-            out.push(closed);
-        }
+    /// Emit the open run and charge it against the remaining files.
+    fn close(
+        run: &mut Vec<Bucket>,
+        run_files: &mut usize,
+        out: &mut Vec<Vec<Bucket>>,
+        files_left: &mut usize,
+    ) {
+        *files_left -= *run_files;
+        *run_files = 0;
+        out.push(std::mem::take(run));
     }
 
     for bucket in buckets {
         buckets_left -= 1;
         let files = bucket.files.len();
-
-        // A bucket too large for the dictionary key space is split on its own;
-        // every piece keeps the bucket's key, so its statistics stay exact.
-        if files > MAX_PARTITION_DICT_CARDINALITY {
-            close(&mut run, &mut out, &mut files_left);
-            out.extend(
-                chunk_ordered_files(bucket.files, files.div_ceil(MAX_PARTITION_DICT_CARDINALITY))
-                    .into_iter()
-                    .map(|group| BucketGroup {
-                        files: group.into_inner(),
-                        start_key: bucket.key.clone(),
-                        end_key: bucket.key.clone(),
-                    }),
-            );
-            files_left -= files;
-            continue;
-        }
-
-        // Only the last prefix column is allowed to change within a group.
         let leading = bucket.key.len() - 1;
-        match run.as_mut() {
-            Some(open)
-                if open.files.len() + files <= MAX_PARTITION_DICT_CARDINALITY
-                    && (one_group || open.end_key[..leading] == bucket.key[..leading]) =>
-            {
-                open.files.extend(bucket.files);
-                open.end_key = bucket.key;
-            }
-            _ => {
-                close(&mut run, &mut out, &mut files_left);
-                run = Some(BucketGroup {
-                    files: bucket.files,
-                    start_key: bucket.key.clone(),
-                    end_key: bucket.key,
-                });
-            }
+        let extends = run.last().is_some_and(|last| {
+            run_files + files <= MAX_PARTITION_DICT_CARDINALITY
+                && (!cut_on_leading_change || last.key[..leading] == bucket.key[..leading])
+        });
+        if !run.is_empty() && !extends {
+            close(&mut run, &mut run_files, &mut out, &mut files_left);
         }
+        run_files += files;
+        run.push(bucket);
 
         // Close the run once it has its share of the files, or once every
         // remaining bucket is needed to fill a remaining group. The remaining
-        // group budget is derived from the emitted group count so that a
-        // multi-group dictionary split above charges for every group it emits.
-        let open = run.as_ref().expect("a run is open");
+        // group budget is derived from the emitted group count so that forced
+        // cuts are charged for the groups they emit.
         let groups_left = target.saturating_sub(out.len()).max(1);
         let share = files_left.div_ceil(groups_left);
-        if open.files.len() >= share || buckets_left < groups_left {
-            close(&mut run, &mut out, &mut files_left);
+        if run_files >= share || buckets_left < groups_left {
+            close(&mut run, &mut run_files, &mut out, &mut files_left);
         }
     }
-    out.extend(run);
+    if !run.is_empty() {
+        out.push(run);
+    }
     out
 }
 
@@ -1059,11 +1081,12 @@ mod tests {
         assert_stats_match_files(&plan, &["part", "sub"]);
     }
 
-    /// A lone group has no neighbour to be proven disjoint from, so it may span
-    /// any prefix column - which is the only way a single-partition scan can
-    /// answer a multi-column partition prefix without a sort. It publishes no
-    /// prefix statistics: `DeltaScanExec` describes a single execution
-    /// partition from the exact table-wide aggregate instead.
+    /// A single target group cannot absorb the extra groups that leading-prefix
+    /// cuts produce, so the buckets are packed across every prefix column -
+    /// which is the only way a single-partition scan can answer a multi-column
+    /// partition prefix without a sort. The group publishes no prefix
+    /// statistics: `DeltaScanExec` describes a single execution partition from
+    /// the exact table-wide aggregate instead.
     #[test]
     fn a_single_target_group_spans_every_prefix_column() {
         let order = vec![asc(0, "part"), asc(1, "sub")];
@@ -1646,10 +1669,11 @@ mod tests {
     }
 
     /// Leading-prefix cuts may exceed the target group count, but only up to
-    /// `max_num_groups`; past that the pushdown is refused so a
-    /// high-cardinality leading column cannot explode the partition count.
+    /// `group_budget`. Past that the buckets are packed by file count instead:
+    /// the sort is still removed, and the groups that span a change in the
+    /// leading column publish no statistics, so the merge above them stays.
     #[test]
-    fn group_overshoot_is_capped_by_max_num_groups() {
+    fn leading_prefix_cuts_fall_back_to_packing_past_the_budget() {
         let files = |parts: usize| -> Vec<PartitionedFile> {
             (0..parts)
                 .map(|i| two_column_file(&format!("f{i:03}"), &format!("p{i:03}"), 0))
@@ -1658,13 +1682,25 @@ mod tests {
         let order = vec![asc(0, "part"), asc(1, "sub")];
 
         // 60 distinct leading values overshoot a target of 2 but stay within
-        // max_num_groups(2) = 64. (A target of 1 packs them into one group
-        // instead - it has no neighbour to step away from.)
+        // group_budget(2) = 64, so every one gets its own group.
         let plan = plan_two_column(files(60), &order, 2).expect("expected a pushdown plan");
         assert_eq!(plan.file_groups.len(), 60);
+        assert!(
+            plan.per_partition_stats
+                .iter()
+                .all(|stats| !stats.is_empty())
+        );
 
-        // 65 distinct leading values exceed the cap.
-        assert!(plan_two_column(files(65), &order, 2).is_none());
+        // 65 distinct leading values exceed the budget: two packed groups, each
+        // spanning many leading values, with no statistics to prove them apart.
+        let plan = plan_two_column(files(65), &order, 2).expect("expected a pushdown plan");
+        assert_eq!(plan.file_groups.len(), 2);
+        assert_eq!(
+            plan.file_groups.iter().map(FileGroup::len).sum::<usize>(),
+            65
+        );
+        assert!(plan.per_partition_stats.iter().all(HashMap::is_empty));
+        assert!(plan.output_ordering.is_none());
     }
 
     /// A bucket larger than the file-id dictionary splits into several
@@ -1687,7 +1723,7 @@ mod tests {
             });
         }
 
-        let groups = chunk_buckets(buckets, 4);
+        let groups = chunk_buckets(buckets, 4).expect("within the group budget");
 
         // The oversized bucket takes three groups on its own, leaving one
         // group for everything else.
@@ -1695,8 +1731,13 @@ mod tests {
             groups.len(),
             4,
             "sizes: {:?}",
-            groups.iter().map(|g| g.files.len()).collect::<Vec<_>>()
+            groups.iter().map(|g| group_files(g)).collect::<Vec<_>>()
         );
+    }
+
+    /// Number of files in a group of buckets.
+    fn group_files(group: &[Bucket]) -> usize {
+        group.iter().map(|bucket| bucket.files.len()).sum()
     }
 
     #[test]
@@ -1707,19 +1748,20 @@ mod tests {
                 .map(|i| file(&format!("{name}{i}"), utf8(&name.to_string()), i, i, 0))
                 .collect(),
         };
-        let groups = chunk_buckets(vec![bucket('a', 6), bucket('b', 2)], 4);
+        let groups = chunk_buckets(vec![bucket('a', 6), bucket('b', 2)], 4)
+            .expect("within the group budget");
 
         // Every group's files come from a single bucket.
         for group in &groups {
-            let prefixes: std::collections::HashSet<char> = group
+            assert_eq!(group.len(), 1);
+            let prefixes: std::collections::HashSet<char> = group[0]
                 .files
                 .iter()
                 .map(|f| f.object_meta.location.to_string().chars().next().unwrap())
                 .collect();
             assert_eq!(prefixes.len(), 1);
-            assert_eq!(group.start_key, group.end_key);
         }
-        assert_eq!(groups.iter().map(|g| g.files.len()).sum::<usize>(), 8);
+        assert_eq!(groups.iter().map(|g| group_files(g)).sum::<usize>(), 8);
         assert!(groups.len() >= 2, "each bucket gets at least one group");
     }
 
@@ -1739,14 +1781,14 @@ mod tests {
             })
             .collect();
 
-        let groups = chunk_buckets(buckets, 4);
+        let groups = chunk_buckets(buckets, 4).expect("within the group budget");
 
         assert_eq!(groups.len(), 4);
-        assert_eq!(groups.iter().map(|g| g.files.len()).sum::<usize>(), 20);
+        assert_eq!(groups.iter().map(|g| group_files(g)).sum::<usize>(), 20);
         // Each group's key range is strictly after the previous group's.
         for pair in groups.windows(2) {
             assert!(
-                pair[0].end_key[0] < pair[1].start_key[0],
+                pair[0].last().unwrap().key[0] < pair[1].first().unwrap().key[0],
                 "group key ranges must take a strict step"
             );
         }
