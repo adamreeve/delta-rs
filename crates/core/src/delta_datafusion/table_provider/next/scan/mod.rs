@@ -14,11 +14,12 @@
 //! The scan planning process in [`plan`] determines which files to read and how to apply
 //! predicates, while execution plans handle the actual data reading and transformation.
 
+use std::cmp::Ordering;
 use std::{collections::VecDeque, pin::Pin, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_cast::{CastOptions, cast_with_options};
-use arrow_schema::{FieldRef, Schema, SchemaBuilder, SchemaRef, SortOptions};
+use arrow_schema::{DataType, FieldRef, Schema, SchemaBuilder, SchemaRef, SortOptions};
 use chrono::{TimeZone as _, Utc};
 use dashmap::DashMap;
 use datafusion::{
@@ -192,10 +193,10 @@ fn resolve_file_sort_order(
 /// one ordered group interleaves each file's nulls into the middle of the
 /// group's stream. Min/max statistics cannot detect this, so an ordering on a
 /// column that may contain nulls must not be declared for multi-file groups.
-fn null_free_ordering_prefix(
+fn null_free_ordering_prefix<'a>(
     ordering: &LexOrdering,
     read_schema: &SchemaRef,
-    files: &[PartitionedFile],
+    files: impl IntoIterator<Item = &'a PartitionedFile> + Clone,
 ) -> Option<LexOrdering> {
     let sort_exprs = ordering
         .iter()
@@ -206,7 +207,7 @@ fn null_free_ordering_prefix(
             if !read_schema.field(column.index()).is_nullable() {
                 return true;
             }
-            files.iter().all(|file| {
+            files.clone().into_iter().all(|file| {
                 file.statistics
                     .as_ref()
                     .and_then(|stats| stats.column_statistics.get(column.index()))
@@ -218,19 +219,114 @@ fn null_free_ordering_prefix(
     LexOrdering::new(sort_exprs)
 }
 
-/// Order `files` on `ordering` if — and only if — they are mutually
-/// non-overlapping on it.
-pub(super) fn order_files_if_non_overlapping(
-    files: &[FileGroup],
-    ordering: &LexOrdering,
-    table_schema: &SchemaRef,
-) -> Option<Vec<PartitionedFile>> {
-    // `split_groups_by_statistics` will return a single group, in sort order,
-    // when no files overlap:
-    match FileScanConfig::split_groups_by_statistics(table_schema, files, ordering) {
-        Ok(mut groups) if groups.len() == 1 => Some(groups.remove(0).into_inner()),
-        _ => None,
+/// Compare two key tuples under `options`, one per column, as a lexicographic
+/// ordering. `None` when a column's values are not comparable.
+pub(super) fn cmp_keys(
+    a: &[ScalarValue],
+    b: &[ScalarValue],
+    options: impl IntoIterator<Item = SortOptions>,
+) -> Option<Ordering> {
+    for ((lhs, rhs), options) in a.iter().zip(b.iter()).zip(options) {
+        let ord = lhs.partial_cmp(rhs)?;
+        let ord = if options.descending {
+            ord.reverse()
+        } else {
+            ord
+        };
+        if ord != Ordering::Equal {
+            return Some(ord);
+        }
     }
+    Some(Ordering::Equal)
+}
+
+/// Per-column types that every key handed to one sort must share, learned
+/// from the first key seen.
+///
+/// `ScalarValue::partial_cmp` is total within one non-nested type but fails
+/// across variants, and `sort_by` panics on a comparator that is not a total
+/// order. Requiring every key to share the first key's per-column types is
+/// what lets the sorts here compare with `expect` instead of collapsing an
+/// incomparable pair to `Equal`.
+#[derive(Default)]
+pub(super) struct KeyTypes(Option<Vec<DataType>>);
+
+impl KeyTypes {
+    /// Whether `key` is comparable with every key accepted before it.
+    pub(super) fn accept(&mut self, key: &[ScalarValue]) -> bool {
+        match &self.0 {
+            None => {
+                let types: Vec<DataType> = key.iter().map(ScalarValue::data_type).collect();
+                if types.iter().any(DataType::is_nested) {
+                    return false;
+                }
+                self.0 = Some(types);
+                true
+            }
+            Some(types) => key
+                .iter()
+                .map(ScalarValue::data_type)
+                .eq(types.iter().cloned()),
+        }
+    }
+}
+
+/// The order in which `files` are mutually non-overlapping on `ordering`, as
+/// indices into `files`, or `None` when they overlap or cannot be placed.
+///
+/// This is `FileScanConfig::split_groups_by_statistics` specialised to the
+/// single-group answer, which is all its callers accept. That routine builds
+/// a `RecordBatch` per endpoint, a `RowConverter`, and a re-clone of every
+/// file - once per call, and the sort pushdown calls it once per bucket of a
+/// daily- or hourly-partitioned table.
+///
+/// The result is identical. `split_groups_by_statistics` sorts files by their
+/// min key and first-fit bin packs them, appending a file to a group when it
+/// starts after that group's last file ends. It lands in one group exactly
+/// when every file is appended to the first, that is when each file's max
+/// precedes the next file's min in min-sorted order - so comparing the endpoint
+/// tuples directly decides it, and the order it accepts is that same min-sorted
+/// order. Endpoints are per-column extrema compared under the sort options,
+/// which is what the row encoding there does.
+///
+/// Values that cannot be compared refuse the files rather than being ordered
+/// arbitrarily. Nulls among the sort columns are the caller's concern: the
+/// bounds say nothing about them.
+pub(super) fn non_overlapping_file_order<'a>(
+    files: impl IntoIterator<Item = &'a PartitionedFile>,
+    ordering: &LexOrdering,
+) -> Option<Vec<usize>> {
+    let mut ranges: Vec<(Vec<ScalarValue>, Vec<ScalarValue>, usize)> = Vec::new();
+    let mut key_types = KeyTypes::default();
+    for (index, file) in files.into_iter().enumerate() {
+        let stats = file.statistics.as_ref()?;
+        let mut mins = Vec::with_capacity(ordering.len());
+        let mut maxes = Vec::with_capacity(ordering.len());
+        for sort_expr in ordering.iter() {
+            let column = sort_expr.expr.downcast_ref::<Column>()?;
+            let column_stats = stats.column_statistics.get(column.index())?;
+            // Read the bounds whatever their precision, as `MinMaxStatistics`
+            // does.
+            mins.push(column_stats.min_value.get_value()?.clone());
+            maxes.push(column_stats.max_value.get_value()?.clone());
+        }
+        if !(key_types.accept(&mins) && key_types.accept(&maxes)) {
+            return None;
+        }
+        ranges.push((mins, maxes, index));
+    }
+
+    let options = || ordering.iter().map(|sort_expr| sort_expr.options);
+    let cmp = |a: &[ScalarValue], b: &[ScalarValue]| {
+        cmp_keys(a, b, options()).expect("endpoints share a non-nested type per column")
+    };
+    ranges.sort_by(|a, b| cmp(&a.0, &b.0));
+    for pair in ranges.windows(2) {
+        if cmp(&pair[0].1, &pair[1].0) != Ordering::Less {
+            return None;
+        }
+    }
+    Some(ranges.into_iter().map(|(_, _, index)| index).collect())
 }
 
 /// Cut a globally ordered, mutually non-overlapping file list into contiguous
@@ -287,18 +383,22 @@ fn split_file_groups_for_ordering(
     target_partitions: usize,
 ) -> Vec<FileGroup> {
     let max_groups = max_num_groups(target_partitions);
-    let flat = vec![FileGroup::new(files.clone())];
 
-    // On the overlapping path this duplicates the statistics analysis of the
-    // grouping below, which is fine: it is a cheap planning-time pass over
-    // per-file min/max values.
-    //
-    // Missing/unusable statistics fall through too: the grouping below fails the
+    // Missing/unusable statistics fall through: the grouping below fails the
     // same way and takes its default-grouping fallback.
-    if let Some(ordered_files) = order_files_if_non_overlapping(&flat, ordering, table_schema) {
+    if let Some(order) = non_overlapping_file_order(&files, ordering) {
+        let mut slots: Vec<Option<PartitionedFile>> = files.into_iter().map(Some).collect();
+        let ordered_files = order
+            .into_iter()
+            .map(|index| slots[index].take().expect("a permutation of the files"))
+            .collect();
         return chunk_ordered_files(ordered_files, target_partitions);
     }
 
+    let flat = vec![FileGroup::new(files)];
+    let default_grouping = |flat: Vec<FileGroup>| {
+        partitioned_files_to_file_groups(flat.into_iter().flat_map(FileGroup::into_inner))
+    };
     match FileScanConfig::split_groups_by_statistics_with_target_partitions(
         table_schema,
         &flat,
@@ -325,14 +425,14 @@ fn split_file_groups_for_ordering(
                     "file sort order grouping exceeded the file-id dictionary key space; falling back to default grouping"
                 );
             }
-            partitioned_files_to_file_groups(files)
+            default_grouping(flat)
         }
         Err(err) => {
             debug!(
                 error = %err,
                 "failed to group files by statistics for the declared file sort order; falling back to default grouping"
             );
-            partitioned_files_to_file_groups(files)
+            default_grouping(flat)
         }
     }
 }
@@ -820,7 +920,7 @@ async fn get_read_plan(
             Some(ordering) => {
                 let files = files.collect_vec();
                 let null_free_prefix =
-                    null_free_ordering_prefix(ordering, parquet_read_schema, &files);
+                    null_free_ordering_prefix(ordering, parquet_read_schema, files.iter());
                 let null_free_len = null_free_prefix.as_ref().map_or(0, |prefix| prefix.len());
                 let file_groups = split_file_groups_for_ordering(
                     files,
