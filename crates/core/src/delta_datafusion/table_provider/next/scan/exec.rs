@@ -816,7 +816,6 @@ impl ExecutionPlan for DeltaScanExec {
         let Some(plan) = super::sort_pushdown::plan_sort_pushdown(
             &shape,
             &self.scan_plan.parquet_read_schema,
-            &parquet_table_schema,
             &files,
             target_groups,
         )?

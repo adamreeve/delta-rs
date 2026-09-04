@@ -31,7 +31,7 @@ use datafusion_datasource::file_groups::FileGroup;
 
 use super::{
     DeltaPartitionValues, MAX_PARTITION_DICT_CARDINALITY, chunk_ordered_files, max_num_groups,
-    null_free_ordering_prefix, order_files_if_non_overlapping,
+    null_free_ordering_prefix,
 };
 
 /// Outcome of planning a sort pushdown: the regrouped, range-ordered file groups
@@ -78,9 +78,19 @@ pub(super) struct OrderShape {
 ///
 /// Returns `None` when a pair of values is incomparable.
 fn cmp_prefix(a: &[ScalarValue], b: &[ScalarValue], prefix: &[PrefixColumn]) -> Option<Ordering> {
-    for ((lhs, rhs), col) in a.iter().zip(b.iter()).zip(prefix.iter()) {
+    cmp_keys(a, b, prefix.iter().map(|col| col.options))
+}
+
+/// Compare two key tuples under `options`, one per column, as a lexicographic
+/// ordering. `None` when a column's values are not comparable.
+fn cmp_keys(
+    a: &[ScalarValue],
+    b: &[ScalarValue],
+    options: impl IntoIterator<Item = SortOptions>,
+) -> Option<Ordering> {
+    for ((lhs, rhs), options) in a.iter().zip(b.iter()).zip(options) {
         let ord = lhs.partial_cmp(rhs)?;
-        let ord = if col.options.descending {
+        let ord = if options.descending {
             ord.reverse()
         } else {
             ord
@@ -90,6 +100,71 @@ fn cmp_prefix(a: &[ScalarValue], b: &[ScalarValue], prefix: &[PrefixColumn]) -> 
         }
     }
     Some(Ordering::Equal)
+}
+
+/// Order one bucket's files on `ordering` if - and only if - they are mutually
+/// non-overlapping on it.
+///
+/// This is [`order_files_if_non_overlapping`](super::order_files_if_non_overlapping)
+/// specialised to the single-group answer, which is all this caller accepts.
+/// That routine reaches `FileScanConfig::split_groups_by_statistics`, which
+/// builds a `RecordBatch` per endpoint, a `RowConverter`, and a re-clone of
+/// every file - once per bucket, and a daily- or hourly-partitioned table has
+/// a bucket per partition value.
+///
+/// The result is identical. `split_groups_by_statistics` sorts files by their
+/// min key and first-fit bin packs them, appending a file to a group when it
+/// starts after that group's last file ends. It lands in one group exactly
+/// when every file is appended to the first, that is when each file's max
+/// precedes the next file's min in min-sorted order - so comparing the endpoint
+/// tuples directly decides it, and the order it accepts is that same min-sorted
+/// order. Endpoints are per-column extrema compared under the sort options,
+/// which is what the row encoding there does.
+///
+/// Values that cannot be compared refuse the bucket rather than being ordered
+/// arbitrarily.
+fn order_bucket_if_non_overlapping(
+    files: Vec<PartitionedFile>,
+    ordering: &LexOrdering,
+) -> Option<Vec<PartitionedFile>> {
+    let mut ranges: Vec<(Vec<ScalarValue>, Vec<ScalarValue>, PartitionedFile)> =
+        Vec::with_capacity(files.len());
+    for file in files {
+        let mut mins = Vec::with_capacity(ordering.len());
+        let mut maxes = Vec::with_capacity(ordering.len());
+        {
+            let stats = file.statistics.as_ref()?;
+            for sort_expr in ordering.iter() {
+                let column = sort_expr.expr.downcast_ref::<Column>()?;
+                let column_stats = stats.column_statistics.get(column.index())?;
+                // Read the bounds whatever their precision, as
+                // `MinMaxStatistics` does; the caller has already established
+                // that the sort columns hold no nulls.
+                mins.push(column_stats.min_value.get_value()?.clone());
+                maxes.push(column_stats.max_value.get_value()?.clone());
+            }
+        }
+        ranges.push((mins, maxes, file));
+    }
+
+    let options = || ordering.iter().map(|sort_expr| sort_expr.options);
+    let mut incomparable = false;
+    ranges.sort_by(|a, b| match cmp_keys(&a.0, &b.0, options()) {
+        Some(ord) => ord,
+        None => {
+            incomparable = true;
+            Ordering::Equal
+        }
+    });
+    if incomparable {
+        return None;
+    }
+    for pair in ranges.windows(2) {
+        if cmp_keys(&pair[0].1, &pair[1].0, options())? != Ordering::Less {
+            return None;
+        }
+    }
+    Some(ranges.into_iter().map(|(_, _, file)| file).collect())
 }
 
 /// Classify `order` as a partition-column prefix plus a file-sort-order suffix,
@@ -206,12 +281,10 @@ struct Bucket {
 ///
 /// * `parquet_read_schema` – physical file columns; its indices address
 ///   `PartitionedFile` statistics directly.
-/// * `parquet_table_schema` – the file scan's full table schema.
 /// * `target_groups` – desired execution-partition count.
 pub(super) fn plan_sort_pushdown(
     shape: &OrderShape,
     parquet_read_schema: &SchemaRef,
-    parquet_table_schema: &SchemaRef,
     files: &[&PartitionedFile],
     target_groups: usize,
 ) -> Result<Option<SortPushdownPlan>> {
@@ -301,8 +374,7 @@ pub(super) fn plan_sort_pushdown(
                 if null_free.is_none_or(|p| p.len() < suffix.len()) {
                     return Ok(None);
                 }
-                let flat = vec![FileGroup::new(bucket_files)];
-                match order_files_if_non_overlapping(&flat, suffix, parquet_table_schema) {
+                match order_bucket_if_non_overlapping(bucket_files, suffix) {
                     Some(ordered) => ordered,
                     None => return Ok(None),
                 }
@@ -553,14 +625,6 @@ mod tests {
         ]))
     }
 
-    fn parquet_table_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, true),
-            Field::new("value", DataType::Int64, true),
-            Field::new("__delta_rs_file_id__", DataType::Utf8, false),
-        ]))
-    }
-
     fn file_sort_order() -> LexOrdering {
         LexOrdering::new(vec![asc(0, "timestamp")]).unwrap()
     }
@@ -629,14 +693,7 @@ mod tests {
                 file_sort_order,
             )?;
             let files: Vec<&PartitionedFile> = self.files.iter().collect();
-            plan_sort_pushdown(
-                &shape,
-                &parquet_read_schema(),
-                &parquet_table_schema(),
-                &files,
-                target_groups,
-            )
-            .unwrap()
+            plan_sort_pushdown(&shape, &parquet_read_schema(), &files, target_groups).unwrap()
         }
     }
 
@@ -907,14 +964,73 @@ mod tests {
             None,
         )?;
         let files: Vec<&PartitionedFile> = files.iter().collect();
-        plan_sort_pushdown(
-            &shape,
-            &parquet_read_schema(),
-            &parquet_table_schema(),
-            &files,
-            target_groups,
+        plan_sort_pushdown(&shape, &parquet_read_schema(), &files, target_groups).unwrap()
+    }
+
+    fn ordered_bucket(specs: &[(&str, i64, i64)], sort: PhysicalSortExpr) -> Option<Vec<String>> {
+        let files = specs
+            .iter()
+            .map(|(url, min, max)| file(url, utf8("A"), *min, *max, 0))
+            .collect();
+        let ordering = LexOrdering::new(vec![sort]).unwrap();
+        Some(
+            order_bucket_if_non_overlapping(files, &ordering)?
+                .into_iter()
+                .map(|file| file.object_meta.location.to_string())
+                .collect(),
         )
-        .unwrap()
+    }
+
+    /// Disjoint ranges are accepted and returned in ascending order of their
+    /// minimum, whatever order they arrived in.
+    #[test]
+    fn test_order_bucket_sorts_disjoint_files() {
+        assert_eq!(
+            ordered_bucket(
+                &[("c", 20, 29), ("a", 0, 9), ("b", 10, 19)],
+                asc(0, "timestamp")
+            ),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+    }
+
+    /// A descending ordering reverses the arrangement, matching what the row
+    /// encoding in `split_groups_by_statistics` would produce.
+    #[test]
+    fn test_order_bucket_reverses_for_a_descending_ordering() {
+        assert_eq!(
+            ordered_bucket(
+                &[("a", 0, 9), ("c", 20, 29), ("b", 10, 19)],
+                desc(0, "timestamp")
+            ),
+            Some(vec!["c".to_string(), "b".to_string(), "a".to_string()])
+        );
+    }
+
+    /// Overlapping ranges are refused, and so are merely touching ones: first
+    /// fit needs the next minimum to be strictly past the previous maximum.
+    #[test]
+    fn test_order_bucket_refuses_overlapping_and_touching_files() {
+        assert_eq!(
+            ordered_bucket(&[("a", 0, 15), ("b", 10, 19)], asc(0, "timestamp")),
+            None
+        );
+        assert_eq!(
+            ordered_bucket(&[("a", 0, 10), ("b", 10, 19)], asc(0, "timestamp")),
+            None
+        );
+    }
+
+    /// A file with no statistics at all cannot be placed.
+    #[test]
+    fn test_order_bucket_refuses_without_statistics() {
+        let mut files = vec![
+            file("a", utf8("A"), 0, 9, 0),
+            file("b", utf8("A"), 10, 19, 0),
+        ];
+        files[1].statistics = None;
+        let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
+        assert!(order_bucket_if_non_overlapping(files, &ordering).is_none());
     }
 
     fn three_two_column_files() -> Vec<PartitionedFile> {
