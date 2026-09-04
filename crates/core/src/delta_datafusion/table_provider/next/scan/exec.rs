@@ -25,6 +25,7 @@ use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_expr::{
     Distribution, EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
 };
+use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, PlanProperties};
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
@@ -152,13 +153,29 @@ fn derive_output_orderings(
     orderings
 }
 
+/// Descend through wrappers that hand their input's partitions on untouched -
+/// same rows, same partition, same order - to whatever they wrap.
+///
+/// Only wrappers known to have that property are crossed; today that is the
+/// cooperative-yield wrapper `EnsureCooperative` may add around a leaf. The
+/// claim checked through this function is per partition, so a node that
+/// merely maintains order within each output partition, such as an
+/// order-preserving repartition, does not qualify.
+fn pass_through_leaf(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
+    let mut plan = plan;
+    while let Some(cooperative) = plan.downcast_ref::<CooperativeExec>() {
+        plan = cooperative.input();
+    }
+    plan
+}
+
 /// The ordered file extents - path and byte range - of each of a parquet
 /// scan's file groups, or `None` when the plan is not a single parquet scan
-/// whose grouping can be read.
+/// (possibly behind pass-through wrappers) whose grouping can be read.
 fn file_group_extents(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Option<Vec<Vec<(&ObjectStorePath, (u64, u64))>>> {
-    let file_scan = plan
+    let file_scan = pass_through_leaf(plan)
         .downcast_ref::<DataSourceExec>()?
         .data_source()
         .as_ref()
@@ -185,6 +202,14 @@ fn file_group_extents(
 /// attaches a filter, adjusts a projection or refreshes statistics keeps it;
 /// any regrouping or file splitting does not. An input whose grouping cannot be
 /// read is treated as changed, so the claim is dropped rather than assumed.
+///
+/// Dropping it fails closed at a price. By the time the child is replaced,
+/// `PushdownSort` has already deleted the `SortExec`, so the merge above is
+/// left with a requirement nothing satisfies and `SanityCheckPlan` fails the
+/// query rather than letting it return misordered rows. That is the right
+/// failure, but it means a rule that wraps the child in a node that
+/// [`pass_through_leaf`] does not cross turns into a planning error instead of
+/// a slower plan; extend that function when such a wrapper appears.
 fn grouping_is_unchanged(old: &Arc<dyn ExecutionPlan>, new: &Arc<dyn ExecutionPlan>) -> bool {
     match (file_group_extents(old), file_group_extents(new)) {
         (Some(old), Some(new)) => old == new,
@@ -2131,6 +2156,20 @@ mod tests {
         assert!(grouping_is_unchanged(&whole, &same));
         assert!(!grouping_is_unchanged(&whole, &split));
         assert!(!grouping_is_unchanged(&whole, &regrouped));
+    }
+
+    /// Wrappers that pass partitions through untouched do not hide the
+    /// grouping; anything else does, and the claim is dropped.
+    #[test]
+    fn test_grouping_is_unchanged_looks_through_pass_through_wrappers() {
+        let scan = parquet_scan(&[&[("a", 100, None)], &[("b", 100, None)]]);
+        let wrapped: Arc<dyn ExecutionPlan> = Arc::new(CooperativeExec::new(Arc::clone(&scan)));
+        let repartitioned: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(Arc::clone(&scan), Partitioning::RoundRobinBatch(2)).unwrap(),
+        );
+
+        assert!(grouping_is_unchanged(&scan, &wrapped));
+        assert!(!grouping_is_unchanged(&scan, &repartitioned));
     }
 
     fn selection_vectors_f1_f2() -> Arc<DashMap<String, Vec<bool>>> {
