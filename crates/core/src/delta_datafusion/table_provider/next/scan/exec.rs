@@ -875,15 +875,13 @@ impl ExecutionPlan for DeltaScanExec {
         .with_file_groups(file_groups)
         .with_statistics(statistics)
         // The regrouped files are ordered by the partition prefix first, which the
-        // parquet child cannot express (partition columns are not in its schema);
-        // that combined order is declared in the pushdown result instead. When every
-        // group holds a single prefix key the file-sort-order suffix still holds per
-        // group and is re-declared, restoring DataFusion's statistics-based
-        // validation of the child's ordering and keeping any child-level
-        // repartitioning order-preserving.
-        .with_output_ordering(plan.output_ordering.into_iter().collect())
-        // Configure the file scan to preserve order, otherwise files may be read out-of-order,
-        // or DataFusion might incorrectly drop row groups that are needed.
+        // parquet child cannot express (partition columns are not in its schema),
+        // so it declares no ordering; the combined order is advertised by this
+        // exec instead. A scan that declares nothing is not order-sensitive by
+        // default, and an order-insensitive scan lets DataFusion pool every file
+        // into one queue for the sibling streams to share, read them in any
+        // order, and let a pushed fetch prune earlier row groups - so say so
+        // explicitly.
         .with_preserve_order(true)
         .build();
         let new_input = DataSourceExec::from_data_source(new_file_scan) as Arc<dyn ExecutionPlan>;

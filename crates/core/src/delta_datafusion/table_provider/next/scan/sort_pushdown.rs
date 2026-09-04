@@ -47,12 +47,6 @@ pub(super) struct SortPushdownPlan {
     /// `file_groups` by index; empty for a group whose endpoints cannot be
     /// read as per-column extrema (see `group_prefix_stats`).
     pub(super) per_partition_stats: Vec<HashMap<String, ColumnStatistics>>,
-    /// The file-sort-order suffix to re-declare on the regrouped scan, present
-    /// when every group holds a single prefix key so each group's rows are
-    /// ordered on the suffix alone. Declaring it restores DataFusion's
-    /// statistics-based validation of the child's ordering and keeps any
-    /// child-level repartitioning order-preserving.
-    pub(super) output_ordering: Option<LexOrdering>,
 }
 
 /// A partition-column sort key extracted from the requested ordering.
@@ -385,13 +379,6 @@ pub(super) fn plan_sort_pushdown(
     let Some(groups) = chunk_buckets(buckets, target_groups) else {
         return Ok(None);
     };
-    // A group packed from several buckets interleaves suffix ranges, so the
-    // suffix ordering only holds per group when no group spans a key change.
-    let output_ordering = shape.suffix.clone().filter(|_| {
-        groups
-            .iter()
-            .all(|group| group[0].key == group[group.len() - 1].key)
-    });
     let (file_groups, per_partition_stats) = groups
         .into_iter()
         .map(|group| {
@@ -405,7 +392,6 @@ pub(super) fn plan_sort_pushdown(
     Ok(Some(SortPushdownPlan {
         file_groups,
         per_partition_stats,
-        output_ordering,
     }))
 }
 
@@ -1130,7 +1116,6 @@ mod tests {
             vec![vec!["a1", "a2", "b0"]],
         );
         assert_eq!(plan.per_partition_stats, vec![HashMap::new()]);
-        assert!(plan.output_ordering.is_none());
     }
 
     /// One record batch per (partition, day range), each sorted by timestamp.
@@ -1366,12 +1351,11 @@ mod tests {
 
     /// The regrouped scan must be marked order-sensitive.
     ///
-    /// The file-to-partition assignment *is* the pushdown result, but the child
-    /// only advertises the file-sort-order suffix, and only when every group
-    /// holds a single partition key. Whenever it does not - here, four keys
-    /// packed into two groups - nothing is declared, and an order-insensitive
-    /// scan lets DataFusion pool every file into one queue for the sibling
-    /// streams to share and lets a pushed fetch prune earlier row groups.
+    /// The file-to-partition assignment *is* the pushdown result, but the
+    /// combined ordering cannot be declared on the child (partition columns
+    /// are not in its schema), and an order-insensitive scan lets DataFusion
+    /// pool every file into one queue for the sibling streams to share and
+    /// lets a pushed fetch prune earlier row groups.
     #[tokio::test]
     async fn pushdown_marks_the_regrouped_scan_order_sensitive() {
         use datafusion::physical_plan::SortOrderPushdownResult;
@@ -1443,7 +1427,7 @@ mod tests {
         assert_eq!(file_scan.file_groups.len(), 2);
         assert!(
             file_scan.output_ordering.is_empty(),
-            "this test only bites while the child declares no ordering of its own"
+            "the child declares no ordering of its own, so nothing else makes it order-sensitive"
         );
         assert!(
             file_scan.preserve_order,
@@ -1617,89 +1601,6 @@ mod tests {
         );
     }
 
-    /// The file-sort-order suffix is re-declared on the regrouped scan only
-    /// when it actually holds per group: every group spans a single prefix
-    /// key. A packed group interleaves the suffix ranges of its buckets.
-    #[test]
-    fn suffix_ordering_is_redeclared_only_for_single_key_groups() {
-        let fixture = Fixture::new(&[
-            ("a0", utf8("A"), 0, 99),
-            ("a1", utf8("A"), 100, 199),
-            ("b0", utf8("B"), 50, 149),
-        ]);
-        let order = vec![asc(0, "part"), asc(1, "timestamp")];
-
-        // Plenty of group budget: every group holds one key.
-        let plan = fixture
-            .plan(&order, Some(&file_sort_order()), 4)
-            .expect("expected a pushdown plan");
-        assert_eq!(plan.output_ordering.as_ref(), Some(&file_sort_order()));
-
-        // One group spanning both keys interleaves the timestamp ranges.
-        let plan = fixture
-            .plan(&order, Some(&file_sort_order()), 1)
-            .expect("expected a pushdown plan");
-        assert_eq!(plan.file_groups.len(), 1);
-        assert!(plan.output_ordering.is_none());
-
-        // A partition-only ordering has no suffix to re-declare.
-        let plan = fixture
-            .plan(&[asc(0, "part")], None, 4)
-            .expect("expected a pushdown plan");
-        assert!(plan.output_ordering.is_none());
-    }
-
-    /// The re-declared suffix ordering must survive into the rebuilt child's
-    /// plan properties (DataFusion validates it against the per-group file
-    /// statistics before advertising it).
-    #[tokio::test]
-    async fn pushed_scan_redeclares_suffix_ordering_on_the_child() {
-        use datafusion::physical_plan::{ExecutionPlanProperties, SortOrderPushdownResult};
-
-        use crate::delta_datafusion::{FileSortColumn, create_session};
-
-        let table = partitioned_sorted_table().await;
-        let ctx = create_session().into_inner();
-        ctx.sql("SET datafusion.execution.target_partitions = 4")
-            .await
-            .unwrap();
-        let provider = table
-            .table_provider()
-            .with_file_sort_order([FileSortColumn::asc("timestamp")])
-            .await
-            .unwrap();
-
-        let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
-        let schema = scan.schema();
-        let sort_col = |name: &str| {
-            PhysicalSortExpr::new(
-                Arc::new(Column::new(name, schema.index_of(name).unwrap())),
-                SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
-            )
-        };
-        let pushed = match scan
-            .try_pushdown_sort(&[sort_col("part"), sort_col("timestamp")])
-            .unwrap()
-        {
-            SortOrderPushdownResult::Exact { inner } => inner,
-            other => panic!("expected an exact pushdown, got {other:?}"),
-        };
-
-        let child = Arc::clone(pushed.children()[0]);
-        let ordering = child
-            .output_ordering()
-            .expect("the child should advertise the re-declared suffix ordering");
-        let leading = ordering
-            .iter()
-            .next()
-            .and_then(|sort_expr| sort_expr.expr.downcast_ref::<Column>())
-            .expect("a column-leading ordering");
-        assert_eq!(leading.name(), "timestamp");
-    }
-
     /// Leading-prefix cuts may exceed the target group count, but only up to
     /// `group_budget`. Past that the buckets are packed by file count instead:
     /// the sort is still removed, and the groups that span a change in the
@@ -1732,7 +1633,6 @@ mod tests {
             65
         );
         assert!(plan.per_partition_stats.iter().all(HashMap::is_empty));
-        assert!(plan.output_ordering.is_none());
     }
 
     /// A bucket larger than the file-id dictionary splits into several
