@@ -26,7 +26,7 @@ use datafusion::{
     catalog::Session,
     common::{
         ColumnStatistics, HashMap, Result, ScalarValue, Statistics, ToDFSchema, plan_err,
-        stats::Precision,
+        stats::Precision, utils::compare_rows,
     },
     config::TableParquetOptions,
     datasource::physical_plan::{ParquetSource, parquet::CachedParquetFileReaderFactory},
@@ -219,35 +219,13 @@ fn null_free_ordering_prefix<'a>(
     LexOrdering::new(sort_exprs)
 }
 
-/// Compare two key tuples under `options`, one per column, as a lexicographic
-/// ordering. `None` when a column's values are not comparable.
-pub(super) fn cmp_keys(
-    a: &[ScalarValue],
-    b: &[ScalarValue],
-    options: impl IntoIterator<Item = SortOptions>,
-) -> Option<Ordering> {
-    for ((lhs, rhs), options) in a.iter().zip(b.iter()).zip(options) {
-        let ord = lhs.partial_cmp(rhs)?;
-        let ord = if options.descending {
-            ord.reverse()
-        } else {
-            ord
-        };
-        if ord != Ordering::Equal {
-            return Some(ord);
-        }
-    }
-    Some(Ordering::Equal)
-}
-
 /// Per-column types that every key handed to one sort must share, learned
 /// from the first key seen.
 ///
-/// `ScalarValue::partial_cmp` is total within one non-nested type but fails
-/// across variants, and `sort_by` panics on a comparator that is not a total
-/// order. Requiring every key to share the first key's per-column types is
-/// what lets the sorts here compare with `expect` instead of collapsing an
-/// incomparable pair to `Equal`.
+/// `compare_rows` fails across `ScalarValue` variants, and `sort_by` panics
+/// on a comparator that is not a total order. Requiring every key to share
+/// the first key's per-column types is what lets the sorts here compare with
+/// `expect` instead of collapsing an incomparable pair to `Equal`.
 #[derive(Default)]
 pub(super) struct KeyTypes(Option<Vec<DataType>>);
 
@@ -316,9 +294,9 @@ pub(super) fn non_overlapping_file_order<'a>(
         ranges.push((mins, maxes, index));
     }
 
-    let options = || ordering.iter().map(|sort_expr| sort_expr.options);
+    let options: Vec<SortOptions> = ordering.iter().map(|sort_expr| sort_expr.options).collect();
     let cmp = |a: &[ScalarValue], b: &[ScalarValue]| {
-        cmp_keys(a, b, options()).expect("endpoints share a non-nested type per column")
+        compare_rows(a, b, &options).expect("endpoints share a non-nested type per column")
     };
     ranges.sort_by(|a, b| cmp(&a.0, &b.0));
     for pair in ranges.windows(2) {

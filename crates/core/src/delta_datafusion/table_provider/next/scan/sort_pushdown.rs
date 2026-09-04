@@ -22,7 +22,9 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow_schema::{SchemaRef, SortOptions};
-use datafusion::common::{ColumnStatistics, HashMap, Result, stats::Precision};
+use datafusion::common::{
+    ColumnStatistics, HashMap, Result, stats::Precision, utils::compare_rows,
+};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::scalar::ScalarValue;
@@ -30,7 +32,7 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file_groups::FileGroup;
 
 use super::{
-    DeltaPartitionValues, KeyTypes, MAX_PARTITION_DICT_CARDINALITY, chunk_ordered_files, cmp_keys,
+    DeltaPartitionValues, KeyTypes, MAX_PARTITION_DICT_CARDINALITY, chunk_ordered_files,
     max_num_groups, non_overlapping_file_order, null_free_ordering_prefix,
 };
 
@@ -177,8 +179,8 @@ pub(super) fn plan_sort_pushdown(
         return Ok(None);
     }
     let prefix = &shape.prefix;
-    let cmp_prefix =
-        |a: &[ScalarValue], b: &[ScalarValue]| cmp_keys(a, b, prefix.iter().map(|col| col.options));
+    let prefix_options: Vec<SortOptions> = prefix.iter().map(|col| col.options).collect();
+    let cmp_prefix = |a: &[ScalarValue], b: &[ScalarValue]| compare_rows(a, b, &prefix_options);
 
     // --- Pair every file with its exact partition-prefix key. ---
     // Sort a lightweight (key, index) permutation rather than the large file objects.
@@ -215,8 +217,8 @@ pub(super) fn plan_sort_pushdown(
         match index_buckets.last_mut() {
             None => index_buckets.push((key, vec![index])),
             Some((last_key, indices)) => match cmp_prefix(last_key, &key) {
-                Some(Ordering::Equal) => indices.push(index),
-                Some(Ordering::Less) => index_buckets.push((key, vec![index])),
+                Ok(Ordering::Equal) => indices.push(index),
+                Ok(Ordering::Less) => index_buckets.push((key, vec![index])),
                 _ => return Ok(None),
             },
         }
