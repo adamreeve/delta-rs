@@ -450,26 +450,16 @@ impl DeltaScanExec {
     /// row-group reordering, which a reversed request can use to read the
     /// interesting end of each file first.
     ///
-    /// Three things must stay above it, though:
-    ///
-    /// - Deletion vectors are applied by position within a file, so the
-    ///   `Inexact` path's row-group reordering would line the mask up against
-    ///   the wrong rows. That returns the wrong *data*, not merely the wrong
-    ///   order, and no `SortExec` above can repair it.
-    /// - Retained row indexes are positional for the same reason.
-    /// - Column mapping renames columns between the two schemas; the ordering
-    ///   handed down is written in the child's own names.
+    /// Deletion vectors must stay above it, though: they are applied by
+    /// position within a file, so the `Inexact` path's row-group reordering
+    /// would line the mask up against the wrong rows. That returns the wrong
+    /// *data*, not merely the wrong order, and no `SortExec` above can repair
+    /// it. (The tables `try_pushdown_sort` refuses outright never get here.)
     fn delegate_pushdown_sort(
         &self,
         order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
-        if self.has_selection_vectors
-            || self.scan_plan.contract.retained_row_index_field().is_some()
-            || self
-                .scan_plan
-                .table_configuration()
-                .is_feature_enabled(&TableFeature::ColumnMapping)
-        {
+        if self.has_selection_vectors {
             return Ok(SortOrderPushdownResult::Unsupported);
         }
         let Some(child_order) = self.map_ordering_to_input(order) else {
@@ -758,22 +748,26 @@ impl ExecutionPlan for DeltaScanExec {
         &self,
         order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
-        // Whatever this exec cannot serve by regrouping, the parquet scan below
-        // may still be able to optimise for.
-        let unsupported = || self.delegate_pushdown_sort(order);
-
-        // Retained row indexes require a single input partition, so there is no
-        // regrouping to do. Column mapping would need physical/logical name
-        // translation for the file-sort-order columns, which is not handled yet;
-        // for both, `get_data_scan_plan` also skips collecting partition values.
+        // Neither regrouping nor delegation can serve these tables. Retained
+        // row indexes are positional: they require a single input partition,
+        // so there is no regrouping to do, and the row-group reordering the
+        // scan below may answer with would misnumber rows. Column mapping
+        // renames columns between this exec's schema and the child's; neither
+        // the file-sort-order columns nor the ordering handed down are
+        // translated yet.
         if self.scan_plan.contract.retained_row_index_field().is_some()
             || self
                 .scan_plan
                 .table_configuration()
                 .is_feature_enabled(&TableFeature::ColumnMapping)
         {
-            return unsupported();
+            return Ok(SortOrderPushdownResult::Unsupported);
         }
+
+        // Whatever this exec cannot serve by regrouping, the parquet scan below
+        // may still be able to optimise for.
+        let unsupported = || self.delegate_pushdown_sort(order);
+
         let Some(ordering) = LexOrdering::new(order.to_vec()) else {
             return unsupported();
         };

@@ -69,13 +69,6 @@ pub(super) struct OrderShape {
     suffix: Option<LexOrdering>,
 }
 
-/// Compare two partition-prefix value tuples under the prefix column options.
-///
-/// Returns `None` when a pair of values is incomparable.
-fn cmp_prefix(a: &[ScalarValue], b: &[ScalarValue], prefix: &[PrefixColumn]) -> Option<Ordering> {
-    cmp_keys(a, b, prefix.iter().map(|col| col.options))
-}
-
 /// Classify `order` as a partition-column prefix plus a file-sort-order suffix,
 /// or `None` when this scan cannot satisfy it by regrouping.
 ///
@@ -184,6 +177,8 @@ pub(super) fn plan_sort_pushdown(
         return Ok(None);
     }
     let prefix = &shape.prefix;
+    let cmp_prefix =
+        |a: &[ScalarValue], b: &[ScalarValue]| cmp_keys(a, b, prefix.iter().map(|col| col.options));
 
     // --- Pair every file with its exact partition-prefix key. ---
     // Sort a lightweight (key, index) permutation rather than the large file objects.
@@ -207,9 +202,7 @@ pub(super) fn plan_sort_pushdown(
         }
         keyed.push((key, index));
     }
-    keyed.sort_by(|a, b| {
-        cmp_prefix(&a.0, &b.0, prefix).expect("keys share a non-nested type per column")
-    });
+    keyed.sort_by(|a, b| cmp_prefix(&a.0, &b.0).expect("keys share a non-nested type per column"));
 
     // --- Cut the sorted files into buckets of equal prefix key. ---
     // One comparator decides both the bucket boundary and its validity: equal
@@ -221,7 +214,7 @@ pub(super) fn plan_sort_pushdown(
     for (key, index) in keyed {
         match index_buckets.last_mut() {
             None => index_buckets.push((key, vec![index])),
-            Some((last_key, indices)) => match cmp_prefix(last_key, &key, prefix) {
+            Some((last_key, indices)) => match cmp_prefix(last_key, &key) {
                 Some(Ordering::Equal) => indices.push(index),
                 Some(Ordering::Less) => index_buckets.push((key, vec![index])),
                 _ => return Ok(None),
