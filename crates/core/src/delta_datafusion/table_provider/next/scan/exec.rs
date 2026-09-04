@@ -291,6 +291,10 @@ pub struct DeltaScanExec {
     /// Result of a successful sort pushdown, or `None` without one. Valid only
     /// for the file grouping it was computed against.
     pushed: Option<Arc<PushedSort>>,
+    /// Whether any scanned file carries a deletion vector, sampled while
+    /// [`Self::selection_vectors`] is still complete - it is drained as the
+    /// masks are consumed during execution.
+    has_selection_vectors: bool,
 }
 
 /// Result of a successful sort pushdown, which regroups files to achieve
@@ -340,6 +344,7 @@ impl DeltaScanExec {
             .retain_file_id
             .then(|| scan_plan.contract.file_id_field.name().to_owned());
         let properties = Self::build_properties(&scan_plan, &input, None);
+        let has_selection_vectors = !selection_vectors.is_empty();
         Self {
             scan_plan,
             input,
@@ -352,6 +357,7 @@ impl DeltaScanExec {
             properties,
             file_sort_order: None,
             pushed: None,
+            has_selection_vectors,
         }
     }
 
@@ -382,6 +388,73 @@ impl DeltaScanExec {
             input.properties().emission_type,
             input.properties().boundedness,
         ))
+    }
+
+    /// Re-express an ordering over this exec's output schema against the input
+    /// plan's schema.
+    ///
+    /// `None` when a column does not survive the crossing - a partition column
+    /// above all, which is materialised here and absent from the parquet child.
+    fn map_ordering_to_input(&self, order: &[PhysicalSortExpr]) -> Option<Vec<PhysicalSortExpr>> {
+        let output_schema = &self.scan_plan.contract.output_schema;
+        let input_schema = self.input.schema();
+        order
+            .iter()
+            .map(|sort_expr| {
+                let column = sort_expr.expr.downcast_ref::<Column>()?;
+                let name = output_schema.fields().get(column.index())?.name();
+                let index = input_schema.index_of(name).ok()?;
+                Some(PhysicalSortExpr::new(
+                    Arc::new(Column::new(name, index)),
+                    sort_expr.options,
+                ))
+            })
+            .collect()
+    }
+
+    /// Offer an ordering this exec cannot serve itself to the scan underneath.
+    ///
+    /// The per-file work done here - partition values, column transforms,
+    /// deletion vectors - keeps rows in the order they arrive, so this node is
+    /// transparent to ordering and the trait asks it to delegate and re-wrap.
+    /// That reaches DataFusion's own file regrouping and its `Inexact`
+    /// row-group reordering, which a reversed request can use to read the
+    /// interesting end of each file first.
+    ///
+    /// Three things must stay above it, though:
+    ///
+    /// - Deletion vectors are applied by position within a file, so the
+    ///   `Inexact` path's row-group reordering would line the mask up against
+    ///   the wrong rows. That returns the wrong *data*, not merely the wrong
+    ///   order, and no `SortExec` above can repair it.
+    /// - Retained row indexes are positional for the same reason.
+    /// - Column mapping renames columns between the two schemas; the ordering
+    ///   handed down is written in the child's own names.
+    fn delegate_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        if self.has_selection_vectors
+            || self.scan_plan.contract.retained_row_index_field().is_some()
+            || self
+                .scan_plan
+                .table_configuration()
+                .is_feature_enabled(&TableFeature::ColumnMapping)
+        {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        let Some(child_order) = self.map_ordering_to_input(order) else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        Ok(match self.input.try_pushdown_sort(&child_order)? {
+            SortOrderPushdownResult::Exact { inner } => SortOrderPushdownResult::Exact {
+                inner: self.with_new_input(inner),
+            },
+            SortOrderPushdownResult::Inexact { inner } => SortOrderPushdownResult::Inexact {
+                inner: self.with_new_input(inner),
+            },
+            SortOrderPushdownResult::Unsupported => SortOrderPushdownResult::Unsupported,
+        })
     }
 
     /// Rebuild this exec around a new input plan, recomputing plan properties.
@@ -656,7 +729,9 @@ impl ExecutionPlan for DeltaScanExec {
         &self,
         order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
-        let unsupported = || Ok(SortOrderPushdownResult::Unsupported);
+        // Whatever this exec cannot serve by regrouping, the parquet scan below
+        // may still be able to optimise for.
+        let unsupported = || self.delegate_pushdown_sort(order);
 
         // Retained row indexes require a single input partition, so there is no
         // regrouping to do. Column mapping would need physical/logical name

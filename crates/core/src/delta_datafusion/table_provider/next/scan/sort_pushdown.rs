@@ -1010,6 +1010,80 @@ mod tests {
         table
     }
 
+    /// An ordering that does not start with partition columns is offered to the
+    /// parquet scan instead of being refused outright: this exec keeps rows in
+    /// the order they arrive, so the trait asks it to delegate and re-wrap.
+    /// DataFusion answers `Inexact` for a reversed request - the `SortExec`
+    /// stays, but the scan now reads each file's row groups from the end the
+    /// query wants first.
+    #[tokio::test]
+    async fn ordering_without_a_partition_prefix_is_delegated_to_the_scan() {
+        use datafusion::physical_plan::SortOrderPushdownResult;
+
+        use crate::delta_datafusion::{FileSortColumn, create_session};
+
+        let table = partitioned_sorted_table().await;
+        let ctx = create_session().into_inner();
+        let provider = table
+            .table_provider()
+            .with_file_sort_order([FileSortColumn::asc("timestamp")])
+            .await
+            .unwrap();
+        let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let schema = scan.schema();
+        let descending = PhysicalSortExpr::new(
+            Arc::new(Column::new(
+                "timestamp",
+                schema.index_of("timestamp").unwrap(),
+            )),
+            SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        );
+
+        assert!(matches!(
+            scan.try_pushdown_sort(&[descending]).unwrap(),
+            SortOrderPushdownResult::Inexact { .. }
+        ));
+    }
+
+    /// Deletion vectors are applied by position within each file, so the
+    /// reordering the scan does on the `Inexact` path would line the mask up
+    /// against the wrong rows - wrong data, which no `SortExec` above can
+    /// repair. Nothing is delegated while any file carries one.
+    #[tokio::test]
+    async fn a_deletion_vector_stops_the_delegation() {
+        use datafusion::physical_plan::SortOrderPushdownResult;
+
+        use crate::delta_datafusion::{FileSortColumn, create_session};
+
+        let table_url =
+            url::Url::from_directory_path(crate::test_utils::TestTables::WithDvSmall.as_path())
+                .unwrap();
+        let table = crate::open_table(table_url).await.unwrap();
+        let ctx = create_session().into_inner();
+        let provider = table
+            .table_provider()
+            .with_file_sort_order([FileSortColumn::asc("value")])
+            .await
+            .unwrap();
+        let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let schema = scan.schema();
+        let descending = PhysicalSortExpr::new(
+            Arc::new(Column::new("value", schema.index_of("value").unwrap())),
+            SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        );
+
+        assert!(matches!(
+            scan.try_pushdown_sort(&[descending]).unwrap(),
+            SortOrderPushdownResult::Unsupported
+        ));
+    }
+
     /// The regrouped scan must be marked order-sensitive.
     ///
     /// The file-to-partition assignment *is* the pushdown result, but the child
