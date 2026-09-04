@@ -103,6 +103,37 @@ fn cmp_keys(
     Some(Ordering::Equal)
 }
 
+/// Per-column types that every key handed to one sort must share, learned
+/// from the first key seen.
+///
+/// `ScalarValue::partial_cmp` is total within one non-nested type but fails
+/// across variants, and `sort_by` panics on a comparator that is not a total
+/// order. Requiring every key to share the first key's per-column types is
+/// what lets the sorts here compare with `expect` instead of collapsing an
+/// incomparable pair to `Equal`.
+#[derive(Default)]
+struct KeyTypes(Option<Vec<DataType>>);
+
+impl KeyTypes {
+    /// Whether `key` is comparable with every key accepted before it.
+    fn accept(&mut self, key: &[ScalarValue]) -> bool {
+        match &self.0 {
+            None => {
+                let types: Vec<DataType> = key.iter().map(ScalarValue::data_type).collect();
+                if types.iter().any(DataType::is_nested) {
+                    return false;
+                }
+                self.0 = Some(types);
+                true
+            }
+            Some(types) => key
+                .iter()
+                .map(ScalarValue::data_type)
+                .eq(types.iter().cloned()),
+        }
+    }
+}
+
 /// Order one bucket's files on `ordering` if - and only if - they are mutually
 /// non-overlapping on it.
 ///
@@ -130,6 +161,7 @@ fn order_bucket_if_non_overlapping(
 ) -> Option<Vec<PartitionedFile>> {
     let mut ranges: Vec<(Vec<ScalarValue>, Vec<ScalarValue>, PartitionedFile)> =
         Vec::with_capacity(files.len());
+    let mut key_types = KeyTypes::default();
     for file in files {
         let mut mins = Vec::with_capacity(ordering.len());
         let mut maxes = Vec::with_capacity(ordering.len());
@@ -145,23 +177,19 @@ fn order_bucket_if_non_overlapping(
                 maxes.push(column_stats.max_value.get_value()?.clone());
             }
         }
+        if !(key_types.accept(&mins) && key_types.accept(&maxes)) {
+            return None;
+        }
         ranges.push((mins, maxes, file));
     }
 
     let options = || ordering.iter().map(|sort_expr| sort_expr.options);
-    let mut incomparable = false;
-    ranges.sort_by(|a, b| match cmp_keys(&a.0, &b.0, options()) {
-        Some(ord) => ord,
-        None => {
-            incomparable = true;
-            Ordering::Equal
-        }
-    });
-    if incomparable {
-        return None;
-    }
+    let cmp = |a: &[ScalarValue], b: &[ScalarValue]| {
+        cmp_keys(a, b, options()).expect("endpoints share a non-nested type per column")
+    };
+    ranges.sort_by(|a, b| cmp(&a.0, &b.0));
     for pair in ranges.windows(2) {
-        if cmp_keys(&pair[0].1, &pair[1].0, options())? != Ordering::Less {
+        if cmp(&pair[0].1, &pair[1].0) != Ordering::Less {
             return None;
         }
     }
@@ -281,7 +309,7 @@ pub(super) fn plan_sort_pushdown(
     // --- Pair every file with its exact partition-prefix key. ---
     // Sort a lightweight (key, index) permutation rather than the large file objects.
     let mut keyed: Vec<(Vec<ScalarValue>, usize)> = Vec::with_capacity(files.len());
-    let mut key_types: Option<Vec<DataType>> = None;
+    let mut key_types = KeyTypes::default();
     for (index, file) in files.iter().enumerate() {
         let Some(values) = file.extensions.get::<DeltaPartitionValues>() else {
             return Ok(None);
@@ -295,27 +323,8 @@ pub(super) fn plan_sort_pushdown(
                 _ => return Ok(None),
             }
         }
-        // `ScalarValue::partial_cmp` is total within one non-nested type but
-        // fails across variants, and `sort_by` panics on a comparator that is
-        // not a total order. Require every key to share the first key's
-        // per-column types so the sort below cannot see an incomparable pair.
-        match &key_types {
-            None => {
-                let types: Vec<DataType> = key.iter().map(ScalarValue::data_type).collect();
-                if types.iter().any(DataType::is_nested) {
-                    return Ok(None);
-                }
-                key_types = Some(types);
-            }
-            Some(types) => {
-                if !key
-                    .iter()
-                    .map(ScalarValue::data_type)
-                    .eq(types.iter().cloned())
-                {
-                    return Ok(None);
-                }
-            }
+        if !key_types.accept(&key) {
+            return Ok(None);
         }
         keyed.push((key, index));
     }
@@ -1051,6 +1060,29 @@ mod tests {
             file("b", utf8("A"), 10, 19, 0),
         ];
         files[1].statistics = None;
+        let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
+        assert!(order_bucket_if_non_overlapping(files, &ordering).is_none());
+    }
+
+    /// Statistics whose `ScalarValue` variant differs between files are
+    /// incomparable; the bucket is refused before the sort, which would
+    /// otherwise see a comparator that is not a total order (see
+    /// `incomparable_partition_values_are_rejected_without_panicking`).
+    #[test]
+    fn test_order_bucket_refuses_incomparable_statistics() {
+        let files: Vec<PartitionedFile> = (0..40)
+            .map(|i| {
+                let mut file = file(&format!("f{i}"), utf8("A"), i * 10, i * 10 + 9, 0);
+                if i % 3 == 1 {
+                    let stats = Arc::make_mut(file.statistics.as_mut().unwrap());
+                    stats.column_statistics[0].min_value =
+                        Precision::Exact(utf8(&format!("{:03}", i * 10)));
+                    stats.column_statistics[0].max_value =
+                        Precision::Exact(utf8(&format!("{:03}", i * 10 + 9)));
+                }
+                file
+            })
+            .collect();
         let ordering = LexOrdering::new(vec![asc(0, "timestamp")]).unwrap();
         assert!(order_bucket_if_non_overlapping(files, &ordering).is_none());
     }
