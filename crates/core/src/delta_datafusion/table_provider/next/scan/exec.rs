@@ -169,12 +169,13 @@ fn pass_through_leaf(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
     plan
 }
 
-/// The ordered file extents - path and byte range - of each of a parquet
-/// scan's file groups, or `None` when the plan is not a single parquet scan
-/// (possibly behind pass-through wrappers) whose grouping can be read.
-fn file_group_extents(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Option<Vec<Vec<(&ObjectStorePath, (u64, u64))>>> {
+/// A file's path and the byte range of it that a scan reads.
+type FileExtent<'a> = (&'a ObjectStorePath, (u64, u64));
+
+/// The ordered file extents of each of a parquet scan's file groups, or `None`
+/// when the plan is not a single parquet scan (possibly behind pass-through
+/// wrappers) whose grouping can be read.
+fn file_group_extents(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<Vec<FileExtent<'_>>>> {
     let file_scan = pass_through_leaf(plan)
         .downcast_ref::<DataSourceExec>()?
         .data_source()
@@ -2115,8 +2116,11 @@ mod tests {
         );
     }
 
-    /// A parquet scan over `groups`, each a list of `(path, size, range)`.
-    fn parquet_scan(groups: &[&[(&str, u64, Option<(i64, i64)>)]]) -> Arc<dyn ExecutionPlan> {
+    /// `(path, size, byte range)` of one file in a test scan.
+    type FileSpec<'a> = (&'a str, u64, Option<(i64, i64)>);
+
+    /// A parquet scan over `groups`.
+    fn parquet_scan(groups: &[&[FileSpec<'_>]]) -> Arc<dyn ExecutionPlan> {
         use datafusion::datasource::physical_plan::ParquetSource;
         use datafusion::execution::object_store::ObjectStoreUrl;
         use datafusion_datasource::TableSchema;
