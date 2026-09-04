@@ -1009,8 +1009,10 @@ async fn delta_table_descending_sort_order_avoids_sort() -> TestResult<()> {
 }
 
 /// An ascending query over a table declared as descending cannot use the
-/// declared order (files cannot be read backwards) and falls back to a full
-/// sort with correct results.
+/// declared order as it stands and keeps a full sort, with correct results.
+/// The request is still handed down to the parquet scan, which answers
+/// `Inexact` and records the ordering it was asked to approximate, so the
+/// opener can reorder each file's row groups by their statistics.
 #[tokio::test]
 async fn delta_table_descending_sort_order_degrades_for_ascending_query() -> TestResult<()> {
     let table = desc_sorted_delta_table().await?;
@@ -1033,12 +1035,55 @@ async fn delta_table_descending_sort_order_degrades_for_ascending_query() -> Tes
         rendered.contains("SortExec"),
         "expected SortExec in plan:\n{rendered}"
     );
+    assert!(
+        rendered.contains("sort_order_for_reorder=[timestamp@0 ASC NULLS LAST]"),
+        "expected the request to reach the parquet scan:\n{rendered}"
+    );
     let timestamps = collect_timestamps(&batches);
     assert_eq!(timestamps.len(), 400);
     assert!(
         timestamps.windows(2).all(|pair| pair[0] <= pair[1]),
         "results are not sorted by timestamp ascending"
     );
+    Ok(())
+}
+
+/// `ORDER BY ... DESC LIMIT n` against an ascending declaration is where the
+/// delegated reverse scan pays off: `DeltaScanExec` cannot serve the reversed
+/// ordering itself, so it offers it to the parquet scan, which reads each
+/// file's row groups from the end and lets the TopK sort above converge
+/// early. The sort must stay - the scan only promises `Inexact` - and the
+/// answer must be the same as a full sort's.
+#[tokio::test]
+async fn delta_table_reversed_limit_query_reads_row_groups_backwards() -> TestResult<()> {
+    let table = sorted_delta_table().await?;
+
+    let ctx = create_session().into_inner();
+    let provider = table
+        .table_provider()
+        .with_file_sort_order([FileSortColumn::asc("timestamp")])
+        .await?;
+    ctx.register_table("test_table", provider)?;
+
+    let df = ctx
+        .sql("SELECT \"timestamp\", value FROM test_table ORDER BY \"timestamp\" DESC LIMIT 5")
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    assert!(
+        rendered.contains("SortExec"),
+        "expected the TopK sort to stay in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("reverse_row_groups=true"),
+        "expected the reversed request to reach the parquet scan:\n{rendered}"
+    );
+
+    let timestamps = collect_timestamps(&batches);
+    let expected: Vec<i64> = (295..300).rev().map(|s| s * 1_000_000).collect();
+    assert_eq!(timestamps, expected);
     Ok(())
 }
 
