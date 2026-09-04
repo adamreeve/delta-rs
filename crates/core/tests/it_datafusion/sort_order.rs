@@ -499,17 +499,21 @@ async fn query_two_partition_prefix(
 }
 
 /// `pack_buckets` cuts a file group at every change of a leading partition
-/// column, so `ORDER BY part, sub` with `target_partitions = 1` regroups into
-/// several partitions. A single-partition plan sorts with a global `SortExec`
-/// and has no merge operator, so removing it would interleave the groups: the
-/// pushdown must refuse and keep the `SortExec`.
+/// column so that neighbouring groups can be proven disjoint from their
+/// statistics. A single target group has no neighbour, so it packs every
+/// bucket together instead and `ORDER BY part, sub` is answered from one
+/// ordered partition, with no `SortExec` and no merge above it.
 #[tokio::test]
-async fn delta_table_partition_prefix_more_groups_than_target_keeps_sort() -> TestResult<()> {
+async fn delta_table_partition_prefix_single_target_group_avoids_sort() -> TestResult<()> {
     let table = two_partition_column_delta_table().await?;
     let (rendered, keys) = query_two_partition_prefix(&table, 1).await?;
     assert!(
-        rendered.contains("SortExec"),
-        "expected SortExec in plan:\n{rendered}"
+        !rendered.contains("SortExec"),
+        "expected no SortExec in plan:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("1 group"),
+        "expected every bucket packed into one group:\n{rendered}"
     );
     assert_eq!(keys.len(), 20);
     assert!(

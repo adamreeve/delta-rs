@@ -332,6 +332,15 @@ pub(super) fn plan_sort_pushdown(
     let (file_groups, per_partition_stats) = groups
         .into_iter()
         .map(|group| {
+            // A group that spans a change in a leading prefix column has no
+            // per-column extrema that also say where its range starts and ends
+            // (see `pack_buckets`). Only a lone group is packed that way, and
+            // `DeltaScanExec` describes a single execution partition from the
+            // exact table-wide aggregate instead, so publish nothing here.
+            let leading = group.start_key.len().saturating_sub(1);
+            if group.start_key[..leading] != group.end_key[..leading] {
+                return (FileGroup::from(group.files), HashMap::new());
+            }
             let stats = prefix
                 .iter()
                 .enumerate()
@@ -417,10 +426,17 @@ fn chunk_buckets(buckets: Vec<Bucket>, target: usize) -> Vec<BucketGroup> {
 /// count. A run is also cut when it would outgrow the file-id dictionary, or
 /// when the next bucket differs in a prefix column other than the last.
 ///
-/// Always cutting runs on changes in prefix columns other than the last is
-/// required so that the min and max statistics can be determined exactly
-/// from the start and end key values of the BucketGroup.
+/// Cutting runs on changes in prefix columns other than the last is what lets
+/// the group's min and max statistics be read exactly off its start and end
+/// keys: a run from `[A, 2]` to `[B, 0]` is ordered, but `sub` really covers
+/// `0..2` there, and no `ColumnStatistics` describes both that range and where
+/// the run begins. Those statistics exist to prove neighbouring groups
+/// disjoint, so a single target group - which has no neighbour - is exempt and
+/// packs every bucket together. `plan_sort_pushdown` then leaves its prefix
+/// statistics to the exact table-wide aggregate, which describes a lone
+/// execution partition precisely.
 fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<BucketGroup> {
+    let one_group = target == 1;
     let mut out: Vec<BucketGroup> = Vec::with_capacity(target);
     let mut files_left = total_files;
     let mut run: Option<BucketGroup> = None;
@@ -460,7 +476,7 @@ fn pack_buckets(buckets: Vec<Bucket>, target: usize, total_files: usize) -> Vec<
         match run.as_mut() {
             Some(open)
                 if open.files.len() + files <= MAX_PARTITION_DICT_CARDINALITY
-                    && open.end_key[..leading] == bucket.key[..leading] =>
+                    && (one_group || open.end_key[..leading] == bucket.key[..leading]) =>
             {
                 open.files.extend(bucket.files);
                 open.end_key = bucket.key;
@@ -901,27 +917,49 @@ mod tests {
         .unwrap()
     }
 
-    /// A run may only span several keys in the *last* prefix column. A run from
-    /// `[A, 2]` to `[B, 0]` is properly ordered, but its endpoints are not the
-    /// extrema of anything: `sub` really covers `0..2` there, so no
-    /// `ColumnStatistics` can describe both the range and where it starts.
-    #[test]
-    fn packed_runs_do_not_span_a_change_in_a_leading_prefix_column() {
-        let files = vec![
+    fn three_two_column_files() -> Vec<PartitionedFile> {
+        vec![
             two_column_file("a1", "A", 1),
             two_column_file("a2", "A", 2),
             two_column_file("b0", "B", 0),
-        ];
-        let order = vec![asc(0, "part"), asc(1, "sub")];
+        ]
+    }
 
-        // One target group would otherwise pack all three buckets into one run.
-        let plan = plan_two_column(files, &order, 1).expect("expected a pushdown plan");
+    /// A run that has a neighbour may only span several keys in the *last*
+    /// prefix column. A run from `[A, 2]` to `[B, 0]` is properly ordered, but
+    /// its endpoints are not the extrema of anything: `sub` really covers
+    /// `0..2` there, so no `ColumnStatistics` can describe both the range and
+    /// where it starts - and that is what proves the groups disjoint.
+    #[test]
+    fn packed_runs_do_not_span_a_change_in_a_leading_prefix_column() {
+        let order = vec![asc(0, "part"), asc(1, "sub")];
+        let plan =
+            plan_two_column(three_two_column_files(), &order, 2).expect("expected a pushdown plan");
 
         assert_eq!(
             plan.file_groups.iter().map(group_urls).collect::<Vec<_>>(),
             vec![vec!["a1", "a2"], vec!["b0"]],
         );
         assert_stats_match_files(&plan, &["part", "sub"]);
+    }
+
+    /// A lone group has no neighbour to be proven disjoint from, so it may span
+    /// any prefix column - which is the only way a single-partition scan can
+    /// answer a multi-column partition prefix without a sort. It publishes no
+    /// prefix statistics: `DeltaScanExec` describes a single execution
+    /// partition from the exact table-wide aggregate instead.
+    #[test]
+    fn a_single_target_group_spans_every_prefix_column() {
+        let order = vec![asc(0, "part"), asc(1, "sub")];
+        let plan =
+            plan_two_column(three_two_column_files(), &order, 1).expect("expected a pushdown plan");
+
+        assert_eq!(
+            plan.file_groups.iter().map(group_urls).collect::<Vec<_>>(),
+            vec![vec!["a1", "a2", "b0"]],
+        );
+        assert_eq!(plan.per_partition_stats, vec![HashMap::new()]);
+        assert!(plan.output_ordering.is_none());
     }
 
     /// One record batch per (partition, day range), each sorted by timestamp.
@@ -1432,13 +1470,14 @@ mod tests {
         };
         let order = vec![asc(0, "part"), asc(1, "sub")];
 
-        // 60 distinct leading values overshoot a target of 1 but stay within
-        // max_num_groups(1) = 64.
-        let plan = plan_two_column(files(60), &order, 1).expect("expected a pushdown plan");
+        // 60 distinct leading values overshoot a target of 2 but stay within
+        // max_num_groups(2) = 64. (A target of 1 packs them into one group
+        // instead - it has no neighbour to step away from.)
+        let plan = plan_two_column(files(60), &order, 2).expect("expected a pushdown plan");
         assert_eq!(plan.file_groups.len(), 60);
 
         // 65 distinct leading values exceed the cap.
-        assert!(plan_two_column(files(65), &order, 1).is_none());
+        assert!(plan_two_column(files(65), &order, 2).is_none());
     }
 
     /// A bucket larger than the file-id dictionary splits into several
