@@ -508,15 +508,8 @@ async fn get_data_scan_plan(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut partition_stats = HashMap::new();
 
-    // `DeltaScanExec::try_pushdown_sort` regroups files by their partition-column
-    // values. Attach them to each file so they survive the regrouping. Skip the
-    // work for cases that never take that path.
     let table_config = scan_plan.table_configuration();
     let partition_column_names = table_config.metadata().partition_columns();
-    let collect_partition_values = !partition_column_names.is_empty()
-        && session.config().options().optimizer.enable_sort_pushdown
-        && scan_plan.contract.retained_row_index_field().is_none()
-        && !table_config.is_feature_enabled(&TableFeature::ColumnMapping);
 
     // Convert the files into datafusions `PartitionedFile`s grouped by the object store they are stored in
     // this is used to create a DataSourceExec plan for each store
@@ -554,7 +547,10 @@ async fn get_data_scan_plan(
         // on `partition_values`, so partition values must be set first.
         partitioned_file.partition_values = vec![file_value.clone()];
         partitioned_file = partitioned_file.with_statistics(Arc::new(f.stats));
-        if let Some(values) = partition_values.filter(|_| collect_partition_values) {
+        // `DeltaScanExec::try_pushdown_sort` regroups files by their
+        // partition-column values; attach them so they survive the regrouping.
+        // Whether that path is ever taken is decided there, not here.
+        if let Some(values) = partition_values {
             partitioned_file
                 .extensions
                 .insert(DeltaPartitionValues(values));

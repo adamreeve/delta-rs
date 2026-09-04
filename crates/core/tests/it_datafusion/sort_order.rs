@@ -339,9 +339,8 @@ async fn delta_table_sort_order_partition_key_prefix_avoids_sort() -> TestResult
     Ok(())
 }
 
-/// With the DataFusion sort-pushdown optimizer disabled the scan skips
-/// attaching per-file partition values, and the query is answered through a
-/// plain `SortExec`.
+/// With the DataFusion sort-pushdown optimizer disabled the scan is never
+/// asked to regroup, and the query is answered through a plain `SortExec`.
 #[tokio::test]
 async fn delta_table_partition_prefix_with_sort_pushdown_disabled_keeps_sort() -> TestResult<()> {
     let table = sorted_delta_table().await?;
