@@ -2048,6 +2048,13 @@ async fn delta_table_progressive_eval_matches_sort_baseline() -> TestResult<()> 
 /// whose right input order is maintained, and a semi join emits only probe-side
 /// columns - with no `ProjectionExec` in between, `EnforceSorting` pushes the
 /// ordering requirement through the join and down onto the scan.
+///
+/// The merge above the join must stay a `SortPreservingMergeExec`. A
+/// `ProgressiveEvalExec` reads its input one partition at a time, while a
+/// `CollectLeft` hash join's dynamic filter parks every probe partition until
+/// all of them have reported, so the two deadlock; `ProgressiveEvalRule` keeps
+/// the merge for any hash join. The query is executed under a timeout so a
+/// regression fails instead of hanging.
 #[tokio::test]
 async fn delta_table_sort_pushdown_survives_dynamic_filter_rebuild() -> TestResult<()> {
     let table = sorted_delta_table().await?;
@@ -2087,17 +2094,39 @@ async fn delta_table_sort_pushdown_survives_dynamic_filter_rebuild() -> TestResu
         "expected no SortExec in plan:\n{rendered}"
     );
     assert!(
-        rendered.contains("ProgressiveEvalExec"),
-        "expected ProgressiveEvalExec in plan:\n{rendered}"
+        rendered.contains("SortPreservingMergeExec"),
+        "expected SortPreservingMergeExec in plan:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("ProgressiveEvalExec"),
+        "expected no ProgressiveEvalExec above a hash join:\n{rendered}"
     );
 
-    // Planning is the whole test: before the fix `create_physical_plan` itself
-    // failed here, because `SanityCheckPlan` runs after the filter pushdown and
-    // saw a scan that had stopped advertising the ordering.
-    //
-    // The plan is deliberately not executed. A `ProgressiveEvalExec` over a
-    // `CollectLeft` hash join that carries a dynamic filter hangs, whether or
-    // not a sort was pushed down - so it is a separate defect, not this one.
+    // Before the `with_new_input` fix `create_physical_plan` itself failed
+    // here, because `SanityCheckPlan` runs after the filter pushdown and saw a
+    // scan that had stopped advertising the ordering.
+    let batches = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        datafusion::physical_plan::collect(plan, ctx.task_ctx()),
+    )
+    .await
+    .expect("query hung: the merge started only some of the join's partitions")?;
+
+    // Every wanted value is in partition A (B holds 50..150), in timestamp order.
+    let mut values: Vec<i64> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    for batch in &batches {
+        values.extend(batch.column(1).as_primitive::<Int64Type>().values());
+        let batch_parts = arrow_cast::cast(batch.column(2), &DataType::Utf8)?;
+        parts.extend(
+            batch_parts
+                .as_string::<i32>()
+                .iter()
+                .map(|part| part.unwrap().to_string()),
+        );
+    }
+    assert_eq!(values, vec![1, 2, 3, 150, 250]);
+    assert_eq!(parts, vec!["A"; 5]);
     Ok(())
 }
 

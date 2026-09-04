@@ -7,6 +7,10 @@
 //! If the partitions are non-overlapping with respect to the sort order, then
 //! this merge is unnecessary, and we can stream the partitions one after another
 //! using a [`ProgressiveEvalExec`].
+//!
+//! Streaming partitions one after another is only sound when no operator below
+//! the merge needs all of its partitions to be running at once; see
+//! [`contains_hash_join`] for the one that does.
 
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Statistics;
@@ -15,6 +19,7 @@ use datafusion::common::{Result, ScalarValue};
 use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties as _};
 
@@ -48,6 +53,9 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
                 return Ok(Transformed::no(plan));
             };
             let input = merge.input();
+            if contains_hash_join(input)? {
+                return Ok(Transformed::no(plan));
+            }
             let Some(ranges) = ordered_partition_ranges(input, merge.expr()) else {
                 return Ok(Transformed::no(plan));
             };
@@ -65,6 +73,27 @@ impl PhysicalOptimizerRule for ProgressiveEvalRule {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// Whether any node of `plan` is a [`HashJoinExec`].
+///
+/// A [`ProgressiveEvalExec`] executes its input partitions a few at a time,
+/// starting the next one only once an earlier one is exhausted. A hash join
+/// whose dynamic filter was pushed into the probe-side scan cannot be read
+/// that way: every probe partition reports its build-side bounds to a shared
+/// accumulator and then waits until *all* probe partitions have reported, so
+/// the partitions that are running wait for ones that will only be started
+/// after they finish, and the query hangs. The filter is attached by
+/// `FilterPushdown::new_post_optimization`, which runs before this rule, so
+/// it could be detected precisely; but joins over a scan that was regrouped
+/// for a sort are uncommon enough that the merge is simply kept for every
+/// hash join, which also does not depend on how the rules are ordered.
+fn contains_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
+    plan.exists(|node| {
+        Ok((node.as_ref() as &dyn ExecutionPlan)
+            .downcast_ref::<HashJoinExec>()
+            .is_some())
+    })
 }
 
 /// To be able to convert to a ProgressiveEval, we need the partitions to
@@ -178,9 +207,11 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
     use datafusion::common::stats::{ColumnStatistics, Precision};
+    use datafusion::common::{JoinType, NullEquality};
     use datafusion::execution::{SendableRecordBatchStream, TaskContext};
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalSortExpr};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::joins::PartitionMode;
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PlanProperties};
 
     /// Leaf plan reporting fixed per-partition statistics; never executed.
@@ -554,5 +585,78 @@ mod tests {
         let ordering = LexOrdering::new(vec![asc(1, "id")]).unwrap();
 
         assert!(ordered_partition_ranges(&plan, &ordering).is_none());
+    }
+
+    /// Two partitions with disjoint `t` ranges: a merge on `t` over them is
+    /// replaceable by a progressive eval.
+    fn ordered_partitions() -> Arc<dyn ExecutionPlan> {
+        StatsExec::new(vec![
+            partition(vec![exact_i64(0, 100, 0), exact_i64(0, 10, 0)]),
+            partition(vec![exact_i64(101, 200, 0), exact_i64(11, 20, 0)]),
+        ])
+    }
+
+    fn merge_on_t(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        Arc::new(SortPreservingMergeExec::new(ordering, input))
+    }
+
+    fn optimize(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        ProgressiveEvalRule::new()
+            .optimize(plan, &ConfigOptions::default())
+            .unwrap()
+    }
+
+    #[test]
+    fn merge_over_ordered_partitions_is_replaced() {
+        let optimized = optimize(merge_on_t(ordered_partitions()));
+
+        assert!(
+            optimized.downcast_ref::<ProgressiveEvalExec>().is_some(),
+            "expected ProgressiveEvalExec, got {}",
+            optimized.name()
+        );
+    }
+
+    #[test]
+    fn merge_over_hash_join_is_kept() {
+        // A semi join keeps the probe side's statistics, so the merge above it
+        // would be replaceable on statistics alone.
+        let build = StatsExec::new(vec![partition(vec![
+            exact_i64(0, 0, 0),
+            exact_i64(5, 5, 0),
+        ])]);
+        let join: Arc<dyn ExecutionPlan> = Arc::new(
+            HashJoinExec::try_new(
+                build,
+                ordered_partitions(),
+                vec![(
+                    Arc::new(Column::new("id", 1)),
+                    Arc::new(Column::new("id", 1)),
+                )],
+                None,
+                &JoinType::RightSemi,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        );
+        let ordering = LexOrdering::new(vec![asc(0, "t")]).unwrap();
+        assert!(
+            ordered_partition_ranges(&join, &ordering).is_some(),
+            "the join's partitions should look replaceable on statistics alone"
+        );
+
+        let optimized = optimize(merge_on_t(join));
+
+        assert!(
+            optimized
+                .downcast_ref::<SortPreservingMergeExec>()
+                .is_some(),
+            "expected SortPreservingMergeExec, got {}",
+            optimized.name()
+        );
     }
 }
