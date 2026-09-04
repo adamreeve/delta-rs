@@ -1164,6 +1164,77 @@ mod tests {
         table
     }
 
+    /// The regrouped scan is assembled field by field rather than cloned from
+    /// the original, so every setting the original carried has to be copied
+    /// across by hand. Losing the expression adapter would quietly break the
+    /// schema adaptation of filters and projections pushed in afterwards.
+    #[tokio::test]
+    async fn pushdown_carries_the_scan_settings_across() {
+        use datafusion::physical_plan::{ExecutionPlan, SortOrderPushdownResult};
+        use datafusion_datasource::file_scan_config::FileScanConfig;
+        use datafusion_datasource::source::DataSourceExec;
+
+        use crate::delta_datafusion::{FileSortColumn, create_session};
+
+        fn file_scan(plan: &Arc<dyn ExecutionPlan>) -> &FileScanConfig {
+            plan.downcast_ref::<DataSourceExec>()
+                .expect("a parquet scan")
+                .data_source()
+                .as_ref()
+                .downcast_ref::<FileScanConfig>()
+                .expect("a file scan config")
+        }
+
+        let table = partitioned_sorted_table().await;
+        let ctx = create_session().into_inner();
+        let provider = table
+            .table_provider()
+            .with_file_sort_order([FileSortColumn::asc("timestamp")])
+            .await
+            .unwrap();
+        let scan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let schema = scan.schema();
+        let sort_col = |name: &str| {
+            PhysicalSortExpr::new(
+                Arc::new(Column::new(name, schema.index_of(name).unwrap())),
+                SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            )
+        };
+        let before = file_scan(scan.children()[0]).clone();
+
+        let pushed = match scan
+            .try_pushdown_sort(&[sort_col("part"), sort_col("timestamp")])
+            .unwrap()
+        {
+            SortOrderPushdownResult::Exact { inner } => inner,
+            other => panic!("expected an exact pushdown, got {other:?}"),
+        };
+        let after = file_scan(pushed.children()[0]);
+
+        assert_eq!(after.object_store_url, before.object_store_url);
+        assert!(Arc::ptr_eq(after.file_source(), before.file_source()));
+        assert_eq!(after.limit, before.limit);
+        assert_eq!(after.constraints, before.constraints);
+        assert_eq!(after.file_compression_type, before.file_compression_type);
+        assert_eq!(after.batch_size, before.batch_size);
+        assert_eq!(
+            after.expr_adapter_factory.is_some(),
+            before.expr_adapter_factory.is_some(),
+            "the expression adapter must survive the regrouping"
+        );
+        assert!(
+            before.expr_adapter_factory.is_some(),
+            "fixture is meaningless without one"
+        );
+        assert_eq!(
+            after.partitioned_by_file_group,
+            before.partitioned_by_file_group
+        );
+    }
+
     /// An ordering that does not start with partition columns is offered to the
     /// parquet scan instead of being refused outright: this exec keeps rows in
     /// the order they arrive, so the trait asks it to delegate and re-wrap.

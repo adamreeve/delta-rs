@@ -839,21 +839,37 @@ impl ExecutionPlan for DeltaScanExec {
 
         let (file_groups, statistics) =
             compute_all_files_statistics(plan.file_groups, parquet_table_schema, true, false)?;
-        let new_file_scan = FileScanConfigBuilder::from(file_scan.clone())
-            .with_file_groups(file_groups)
-            .with_statistics(statistics)
-            // The regrouped files are ordered by the partition prefix first, which the
-            // parquet child cannot express (partition columns are not in its schema);
-            // that combined order is declared in the pushdown result instead. When every
-            // group holds a single prefix key the file-sort-order suffix still holds per
-            // group and is re-declared, restoring DataFusion's statistics-based
-            // validation of the child's ordering and keeping any child-level
-            // repartitioning order-preserving.
-            .with_output_ordering(plan.output_ordering.into_iter().collect())
-            // Configure the file scan to preserve order, otherwise files may be read out-of-order,
-            // or DataFusion might incorrectly drop row groups that are needed.
-            .with_preserve_order(true)
-            .build();
+        // Rebuilt field by field rather than through
+        // `FileScanConfigBuilder::from(file_scan.clone())`: cloning the config
+        // deep-copies every `PartitionedFile` only for `with_file_groups` to
+        // drop them again, which doubles the per-file copying of a scan over
+        // tens of thousands of files. These are exactly the fields that
+        // `From<FileScanConfig>` carries across, so a field added to it
+        // upstream has to be added here too.
+        let new_file_scan = FileScanConfigBuilder::new(
+            file_scan.object_store_url.clone(),
+            Arc::clone(file_scan.file_source()),
+        )
+        .with_limit(file_scan.limit)
+        .with_constraints(file_scan.constraints.clone())
+        .with_file_compression_type(file_scan.file_compression_type)
+        .with_batch_size(file_scan.batch_size)
+        .with_expr_adapter(file_scan.expr_adapter_factory.clone())
+        .with_partitioned_by_file_group(file_scan.partitioned_by_file_group)
+        .with_file_groups(file_groups)
+        .with_statistics(statistics)
+        // The regrouped files are ordered by the partition prefix first, which the
+        // parquet child cannot express (partition columns are not in its schema);
+        // that combined order is declared in the pushdown result instead. When every
+        // group holds a single prefix key the file-sort-order suffix still holds per
+        // group and is re-declared, restoring DataFusion's statistics-based
+        // validation of the child's ordering and keeping any child-level
+        // repartitioning order-preserving.
+        .with_output_ordering(plan.output_ordering.into_iter().collect())
+        // Configure the file scan to preserve order, otherwise files may be read out-of-order,
+        // or DataFusion might incorrectly drop row groups that are needed.
+        .with_preserve_order(true)
+        .build();
         let new_input = DataSourceExec::from_data_source(new_file_scan) as Arc<dyn ExecutionPlan>;
 
         let pushed = Arc::new(PushedSort {
