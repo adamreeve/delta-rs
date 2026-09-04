@@ -152,9 +152,12 @@ fn derive_output_orderings(
     orderings
 }
 
-/// The ordered file paths of each of a parquet scan's file groups, or `None`
-/// when the plan is not a single parquet scan whose grouping can be read.
-fn file_group_paths(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<Vec<&ObjectStorePath>>> {
+/// The ordered file extents - path and byte range - of each of a parquet
+/// scan's file groups, or `None` when the plan is not a single parquet scan
+/// whose grouping can be read.
+fn file_group_extents(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<Vec<Vec<(&ObjectStorePath, (u64, u64))>>> {
     let file_scan = plan
         .downcast_ref::<DataSourceExec>()?
         .data_source()
@@ -167,7 +170,7 @@ fn file_group_paths(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<Vec<&ObjectStor
             .map(|group| {
                 group
                     .iter()
-                    .map(|file| &file.object_meta.location)
+                    .map(|file| (&file.object_meta.location, file.range()))
                     .collect()
             })
             .collect(),
@@ -183,7 +186,7 @@ fn file_group_paths(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<Vec<&ObjectStor
 /// any regrouping or file splitting does not. An input whose grouping cannot be
 /// read is treated as changed, so the claim is dropped rather than assumed.
 fn grouping_is_unchanged(old: &Arc<dyn ExecutionPlan>, new: &Arc<dyn ExecutionPlan>) -> bool {
-    match (file_group_paths(old), file_group_paths(new)) {
+    match (file_group_extents(old), file_group_extents(new)) {
         (Some(old), Some(new)) => old == new,
         _ => false,
     }
@@ -2087,6 +2090,47 @@ mod tests {
             coalesced_paths(&[piece("a", 100, None), piece("a", 100, Some((0, 100)))]),
             None
         );
+    }
+
+    /// A parquet scan over `groups`, each a list of `(path, size, range)`.
+    fn parquet_scan(groups: &[&[(&str, u64, Option<(i64, i64)>)]]) -> Arc<dyn ExecutionPlan> {
+        use datafusion::datasource::physical_plan::ParquetSource;
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        use datafusion_datasource::TableSchema;
+        use datafusion_datasource::file_groups::FileGroup;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let source = Arc::new(ParquetSource::new(TableSchema::new(schema, vec![])));
+        let file_groups = groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|(path, size, range)| piece(path, *size, *range))
+                    .collect::<FileGroup>()
+            })
+            .collect();
+        let config = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+            .with_file_groups(file_groups)
+            .build();
+        DataSourceExec::from_data_source(config)
+    }
+
+    /// A pushed sort describes an arrangement of whole files: the same paths
+    /// split into byte ranges, or regrouped, are a different arrangement.
+    #[test]
+    fn test_grouping_is_unchanged_compares_paths_and_ranges() {
+        let whole = parquet_scan(&[&[("a", 100, None)], &[("b", 100, None)]]);
+        let same = parquet_scan(&[&[("a", 100, None)], &[("b", 100, None)]]);
+        let split = parquet_scan(&[
+            &[("a", 100, Some((0, 50))), ("a", 100, Some((50, 100)))],
+            &[("b", 100, None)],
+        ]);
+        let regrouped = parquet_scan(&[&[("a", 100, None), ("b", 100, None)]]);
+
+        assert!(grouping_is_unchanged(&whole, &same));
+        assert!(!grouping_is_unchanged(&whole, &split));
+        assert!(!grouping_is_unchanged(&whole, &regrouped));
     }
 
     fn selection_vectors_f1_f2() -> Arc<DashMap<String, Vec<bool>>> {
