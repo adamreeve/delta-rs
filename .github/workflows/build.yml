@@ -139,7 +139,15 @@ jobs:
       - name: Run doc tests
         shell: bash
         run: |
-          # llvm-cov doesn't run doc tests, so run them separately
+          # llvm-cov doesn't run doc tests on stable, so run them separately.
+          # Use the same RUSTFLAGS and target dir as cargo llvm-cov, and the same
+          # package selection, to avoid recompilation.
+          eval "$(cargo llvm-cov show-env --sh)"
           cargo test --features ${{ env.DEFAULT_FEATURES }} \
             --workspace \
+            --exclude deltalake \
+            --exclude deltalake-azure \
+            --exclude deltalake-aws \
+            --exclude deltalake-hdfs \
+            --exclude deltalake-lakefs \
             --doc
