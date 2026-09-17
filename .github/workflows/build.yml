@@ -138,11 +138,15 @@ jobs:
 
       - name: Run doc tests
         shell: bash
+        # llvm-cov doesn't run doc tests on stable, so run them separately.
         run: |
-          # llvm-cov doesn't run doc tests on stable, so run them separately.
           # Use the environment from llvm-cov and the same target dir and
           # package selection, to avoid recompilation.
           eval "$(cargo llvm-cov show-env --sh)"
+          # Doc test dependencies are built with the dev profile, whereas
+          # llvm-cov builds them with the test profile, so match its debug
+          # setting from Cargo.toml.
+          CARGO_PROFILE_DEV_DEBUG=line-tables-only \
           cargo test --features ${{ env.DEFAULT_FEATURES }} \
             --target-dir target/llvm-cov-target \
             --workspace \
