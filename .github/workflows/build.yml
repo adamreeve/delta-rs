@@ -132,9 +132,9 @@ jobs:
             --exclude deltalake-hdfs \
             --exclude deltalake-lakefs
 
-      - uses: ./.github/actions/upload-coverage
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
+      #- uses: ./.github/actions/upload-coverage
+      #  with:
+      #    token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Run doc tests
         shell: bash
