@@ -91,6 +91,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       DEFAULT_FEATURES: "datafusion"
+      # Doc tests are built with the dev profile, whereas llvm-cov
+      # builds with the test profile.
+      # Make debug match test to avoid rebuilding all dependencies
+      # when running the doc tests.
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
 
     steps:
       # v6.0.2
@@ -143,10 +148,6 @@ jobs:
           # Use the environment from llvm-cov and the same target dir and
           # package selection, to avoid recompilation.
           eval "$(cargo llvm-cov show-env --sh)"
-          # Doc test dependencies are built with the dev profile, whereas
-          # llvm-cov builds them with the test profile, so match its debug
-          # setting from Cargo.toml.
-          CARGO_PROFILE_DEV_DEBUG=line-tables-only \
           cargo test --features ${{ env.DEFAULT_FEATURES }} \
             --target-dir target/llvm-cov-target \
             --workspace \
