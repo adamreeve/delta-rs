@@ -35,6 +35,23 @@ jobs:
       - name: Run Machete to check for unused dependencies
         uses: bnjbvr/cargo-machete@aa070c61641e482bc2b5d41c97b496ee4755bf37
 
+      # TEMPORARY: show sccache warnings, eg. why cache writes failed
+      - name: Show sccache log
+        if: always()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/sccache.log"
+          [ -f "$log" ] || { echo "No sccache log"; exit 0; }
+          # "read failed NotFound" is a normal cache miss
+          echo "Failed cache operations, by operation and error kind:"
+          grep -E 'opendal::services.*: (read|write) failed ' "$log" \
+            | sed -E 's/.*: (read|write) failed ([A-Za-z]+) .*/\1 \2/' \
+            | sort | uniq -c | sort -rn || true
+          echo "Warnings other than failed cache operations:"
+          grep -E ' (WARN|ERROR) ' "$log" \
+            | grep -v -E 'opendal::services.*: (read|write) failed |Got unexpected error: RateLimited' \
+            | sed -n '1,20p' || true
+
   test-matrix:
     runs-on: ubuntu-latest
 
@@ -80,6 +97,23 @@ jobs:
 
       - name: Spot-check build for native-tls features
         run: cargo build --profile=ci --package deltalake --no-default-features --features azure,datafusion,s3-native-tls,gcs,glue
+
+      # TEMPORARY: show sccache warnings, eg. why cache writes failed
+      - name: Show sccache log
+        if: always()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/sccache.log"
+          [ -f "$log" ] || { echo "No sccache log"; exit 0; }
+          # "read failed NotFound" is a normal cache miss
+          echo "Failed cache operations, by operation and error kind:"
+          grep -E 'opendal::services.*: (read|write) failed ' "$log" \
+            | sed -E 's/.*: (read|write) failed ([A-Za-z]+) .*/\1 \2/' \
+            | sort | uniq -c | sort -rn || true
+          echo "Warnings other than failed cache operations:"
+          grep -E ' (WARN|ERROR) ' "$log" \
+            | grep -v -E 'opendal::services.*: (read|write) failed |Got unexpected error: RateLimited' \
+            | sed -n '1,20p' || true
 
   test:
     name: Unit Tests
@@ -152,3 +186,20 @@ jobs:
             --exclude deltalake-hdfs \
             --exclude deltalake-lakefs \
             --doc
+
+      # TEMPORARY: show sccache warnings, eg. why cache writes failed
+      - name: Show sccache log
+        if: always()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/sccache.log"
+          [ -f "$log" ] || { echo "No sccache log"; exit 0; }
+          # "read failed NotFound" is a normal cache miss
+          echo "Failed cache operations, by operation and error kind:"
+          grep -E 'opendal::services.*: (read|write) failed ' "$log" \
+            | sed -E 's/.*: (read|write) failed ([A-Za-z]+) .*/\1 \2/' \
+            | sort | uniq -c | sort -rn || true
+          echo "Warnings other than failed cache operations:"
+          grep -E ' (WARN|ERROR) ' "$log" \
+            | grep -v -E 'opendal::services.*: (read|write) failed |Got unexpected error: RateLimited' \
+            | sed -n '1,20p' || true
